@@ -152,7 +152,7 @@ HOME_DIR="$ROOT/home"
 # Bash applies this RLIMIT_FSIZE (in 1024-byte blocks) to the trace and both
 # redirected streams, and every descendant inherits it.
 ulimit -f "$CAPTURE_FILE_BLOCKS"
-exec strace -f -qq -s 0 -yy -e signal=none \
+exec strace -f -qq -s 0 -yy -ttt -e signal=none \
   -e trace=open,openat,openat2,creat,link,linkat,symlink,symlinkat,unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,truncate,ftruncate,chdir,fchdir,clone,clone3,fork,vfork,unshare,execve,execveat,connect,sendto,sendmsg,sendmmsg,write,writev \
   -u "$AGENT_USER" -o "$TRACE_DIR/trace" \
   env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

@@ -179,6 +179,38 @@ For a plugin using the default exercise prompt, Observatory selects the first
 sorted tool declared in `contracts.tools` and names it explicitly. Plugins with
 no declared tools require an operator-supplied `exercise.prompt`.
 
+## Ordered tool-event timeline
+
+Alongside the baseline-subtracted `observations` aggregate, every capture carries
+a `timeline` section: an ordered, per-lane projection of tool activity for both
+the baseline and exercise lanes. Where `observations` answers "what increased in
+the exercise lane", the timeline answers "in what order, and when" so downstream
+deterministic grading and future declared-vs-observed comparison can reason about
+sequence and timing.
+
+Each lane publishes `events` in capture order with a contiguous `sequence`, the
+event `kind`/`operation`, a normalized secret-safe `subject`, an `outcome` of
+`completed`, `denied` (an `EACCES`/`EPERM` permission failure), or `error`, an
+optional network `role`, and an optional `canary` attribution when a file event
+touches a synthetic canary path. Subjects reuse the exact normalization and
+redaction applied to `observations`: host paths collapse to `$WORKSPACE`,
+`$STATE`, `$HOME`, `$SKILL`/`$PLUGIN`, private and control-plane addresses are
+masked, canary markers are never emitted, and raw command arguments and payloads
+are excluded. The full ordered sequence ships in the JSON projection; the static
+page previews up to 250 events per lane.
+
+Timing is captured with `strace -ttt` and published as `offsetMs`, the
+millisecond offset from each lane's first event, only when the lane carries a
+timestamp on every event and those timestamps never move backwards
+(`timed: true`, with a lane `durationMs`). Absolute wall-clock time is never
+published, and a lane with missing or non-monotonic timestamps omits offsets
+rather than publishing untrustworthy timing. Each lane is bounded at 4096 events;
+a busier lane keeps the earliest-first prefix and sets `truncated: true` with the
+full `totalEvents` count. Malformed, inconsistent, or incompletely timed
+timelines fail closed during evidence validation. The timeline is part of the
+capture-protocol revision, so re-analysis and version comparison reject evidence
+produced by a different protocol.
+
 ## MVP limitations
 
 - One bounded task cannot cover every branch.

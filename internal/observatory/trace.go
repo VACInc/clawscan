@@ -1,6 +1,7 @@
 package observatory
 
 import (
+	"math"
 	"net"
 	"net/netip"
 	pathpkg "path"
@@ -44,8 +45,10 @@ type traceString struct {
 }
 
 type traceRecord struct {
-	PID  string
-	Line string
+	PID          string
+	Line         string
+	Timestamp    float64
+	HasTimestamp bool
 }
 
 type processCWD struct {
@@ -65,6 +68,7 @@ var (
 	portPattern                = regexp.MustCompile(`sin6?_port=htons\(([0-9]+)\)`)
 	unixPathPattern            = regexp.MustCompile(`sun_path=(@)?("(?:\\.|[^"\\])*")`)
 	pidPrefixPattern           = regexp.MustCompile(`^(?:\[pid\s+([0-9]+)\]\s+|([0-9]+)\s+)(.*)$`)
+	traceTimestampPattern      = regexp.MustCompile(`^([0-9]+\.[0-9]+)\s+`)
 	resumedCallPattern         = regexp.MustCompile(`^<\.\.\.\s+([A-Za-z0-9_]+)\s+resumed>(.*)$`)
 	ipv4LiteralPattern         = regexp.MustCompile(`(?:[0-9]{1,3}\.){3}[0-9]{1,3}`)
 	ipv6LiteralPattern         = regexp.MustCompile(`(?i)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*`)
@@ -187,9 +191,160 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 			"System-call tracing records endpoint addresses but does not provide complete DNS-name or payload attribution.",
 			"A behavioral delta shows correlation with the exercise lane, not author intent or a safety verdict.",
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
+			"The per-lane tool-event timeline is a bounded, ordered projection of the selected MVP syscalls with normalized, secret-safe subjects; it excludes raw arguments and is capped per lane.",
+			"Timeline timing offsets are relative to each lane's first event and are published only when the capture provides monotonic per-event timestamps.",
 		},
 	}
 	return result
+}
+
+// BuildTimeline extracts an ordered, per-lane tool-event timeline from the same
+// records AnalyzeTraces aggregates. Both lanes are published in full (bounded by
+// MaxTimelineEventsPerLane) rather than baseline-subtracted, because the
+// timeline's job is to expose sequence and timing to downstream grading. Every
+// subject reuses AnalyzeTraces' normalization and redaction so the timeline is
+// exactly as secret-safe as the delta observations.
+func BuildTimeline(input AnalysisInput) Timeline {
+	return Timeline{
+		MaxEventsPerLane: MaxTimelineEventsPerLane,
+		Baseline:         buildLaneTimeline(input.BaselineTraces, input.Metadata.BaselineWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, false),
+		Exercise:         buildLaneTimeline(input.ExerciseTraces, input.Metadata.ExerciseWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, true),
+	}
+}
+
+type timelineGroup struct {
+	events       []TimelineEvent
+	timestamp    float64
+	hasTimestamp bool
+}
+
+func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetadata, canaries []CanaryDefinition, controlPlaneAddresses []string, exercise bool) TimelineLane {
+	groups := []timelineGroup{}
+	timed := true
+	monotonic := true
+	seen := false
+	var previous float64
+	for _, trace := range traces {
+		processes := newTraceProcessState(initialCWD)
+		for _, record := range completeTraceRecords(trace) {
+			if line := record.Line; line != "" {
+				cwd := processes.cwd(record.PID)
+				parsed := parseTraceLineAtCWD(line, metadata, controlPlaneAddresses, exercise, cwd)
+				if len(parsed) > 0 {
+					events := make([]TimelineEvent, 0, len(parsed))
+					for _, observation := range parsed {
+						events = append(events, TimelineEvent{
+							Kind:      observation.Kind,
+							Operation: observation.Operation,
+							Subject:   timelinePublicSubject(observation, canaries, controlPlaneAddresses),
+							Outcome:   timelineOutcome(observation.Outcome, line),
+							Role:      observation.Role,
+							Canary:    timelineCanaryID(observation, canaries),
+						})
+					}
+					groups = append(groups, timelineGroup{events: events, timestamp: record.Timestamp, hasTimestamp: record.HasTimestamp})
+					if !record.HasTimestamp {
+						timed = false
+					}
+					if seen && record.Timestamp < previous {
+						monotonic = false
+					}
+					previous = record.Timestamp
+					seen = true
+				}
+			}
+			processes.apply(record)
+		}
+	}
+
+	lane := TimelineLane{Events: []TimelineEvent{}}
+	if len(groups) == 0 {
+		return lane
+	}
+	// Timing is trustworthy only when every timeline record carries a stamp and
+	// the stamps never move backwards; otherwise offsets are withheld entirely.
+	timed = timed && monotonic
+	base := groups[0].timestamp
+	var duration int64
+	events := make([]TimelineEvent, 0, len(groups))
+	for _, group := range groups {
+		var offset int64
+		if timed {
+			offset = relativeOffsetMs(group.timestamp, base)
+			if offset > duration {
+				duration = offset
+			}
+		}
+		for _, event := range group.events {
+			if timed {
+				value := offset
+				event.OffsetMs = &value
+			}
+			events = append(events, event)
+		}
+	}
+	lane.TotalEvents = len(events)
+	if len(events) > MaxTimelineEventsPerLane {
+		events = events[:MaxTimelineEventsPerLane]
+		lane.Truncated = true
+	}
+	for index := range events {
+		events[index].Sequence = index + 1
+	}
+	lane.Events = events
+	lane.EventCount = len(events)
+	if timed {
+		lane.Timed = true
+		total := duration
+		lane.DurationMs = &total
+	}
+	return lane
+}
+
+func relativeOffsetMs(timestamp float64, base float64) int64 {
+	offset := int64(math.Round((timestamp - base) * 1000))
+	if offset < 0 {
+		return 0
+	}
+	return offset
+}
+
+func timelinePublicSubject(observation traceObservation, canaries []CanaryDefinition, controlPlaneAddresses []string) string {
+	if observation.Kind == "process" {
+		return pathpkg.Base(sanitizeObservationSubject(observation.Subject, canaries, controlPlaneAddresses))
+	}
+	return publicObservationSubject(observation, canaries, controlPlaneAddresses)
+}
+
+// timelineCanaryID attributes a file event to a synthetic canary by exact
+// normalized path. It is intentionally path-only: marker-in-argument
+// interactions are still counted in the aggregate canary section but are never
+// reconstructed into a timeline subject that could leak the marker value.
+func timelineCanaryID(observation traceObservation, canaries []CanaryDefinition) string {
+	if observation.Kind != "file" {
+		return ""
+	}
+	for _, canary := range canaries {
+		if canary.Path != "" && observation.Subject == canary.Path {
+			return canary.ID
+		}
+	}
+	return ""
+}
+
+// timelineOutcome maps the parser's succeeded/attempted verdict onto the
+// timeline's completion/denial/error vocabulary. A permission error is reported
+// as a distinct denial so downstream grading can separate blocked attempts from
+// other failures.
+func timelineOutcome(observationOutcome string, line string) string {
+	if observationOutcome == "succeeded" {
+		return "completed"
+	}
+	result := syscallResult(line)
+	if strings.Contains(result, "EACCES") || strings.Contains(result, "EPERM") {
+		return "denied"
+	}
+	return "error"
 }
 
 func traceLaneHasCompleteSyscall(traces []string) bool {
@@ -218,8 +373,10 @@ func publicObservationSubject(observation traceObservation, canaries []CanaryDef
 
 func completeTraceRecords(trace string) []traceRecord {
 	type pendingCall struct {
-		prefix string
-		index  int
+		prefix       string
+		index        int
+		timestamp    float64
+		hasTimestamp bool
 	}
 	pending := map[string]pendingCall{}
 	completed := []traceRecord{}
@@ -237,25 +394,42 @@ func completeTraceRecords(trace string) []traceRecord {
 			}
 			line = match[3]
 		}
+		// A trailing `-ttt` timestamp is stripped here so every downstream
+		// consumer (parsing, resumed-call stitching, cwd tracking) sees the same
+		// bare syscall text it did before timing capture existed. The start-time
+		// stamp of a split syscall stays with its <unfinished ...> record.
+		timestamp, hasTimestamp, line := splitTraceTimestamp(line)
 		if strings.HasSuffix(line, "<unfinished ...>") {
 			prefix := strings.TrimSpace(strings.TrimSuffix(line, "<unfinished ...>"))
-			pending[pid] = pendingCall{prefix: prefix, index: len(completed)}
+			pending[pid] = pendingCall{prefix: prefix, index: len(completed), timestamp: timestamp, hasTimestamp: hasTimestamp}
 			completed = append(completed, traceRecord{PID: pid})
 			continue
 		}
 		if match := resumedCallPattern.FindStringSubmatch(line); len(match) == 3 {
 			if call, ok := pending[pid]; ok && strings.HasPrefix(call.prefix, match[1]+"(") {
-				completed[call.index].Line = call.prefix + match[2]
+				completed[call.index] = traceRecord{PID: pid, Line: call.prefix + match[2], Timestamp: call.timestamp, HasTimestamp: call.hasTimestamp}
 				delete(pending, pid)
 			}
 			continue
 		}
-		completed = append(completed, traceRecord{PID: pid, Line: line})
+		completed = append(completed, traceRecord{PID: pid, Line: line, Timestamp: timestamp, HasTimestamp: hasTimestamp})
 	}
 	for pid, call := range pending {
-		completed[call.index] = traceRecord{PID: pid, Line: call.prefix + " = -1 EINTR (trace ended before syscall resumed)"}
+		completed[call.index] = traceRecord{PID: pid, Line: call.prefix + " = -1 EINTR (trace ended before syscall resumed)", Timestamp: call.timestamp, HasTimestamp: call.hasTimestamp}
 	}
 	return completed
+}
+
+func splitTraceTimestamp(line string) (float64, bool, string) {
+	match := traceTimestampPattern.FindStringSubmatch(line)
+	if match == nil {
+		return 0, false, line
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0, false, line
+	}
+	return value, true, strings.TrimSpace(line[len(match[0]):])
 }
 
 func newTraceProcessState(defaultCWD string) *traceProcessState {

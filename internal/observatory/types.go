@@ -12,6 +12,14 @@ import (
 const EvidenceSchemaVersion = "observatory.behavior.v1"
 const MaxEvidenceBytes = 64 << 20
 
+// MaxTimelineEventsPerLane bounds the ordered tool-event timeline that each lane
+// publishes. The timeline is a normalized, secret-safe projection; the cap keeps
+// the public evidence bounded even when an exercise emits many syscalls. Events
+// beyond the cap are dropped from the earliest-preserving prefix and the lane is
+// flagged truncated. The value is bound into the capture-config receipt through
+// the capture protocol revision so it cannot silently drift across versions.
+const MaxTimelineEventsPerLane = 4096
+
 type Evidence struct {
 	SchemaVersion       string              `json:"schemaVersion"`
 	CaptureConfigSHA256 string              `json:"captureConfigSha256"`
@@ -21,6 +29,7 @@ type Evidence struct {
 	Observations        []Observation       `json:"observations"`
 	Canaries            []CanaryObservation `json:"canaries"`
 	Coverage            CoverageEvidence    `json:"coverage"`
+	Timeline            Timeline            `json:"timeline"`
 }
 
 type TargetEvidence struct {
@@ -122,6 +131,41 @@ type CoverageEvidence struct {
 	NetworkSyscalls bool     `json:"networkSyscalls"`
 	BaselinePaired  bool     `json:"baselinePaired"`
 	Limitations     []string `json:"limitations"`
+}
+
+// Timeline is the ordered tool-event timeline for both lanes. Unlike
+// Observations (a baseline-subtracted aggregate), the timeline preserves the
+// per-lane sequence of activity so downstream grading and future
+// declared-vs-observed comparison can reason about ordering and timing. Subjects
+// reuse the same normalization and redaction as Observations, so no raw
+// arguments, secrets, canary values, private addresses, or host paths appear.
+type Timeline struct {
+	MaxEventsPerLane int          `json:"maxEventsPerLane"`
+	Baseline         TimelineLane `json:"baseline"`
+	Exercise         TimelineLane `json:"exercise"`
+}
+
+type TimelineLane struct {
+	EventCount  int             `json:"eventCount"`
+	TotalEvents int             `json:"totalEvents"`
+	Truncated   bool            `json:"truncated"`
+	Timed       bool            `json:"timed"`
+	DurationMs  *int64          `json:"durationMs,omitempty"`
+	Events      []TimelineEvent `json:"events"`
+}
+
+type TimelineEvent struct {
+	Sequence  int    `json:"sequence"`
+	Kind      string `json:"kind"`
+	Operation string `json:"operation"`
+	Subject   string `json:"subject"`
+	Outcome   string `json:"outcome"`
+	Role      string `json:"role,omitempty"`
+	Canary    string `json:"canary,omitempty"`
+	// OffsetMs is the millisecond offset from the lane's first captured event.
+	// It is present only when the lane carries trustworthy monotonic timing;
+	// offsets are relative so no absolute wall-clock time is published.
+	OffsetMs *int64 `json:"offsetMs,omitempty"`
 }
 
 type CaptureMetadata struct {
@@ -242,9 +286,88 @@ func ValidateEvidence(evidence Evidence) error {
 			return errors.New("evidence contains an invalid canary observation")
 		}
 	}
+	if err := validateTimeline(evidence.Timeline); err != nil {
+		return err
+	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {
 		return fmt.Errorf("evidence exceeds maximum encoded size (%d bytes)", MaxEvidenceBytes)
+	}
+	return nil
+}
+
+// validateTimeline fails closed on any malformed timeline so incomplete or
+// tampered captures cannot be published. It enforces the per-lane bound,
+// contiguous sequence numbering, a closed outcome vocabulary, secret-safe
+// subjects, and the invariant that timing offsets appear only for timed lanes
+// and remain non-decreasing within the reported duration.
+func validateTimeline(timeline Timeline) error {
+	if timeline.MaxEventsPerLane != MaxTimelineEventsPerLane {
+		return errors.New("evidence timeline per-lane event bound is missing or unsupported")
+	}
+	if err := validateTimelineLane(timeline.Baseline); err != nil {
+		return fmt.Errorf("evidence baseline timeline is invalid: %w", err)
+	}
+	if err := validateTimelineLane(timeline.Exercise); err != nil {
+		return fmt.Errorf("evidence exercise timeline is invalid: %w", err)
+	}
+	return nil
+}
+
+func validateTimelineLane(lane TimelineLane) error {
+	if lane.Events == nil {
+		return errors.New("events are required")
+	}
+	if lane.EventCount != len(lane.Events) {
+		return errors.New("event count does not match its events")
+	}
+	if lane.EventCount > MaxTimelineEventsPerLane {
+		return errors.New("event count exceeds the per-lane bound")
+	}
+	if lane.TotalEvents < lane.EventCount {
+		return errors.New("total events cannot be fewer than published events")
+	}
+	if lane.Truncated != (lane.TotalEvents > lane.EventCount) {
+		return errors.New("truncation flag is inconsistent with the event counts")
+	}
+	if !lane.Timed && lane.DurationMs != nil {
+		return errors.New("untimed lane must not report a duration")
+	}
+	if lane.Timed && (lane.DurationMs == nil || *lane.DurationMs < 0) {
+		return errors.New("timed lane must report a non-negative duration")
+	}
+	var lastOffset int64 = -1
+	for index, event := range lane.Events {
+		if event.Sequence != index+1 {
+			return errors.New("event sequence is not contiguous")
+		}
+		if event.Kind != "file" && event.Kind != "process" && event.Kind != "network" {
+			return errors.New("event kind is unsupported")
+		}
+		if strings.TrimSpace(event.Operation) == "" || strings.TrimSpace(event.Subject) == "" {
+			return errors.New("event operation and subject are required")
+		}
+		if len(event.Subject) > 4096 || strings.ContainsAny(event.Subject, "\x00\r\n") ||
+			strings.ContainsAny(event.Operation+event.Role+event.Canary, "\x00\r\n") {
+			return errors.New("event fields contain unsafe characters")
+		}
+		if event.Outcome != "completed" && event.Outcome != "denied" && event.Outcome != "error" {
+			return errors.New("event outcome is unsupported")
+		}
+		if lane.Timed {
+			if event.OffsetMs == nil || *event.OffsetMs < 0 {
+				return errors.New("timed event must report a non-negative offset")
+			}
+			if *event.OffsetMs < lastOffset {
+				return errors.New("timed event offsets must be non-decreasing")
+			}
+			if *event.OffsetMs > *lane.DurationMs {
+				return errors.New("timed event offset exceeds the lane duration")
+			}
+			lastOffset = *event.OffsetMs
+		} else if event.OffsetMs != nil {
+			return errors.New("untimed event must not report an offset")
+		}
 	}
 	return nil
 }

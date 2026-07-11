@@ -1192,7 +1192,7 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 			t.Fatalf("remote runner missing %q", required)
 		}
 	}
-	if strings.Contains(remoteRunScript, "timeout --signal=TERM") || !strings.Contains(remoteAgentScript, "ulimit -f") || !strings.Contains(remoteAgentScript, "strace -f -qq -s 0") {
+	if strings.Contains(remoteRunScript, "timeout --signal=TERM") || !strings.Contains(remoteAgentScript, "ulimit -f") || !strings.Contains(remoteAgentScript, "strace -f -qq -s 0") || !strings.Contains(remoteAgentScript, "-ttt") {
 		t.Fatalf("remote capture bounds are incomplete")
 	}
 	for _, syscall := range []string{"sendmmsg", "truncate", "ftruncate", "symlink", "symlinkat", "chdir", "fchdir", "clone", "clone3", "fork", "vfork", "unshare"} {
@@ -1478,6 +1478,11 @@ func fixtureEvidence() Evidence {
 		Observations: []Observation{},
 		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file"}},
 		Coverage:     CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, Limitations: []string{"Fixture limitation."}},
+		Timeline: Timeline{
+			MaxEventsPerLane: MaxTimelineEventsPerLane,
+			Baseline:         TimelineLane{Events: []TimelineEvent{}},
+			Exercise:         TimelineLane{Events: []TimelineEvent{}},
+		},
 	}
 }
 
@@ -1705,5 +1710,240 @@ func TestGeneratedPluginConfigDiscoversOwnedFixtureWhenCLIAvailable(t *testing.T
 	}
 	if !bytes.Contains(output, []byte(`"id": "observatory-probe"`)) && !bytes.Contains(output, []byte(`"id":"observatory-probe"`)) {
 		t.Fatalf("fixture plugin missing from inventory: %s", output)
+	}
+}
+
+func timelineTestMetadata() CaptureMetadata {
+	return CaptureMetadata{
+		RunID:             "obs_timeline",
+		BaselineWorkspace: "/run/baseline/workspace", ExerciseWorkspace: "/run/exercise/workspace",
+		BaselineState: "/run/baseline/state", ExerciseState: "/run/exercise/state",
+		BaselineHome: "/run/baseline/home", ExerciseHome: "/run/exercise/home",
+		TargetKind: "skill", TargetRoot: "/run/exercise/workspace/skills/observed",
+	}
+}
+
+func TestBuildTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T) {
+	cloudMarker := testCanaryMarkers()["cloud-credentials"]
+	baseline := "100 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
+	exercise := "200 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 1000.500000 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
+		"200 1001.000000 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n" +
+		"200 1001.250000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n" +
+		"200 1002.000000 connect(3<TCP:[1]>, {sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr(\"203.0.113.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n" +
+		"200 1002.500000 sendto(4, \"" + cloudMarker + "\", 61, 0, {sa_family=AF_INET, sin_port=htons(8000), sin_addr=inet_addr(\"10.0.0.2\")}, 16) = 61\n"
+	timeline := BuildTimeline(AnalysisInput{
+		BaselineTraces:        []string{baseline},
+		ExerciseTraces:        []string{exercise},
+		Metadata:              timelineTestMetadata(),
+		Canaries:              testCanaries(),
+		ControlPlaneAddresses: []string{"10.0.0.2:8000"},
+	})
+	if timeline.MaxEventsPerLane != MaxTimelineEventsPerLane {
+		t.Fatalf("event bound = %d", timeline.MaxEventsPerLane)
+	}
+	// Both lanes are published in full rather than baseline-subtracted.
+	if timeline.Baseline.EventCount != 1 || timeline.Baseline.Events[0].Subject != "node" || !timeline.Baseline.Timed {
+		t.Fatalf("baseline lane = %#v", timeline.Baseline)
+	}
+	exerciseLane := timeline.Exercise
+	if !exerciseLane.Timed || exerciseLane.DurationMs == nil || *exerciseLane.DurationMs != 2500 {
+		t.Fatalf("exercise timing = %#v (duration %v)", exerciseLane, exerciseLane.DurationMs)
+	}
+	type want struct {
+		kind, operation, subject, outcome, role, canary string
+		offset                                          int64
+	}
+	expected := []want{
+		{"process", "execute", "node", "completed", "", "", 0},
+		{"file", "open-for-read", "$HOME/.aws/credentials", "completed", "", "cloud-credentials", 500},
+		{"file", "open-for-read", "/etc/shadow", "denied", "", "", 1000},
+		{"file", "open-for-write", "$WORKSPACE/probe.json", "completed", "", "", 1250},
+		{"network", "connect", "203.0.113.1:9", "error", "external", "", 2000},
+		{"network", "send", "model-endpoint:8000", "completed", "model-control-plane", "", 2500},
+	}
+	if exerciseLane.EventCount != len(expected) {
+		t.Fatalf("exercise events = %#v", exerciseLane.Events)
+	}
+	for index, event := range exerciseLane.Events {
+		exp := expected[index]
+		if event.Sequence != index+1 || event.Kind != exp.kind || event.Operation != exp.operation ||
+			event.Subject != exp.subject || event.Outcome != exp.outcome || event.Role != exp.role || event.Canary != exp.canary {
+			t.Fatalf("event %d = %#v, want %#v", index, event, exp)
+		}
+		if event.OffsetMs == nil || *event.OffsetMs != exp.offset {
+			t.Fatalf("event %d offset = %v, want %d", index, event.OffsetMs, exp.offset)
+		}
+	}
+	encoded, err := json.Marshal(timeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{cloudMarker, "OBS-CANARY", "10.0.0.2"} {
+		if strings.Contains(string(encoded), leaked) {
+			t.Fatalf("timeline leaked private value %q: %s", leaked, encoded)
+		}
+	}
+	if err := validateTimeline(timeline); err != nil {
+		t.Fatalf("validate timeline: %v", err)
+	}
+}
+
+func TestBuildTimelineWithoutTimestampsOmitsOffsets(t *testing.T) {
+	exercise := "200 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT) = 5\n"
+	timeline := BuildTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: timelineTestMetadata(), Canaries: testCanaries()})
+	lane := timeline.Exercise
+	if lane.Timed || lane.DurationMs != nil || lane.EventCount != 2 {
+		t.Fatalf("untimed lane = %#v", lane)
+	}
+	for _, event := range lane.Events {
+		if event.OffsetMs != nil {
+			t.Fatalf("untimed event carried an offset: %#v", event)
+		}
+	}
+	if err := validateTimeline(timeline); err != nil {
+		t.Fatalf("validate timeline: %v", err)
+	}
+}
+
+func TestBuildTimelineRejectsNonMonotonicTimestamps(t *testing.T) {
+	// A backwards stamp makes timing untrustworthy for the whole lane, but the
+	// ordered sequence is still preserved.
+	exercise := "200 1005.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 1002.000000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_RDONLY) = 3\n"
+	lane := BuildTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: timelineTestMetadata()}).Exercise
+	if lane.Timed || lane.EventCount != 2 || lane.Events[0].OffsetMs != nil {
+		t.Fatalf("non-monotonic lane = %#v", lane)
+	}
+}
+
+func TestBuildTimelineBoundsEventsPerLane(t *testing.T) {
+	var builder strings.Builder
+	total := MaxTimelineEventsPerLane + 25
+	for index := 0; index < total; index++ {
+		fmt.Fprintf(&builder, "200 openat(AT_FDCWD, \"/tmp/f%d\", O_RDONLY) = 3\n", index)
+	}
+	lane := BuildTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: timelineTestMetadata()}).Exercise
+	if lane.EventCount != MaxTimelineEventsPerLane || lane.TotalEvents != total || !lane.Truncated {
+		t.Fatalf("bounded lane = eventCount %d totalEvents %d truncated %v", lane.EventCount, lane.TotalEvents, lane.Truncated)
+	}
+	if lane.Events[0].Sequence != 1 || lane.Events[len(lane.Events)-1].Sequence != MaxTimelineEventsPerLane {
+		t.Fatalf("sequence bounds = %d..%d", lane.Events[0].Sequence, lane.Events[len(lane.Events)-1].Sequence)
+	}
+	if err := validateTimeline(BuildTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: timelineTestMetadata()})); err != nil {
+		t.Fatalf("validate bounded timeline: %v", err)
+	}
+}
+
+func TestValidateEvidenceRejectsMalformedTimeline(t *testing.T) {
+	offset := func(value int64) *int64 { return &value }
+	tests := []struct {
+		name   string
+		mutate func(*Evidence)
+		want   string
+	}{
+		{"missing bound", func(e *Evidence) { e.Timeline.MaxEventsPerLane = 0 }, "per-lane event bound"},
+		{"nil events", func(e *Evidence) { e.Timeline.Exercise.Events = nil }, "events are required"},
+		{"count mismatch", func(e *Evidence) {
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.Timeline.Exercise.EventCount = 2
+		}, "event count does not match"},
+		{"non-contiguous sequence", func(e *Evidence) {
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 2, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.Timeline.Exercise.EventCount = 1
+			e.Timeline.Exercise.TotalEvents = 1
+		}, "sequence is not contiguous"},
+		{"bad outcome", func(e *Evidence) {
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "succeeded"}}
+			e.Timeline.Exercise.EventCount = 1
+			e.Timeline.Exercise.TotalEvents = 1
+		}, "outcome is unsupported"},
+		{"truncation mismatch", func(e *Evidence) {
+			e.Timeline.Exercise.TotalEvents = 5
+		}, "truncation flag is inconsistent"},
+		{"offset on untimed", func(e *Evidence) {
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed", OffsetMs: offset(3)}}
+			e.Timeline.Exercise.EventCount = 1
+			e.Timeline.Exercise.TotalEvents = 1
+		}, "untimed event must not report an offset"},
+		{"missing offset on timed", func(e *Evidence) {
+			e.Timeline.Exercise.Timed = true
+			e.Timeline.Exercise.DurationMs = offset(10)
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.Timeline.Exercise.EventCount = 1
+			e.Timeline.Exercise.TotalEvents = 1
+		}, "timed event must report a non-negative offset"},
+		{"unsafe subject", func(e *Evidence) {
+			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x\ninjected", Outcome: "completed"}}
+			e.Timeline.Exercise.EventCount = 1
+			e.Timeline.Exercise.TotalEvents = 1
+		}, "unsafe characters"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := fixtureEvidence()
+			test.mutate(&evidence)
+			if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildEvidenceEmitsValidatedTimedTimelineFromBundle(t *testing.T) {
+	config := validTestConfig(t, t.TempDir())
+	entries := fixtureBundleEntries("obs_timeline_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "skill", "")
+	entries["baseline/trace"] = "101 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
+	entries["exercise/trace"] = "201 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"201 2000.750000 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
+		"201 2001.000000 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n"
+	bundlePath := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(bundlePath, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(bundlePath, config.Limits.MaxBundleBytes)
+	if err != nil {
+		t.Fatalf("read timestamped bundle: %v", err)
+	}
+	evidence := BuildEvidence(fixtureEvidence().Target, config, bundle)
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatalf("validate evidence: %v", err)
+	}
+	exercise := evidence.Timeline.Exercise
+	if !exercise.Timed || exercise.EventCount != 3 || exercise.DurationMs == nil || *exercise.DurationMs != 1000 {
+		t.Fatalf("exercise timeline = %#v", exercise)
+	}
+	credentials := exercise.Events[1]
+	if credentials.Subject != "$HOME/.aws/credentials" || credentials.Canary != "cloud-credentials" {
+		t.Fatalf("credentials event = %#v", credentials)
+	}
+	if exercise.Events[2].Outcome != "denied" {
+		t.Fatalf("shadow event = %#v", exercise.Events[2])
+	}
+	if evidence.Timeline.Baseline.EventCount != 1 {
+		t.Fatalf("baseline timeline = %#v", evidence.Timeline.Baseline)
+	}
+}
+
+func TestRenderSiteShowsToolEventTimeline(t *testing.T) {
+	requireLinuxControlHost(t)
+	evidence := fixtureEvidence()
+	evidence.Timeline.Exercise = TimelineLane{
+		EventCount: 1, TotalEvents: 1, Timed: true, DurationMs: func() *int64 { v := int64(42); return &v }(),
+		Events: []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$HOME/.aws/credentials", Outcome: "denied", Canary: "cloud-credentials", OffsetMs: func() *int64 { v := int64(42); return &v }()}},
+	}
+	output := t.TempDir()
+	if err := RenderSite(output, evidence, nil); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(filepath.Join(output, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"Tool-event timeline", "$HOME/.aws/credentials", "denied", "42 ms", "canary · cloud-credentials"} {
+		if !strings.Contains(string(html), expected) {
+			t.Fatalf("timeline HTML missing %q", expected)
+		}
 	}
 }

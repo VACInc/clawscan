@@ -272,13 +272,15 @@ func safeVersion(value string) string {
 
 func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) Evidence {
 	target.Lineage = config.TargetLineage
-	analysis := AnalyzeTraces(AnalysisInput{
+	analysisInput := AnalysisInput{
 		BaselineTraces:        bundle.BaselineTraces,
 		ExerciseTraces:        bundle.ExerciseTraces,
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
-	})
+	}
+	analysis := AnalyzeTraces(analysisInput)
+	timeline := BuildTimeline(analysisInput)
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
@@ -325,6 +327,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Observations: analysis.Observations,
 		Canaries:     analysis.Canaries,
 		Coverage:     analysis.Coverage,
+		Timeline:     timeline,
 	}
 }
 

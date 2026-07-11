@@ -105,7 +105,13 @@ Top-level sections:
   never presented as a completed read or write;
 - `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
-  scope (never an exhaustive Linux-audit claim), and concrete limitations.
+  scope (never an exhaustive Linux-audit claim), and concrete limitations;
+- `timeline`: an ordered, per-lane tool-event sequence for both the baseline and
+  exercise lanes with contiguous sequence numbers, normalized secret-safe
+  subjects, completion/denial/error outcomes, path-based canary attribution, and
+  relative `offsetMs` timing published only when the capture provides monotonic
+  per-event timestamps. Each lane is bounded and flags truncation; the timeline
+  never carries raw arguments, canary values, private addresses, or host paths.
 
 The schema deliberately has no verdict, severity, score, or recommendation field.
 

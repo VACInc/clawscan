@@ -14,6 +14,12 @@ import (
 
 const MaxClawscanArtifactBytes = 256 << 20
 
+// maxTimelineDisplayRows bounds how many timeline rows each lane renders into the
+// HTML page. The complete ordered timeline always ships in the JSON projection;
+// the page shows only an earliest-first preview so a busy exercise cannot bloat
+// the static evidence page.
+const maxTimelineDisplayRows = 250
+
 type VersionChange struct {
 	Change        string
 	Kind          string
@@ -279,6 +285,12 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
 		return value
 	},
 	"upper": strings.ToUpper,
+	"timelinePreview": func(events []TimelineEvent) []TimelineEvent {
+		if len(events) > maxTimelineDisplayRows {
+			return events[:maxTimelineDisplayRows]
+		}
+		return events
+	},
 }).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -295,6 +307,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     .eyebrow { color:var(--cyan); font:700 12px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; text-transform:uppercase; }
     h1 { margin:0; font-size:clamp(32px,6vw,64px); line-height:1.02; letter-spacing:-.045em; }
     h2 { margin:0 0 14px; font-size:20px; letter-spacing:-.02em; }
+    h3 { margin:20px 0 8px; font-size:14px; letter-spacing:.01em; color:var(--cyan); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
     p { margin:0; }
     .lede { max-width:760px; color:var(--muted); font-size:17px; }
     .badge { display:inline-flex; width:max-content; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line); border-radius:999px; background:#0b111b; color:var(--muted); font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace; }
@@ -353,6 +366,16 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
+  <section class="panel"><h2>Tool-event timeline</h2>
+    <p class="muted">Ordered, normalized tool events for each lane. Subjects are redacted and raw arguments are never shown; the complete ordered sequence ships in the JSON projection while this page previews up to 250 events per lane.</p>
+    <h3>Baseline lane · {{.Evidence.Timeline.Baseline.EventCount}} event(s){{if .Evidence.Timeline.Baseline.Truncated}} · {{.Evidence.Timeline.Baseline.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.Timeline.Baseline.Timed}} · {{.Evidence.Timeline.Baseline.DurationMs}} ms span{{end}}</h3>
+    {{template "timelineLane" .Evidence.Timeline.Baseline}}
+    <h3>Exercise lane · {{.Evidence.Timeline.Exercise.EventCount}} event(s){{if .Evidence.Timeline.Exercise.Truncated}} · {{.Evidence.Timeline.Exercise.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.Timeline.Exercise.Timed}} · {{.Evidence.Timeline.Exercise.DurationMs}} ms span{{end}}</h3>
+    {{template "timelineLane" .Evidence.Timeline.Exercise}}
+  </section>
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>
-</main></body></html>`))
+</main></body></html>
+{{define "timelineLane"}}{{if .Events}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Offset</th></tr></thead><tbody>
+    {{range timelinePreview .Events}}<tr><td>{{.Sequence}}</td><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Canary}}<div class="muted">canary · {{.Canary}}</div>{{else if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No tool events captured in this lane.</p>{{end}}{{end}}`))
