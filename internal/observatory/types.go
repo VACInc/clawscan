@@ -20,6 +20,7 @@ type Evidence struct {
 	Exercise            ExerciseEvidence    `json:"exercise"`
 	Observations        []Observation       `json:"observations"`
 	Canaries            []CanaryObservation `json:"canaries"`
+	Persistence         PersistenceEvidence `json:"persistence"`
 	Coverage            CoverageEvidence    `json:"coverage"`
 }
 
@@ -122,6 +123,39 @@ type CoverageEvidence struct {
 	NetworkSyscalls bool     `json:"networkSyscalls"`
 	BaselinePaired  bool     `json:"baselinePaired"`
 	Limitations     []string `json:"limitations"`
+}
+
+// PersistenceEvidence reports persistence- and lifecycle-relevant behavior for a
+// bounded, curated set of surfaces. Findings distinguish attempted-but-denied
+// operations (outcome "attempted") from successful residual changes confirmed by
+// a before/after lane inventory (residual "confirmed"). The surface catalog makes
+// coverage explicit; it is not an exhaustive host persistence audit.
+type PersistenceEvidence struct {
+	Scope           string               `json:"scope"`
+	InventoryPaired bool                 `json:"inventoryPaired"`
+	Surfaces        []PersistenceSurface `json:"surfaces"`
+	Findings        []PersistenceFinding `json:"findings"`
+	Limitations     []string             `json:"limitations"`
+}
+
+type PersistenceSurface struct {
+	ID          string `json:"id"`
+	Category    string `json:"category"`
+	Scope       string `json:"scope"`
+	Description string `json:"description"`
+}
+
+type PersistenceFinding struct {
+	Surface       string `json:"surface"`
+	Category      string `json:"category"`
+	Operation     string `json:"operation"`
+	Subject       string `json:"subject"`
+	Outcome       string `json:"outcome"`
+	Evidence      string `json:"evidence"`
+	Residual      string `json:"residual"`
+	BaselineCount int    `json:"baselineCount"`
+	ExerciseCount int    `json:"exerciseCount"`
+	DeltaCount    int    `json:"deltaCount"`
 }
 
 type CaptureMetadata struct {
@@ -242,9 +276,68 @@ func ValidateEvidence(evidence Evidence) error {
 			return errors.New("evidence contains an invalid canary observation")
 		}
 	}
+	if err := validatePersistenceEvidence(evidence.Persistence); err != nil {
+		return err
+	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {
 		return fmt.Errorf("evidence exceeds maximum encoded size (%d bytes)", MaxEvidenceBytes)
+	}
+	return nil
+}
+
+func validatePersistenceEvidence(persistence PersistenceEvidence) error {
+	if persistence.Scope != persistenceScope {
+		return errors.New("evidence persistence scope is missing or unsupported")
+	}
+	if persistence.Surfaces == nil || persistence.Findings == nil || persistence.Limitations == nil {
+		return errors.New("evidence persistence surfaces, findings, and limitations are required")
+	}
+	if len(persistence.Surfaces) == 0 {
+		return errors.New("evidence persistence surface catalog is empty")
+	}
+	validSurfaceScope := map[string]bool{"agent": true, "user": true, "system": true}
+	surfaceCategory := map[string]string{}
+	for _, surface := range persistence.Surfaces {
+		if !persistenceSurfaceIDPattern.MatchString(surface.ID) || surface.Category == "" || len(surface.Category) > 64 ||
+			!validSurfaceScope[surface.Scope] || strings.TrimSpace(surface.Description) == "" ||
+			len(surface.Description) > 200 || strings.ContainsAny(surface.Category+surface.Description, "\x00\r\n") {
+			return errors.New("evidence persistence surface catalog is invalid")
+		}
+		if _, duplicate := surfaceCategory[surface.ID]; duplicate {
+			return errors.New("evidence persistence surface catalog has duplicate identifiers")
+		}
+		surfaceCategory[surface.ID] = surface.Category
+	}
+	validOutcome := map[string]bool{"succeeded": true, "attempted": true}
+	validEvidence := map[string]bool{"syscall": true, "inventory": true, "syscall+inventory": true}
+	validResidual := map[string]bool{"confirmed": true, "not-observed": true, "unavailable": true}
+	for _, finding := range persistence.Findings {
+		category, known := surfaceCategory[finding.Surface]
+		if !known || finding.Category != category {
+			return errors.New("evidence persistence finding references an unknown surface")
+		}
+		if finding.Operation == "" || finding.Subject == "" || len(finding.Subject) > 512 ||
+			strings.ContainsAny(finding.Subject, "\x00\r\n") || strings.Contains(finding.Subject, "OBS-CANARY-") {
+			return errors.New("evidence contains an invalid persistence finding subject")
+		}
+		if !validOutcome[finding.Outcome] || !validEvidence[finding.Evidence] || !validResidual[finding.Residual] {
+			return errors.New("evidence contains an invalid persistence finding classification")
+		}
+		expectedDelta := finding.ExerciseCount - finding.BaselineCount
+		if finding.BaselineCount < 0 || finding.ExerciseCount < 0 || expectedDelta < 1 || finding.DeltaCount != expectedDelta {
+			return errors.New("evidence contains an invalid persistence finding count")
+		}
+		// A confirmed residual must be backed by inventory; an inventory-backed
+		// finding must be a confirmed, successful change. This keeps the
+		// attempted-vs-residual distinction unambiguous for grading.
+		inventoryBacked := finding.Evidence == "inventory" || finding.Evidence == "syscall+inventory"
+		if (finding.Residual == "confirmed") != inventoryBacked {
+			return errors.New("evidence persistence residual state is inconsistent with its evidence source")
+		}
+		if inventoryBacked && finding.Outcome != "succeeded" {
+			return errors.New("evidence persistence inventory-confirmed finding must record a succeeded outcome")
+		}
 	}
 	return nil
 }

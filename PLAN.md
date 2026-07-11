@@ -104,6 +104,10 @@ Top-level sections:
   counts, outcome; file descriptor acquisition is labeled `open-for-*` and is
   never presented as a completed read or write;
 - `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
+- `persistence`: a curated `selected-persistence-surfaces` catalog plus findings
+  that distinguish attempted-but-denied persistence operations from successful
+  residual changes confirmed by a before/after lane inventory; no reboot cycle,
+  no verdict, and no claim of exhaustive host persistence detection;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), and concrete limitations.
 

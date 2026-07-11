@@ -823,9 +823,29 @@ func TestScanStagesAndConsumesFixtureExecutorBundle(t *testing.T) {
 	if result.Evidence.Run.Status != "completed" || len(result.Evidence.Observations) == 0 {
 		t.Fatalf("evidence = %#v", result.Evidence)
 	}
+	if !result.Evidence.Persistence.InventoryPaired {
+		t.Fatalf("persistence inventory was not paired: %#v", result.Evidence.Persistence)
+	}
+	shellInit := findPersistenceFinding(result.Evidence.Persistence.Findings, "shell-init", "$HOME/.bashrc")
+	if shellInit.Outcome != "succeeded" || shellInit.Residual != "confirmed" || shellInit.Evidence != "syscall+inventory" {
+		t.Fatalf("shell-init residual finding = %#v", shellInit)
+	}
+	systemCron := findPersistenceFinding(result.Evidence.Persistence.Findings, "system-cron", "/etc/cron.d/observatory-probe")
+	if systemCron.Outcome != "attempted" || systemCron.Residual == "confirmed" || systemCron.Evidence != "syscall" {
+		t.Fatalf("system-cron attempted finding = %#v", systemCron)
+	}
 	if _, err := os.Stat(filepath.Join(result.RunDirectory, "evidence.json")); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func findPersistenceFinding(findings []PersistenceFinding, surface string, subject string) PersistenceFinding {
+	for _, finding := range findings {
+		if finding.Surface == surface && finding.Subject == subject {
+			return finding
+		}
+	}
+	return PersistenceFinding{}
 }
 
 func TestScanReturnsValidatedEvidenceWhenExecutorExitsNonzero(t *testing.T) {
@@ -1390,8 +1410,12 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"201 openat(AT_FDCWD, \"" + targetFile + "\", O_RDONLY) = 3\n" +
 		"201 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
 		"201 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n" +
-		"201 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n"
+		"201 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n" +
+		"201 openat(AT_FDCWD, \"/run/exercise/home/.bashrc\", O_WRONLY|O_CREAT|O_APPEND, 0600) = 6\n" +
+		"201 openat(AT_FDCWD, \"/etc/cron.d/observatory-probe\", O_WRONLY|O_CREAT, 0644) = -1 EROFS (Read-only file system)\n"
 	canaryJSON, _ := json.Marshal(testCanaryMarkers())
+	stateInventory := "0600\t" + strings.Repeat("1", 64) + "\tstate/openclaw.json\n"
+	bashrcInventory := "0600\t" + strings.Repeat("2", 64) + "\thome/.bashrc\n"
 	return map[string]string{
 		"meta/run-id":                runID + "\n",
 		"meta/target-sha256":         targetSHA256 + "\n",
@@ -1416,6 +1440,10 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"exercise/trace":             exerciseTrace,
 		"baseline/agent.stdout":      "baseline\n",
 		"exercise/agent.stdout":      "exercise\n",
+		"baseline/inventory.before":  stateInventory,
+		"baseline/inventory.after":   stateInventory,
+		"exercise/inventory.before":  stateInventory,
+		"exercise/inventory.after":   stateInventory + bashrcInventory,
 	}
 }
 
@@ -1477,6 +1505,7 @@ func fixtureEvidence() Evidence {
 		Exercise:     ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
 		Observations: []Observation{},
 		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file"}},
+		Persistence:  PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
 		Coverage:     CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, Limitations: []string{"Fixture limitation."}},
 	}
 }
