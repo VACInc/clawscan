@@ -58,3 +58,12 @@ limits:
   maxMemoryBytes: 2147483648
   cpuQuotaPercent: 200
   maxTasks: 256
+
+history:
+  # Local version-diff history is on by default; set enabled: false to opt out.
+  # It never fetches versions or targets from the network.
+  enabled: true
+  # Bounded number of prior evidence snapshots kept per stable lineage/plugin
+  # ID. Older snapshots beyond this are pruned from the private history store
+  # only; per-run artifact directories and raw bundles are never touched.
+  retain: 10

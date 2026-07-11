@@ -105,6 +105,52 @@ coverage, and refuses incomplete captures. It never labels incomparable runs as
 a version delta. Version deltas include both normalized trace observations and
 synthetic-canary interaction changes.
 
+## Hands-off version-diff history
+
+Every scan of a completed capture records its public evidence in a bounded
+local history keyed by the stable lineage (skills) or manifest ID (plugins).
+On the next release, `observatory scan` selects the latest strictly comparable
+prior evidence for that identity and renders or emits an evidence-based version
+delta — no version, target, or history is ever fetched from the network.
+
+```bash
+# Record this scan and render a site that auto-includes the latest comparable
+# predecessor delta. Also write the structured delta document.
+./bin/observatory scan --config ./observatory.yml \
+  --site ./site --delta ./version-delta.json ./path/to/skill
+
+# Render a delta later from stored history instead of a hand-picked file.
+./bin/observatory render --input ./skill-v2.json --output ./site \
+  --auto-previous --config ./observatory.yml
+```
+
+The evidence JSON on stdout is unchanged; delta selection is a side channel and
+never pollutes the Clawscan adapter contract. The current run is recorded before
+selection and is excluded from its own predecessor search. Selection reuses the
+same comparability gate as `--previous`: a mismatched capture protocol,
+isolation receipt, prompt, model, resource limits, or target kind/identity is
+skipped rather than diffed, and a completed run with no comparable predecessor
+simply renders current evidence only. Corrupt history (an unparseable index or a
+damaged snapshot) fails closed: `scan` omits the delta with a diagnostic, and an
+explicit `render --auto-previous` returns an error. The structured
+`observatory.version-delta.v1` document carries the behavioral `changes` plus a
+reserved, nil-by-default `grade` field so a future external grade signal can be
+integrated alongside — never in place of — the evidence-based delta.
+
+History is configured under `history` in the Observatory YAML:
+
+```yaml
+history:
+  enabled: true   # default; set false to disable recording and diffs
+  retain: 10      # bounded snapshots kept per stable lineage/plugin ID (1..1000)
+```
+
+Retention prunes only the private history snapshots; canonical per-run artifact
+directories and raw capture bundles are never removed. History snapshots live
+under `<artifactsDir>/history` with owner-only permissions and contain only the
+public evidence projection, preserving the private/public artifact boundary.
+Use `--no-history` to skip recording and diffing for a single run.
+
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
 capture. Their canonical digest

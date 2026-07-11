@@ -36,6 +36,7 @@ type Config struct {
 	Runtime       RuntimeConfig   `yaml:"runtime"`
 	Exercise      ExerciseConfig  `yaml:"exercise"`
 	Limits        LimitsConfig    `yaml:"limits"`
+	History       HistoryConfig   `yaml:"history"`
 }
 
 type ExecutorConfig struct {
@@ -92,6 +93,35 @@ type LimitsConfig struct {
 	MaxMemoryBytes int64 `yaml:"maxMemoryBytes"`
 	CPUQuotaPct    int   `yaml:"cpuQuotaPercent"`
 	MaxTasks       int   `yaml:"maxTasks"`
+}
+
+// HistoryConfig governs the local version-diff history store. It is
+// orchestration metadata only and is deliberately excluded from the
+// capture-configuration digest so it never affects comparability.
+type HistoryConfig struct {
+	// Enabled defaults to true when omitted; set false to opt out of recording
+	// and automatic predecessor selection entirely.
+	Enabled *bool `yaml:"enabled"`
+	// Retain bounds how many prior evidence snapshots are kept per stable
+	// lineage/plugin identity. Older snapshots beyond this bound are pruned from
+	// the history store only; canonical per-run artifact directories and raw
+	// capture bundles are never touched. Zero selects the built-in default.
+	Retain int `yaml:"retain"`
+}
+
+// HistoryEnabled reports whether local version-diff history is active. History
+// is on by default; only an explicit history.enabled: false disables it.
+func (config Config) HistoryEnabled() bool {
+	return config.History.Enabled == nil || *config.History.Enabled
+}
+
+// HistoryRetain resolves the effective bounded retention count, applying the
+// built-in default when the operator left it unset.
+func (config Config) HistoryRetain() int {
+	if config.History.Retain <= 0 {
+		return 10
+	}
+	return config.History.Retain
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -205,6 +235,9 @@ func (config *Config) applyDefaults() {
 	if config.Limits.MaxTasks == 0 {
 		config.Limits.MaxTasks = 256
 	}
+	if config.History.Retain == 0 {
+		config.History.Retain = 10
+	}
 	if config.ArtifactsDir == "" {
 		if cacheDir, err := os.UserCacheDir(); err == nil {
 			config.ArtifactsDir = filepath.Join(cacheDir, "clawhub-observatory", "runs")
@@ -292,6 +325,12 @@ func (config Config) Validate() error {
 	}
 	if config.Limits.MaxTasks < 32 || config.Limits.MaxTasks > 1024 {
 		return errors.New("limits.maxTasks must be between 32 and 1024")
+	}
+	// Zero means "use the built-in default"; anything outside the bound is a
+	// misconfiguration. Retention is intentionally capped so history cannot grow
+	// without limit.
+	if config.History.Retain < 0 || config.History.Retain > 1000 {
+		return errors.New("history.retain must be between 1 and 1000")
 	}
 	return nil
 }
