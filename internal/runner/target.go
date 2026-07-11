@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -76,8 +77,8 @@ func classifyLocalTarget(resolvedPath string, input string) (kind string, id str
 			return targetKindSkill, "", nil
 		}
 	}
-	hasPlugin := regularFileExists(filepath.Join(dir, observatory.PluginManifestName))
-	hasSkill := regularFileExists(filepath.Join(dir, observatory.SkillManifestName))
+	hasPlugin := regularManifestExists(filepath.Join(dir, observatory.PluginManifestName))
+	hasSkill := regularManifestExists(filepath.Join(dir, observatory.SkillManifestName))
 	if !hasPlugin {
 		return targetKindSkill, "", nil
 	}
@@ -91,25 +92,53 @@ func classifyLocalTarget(resolvedPath string, input string) (kind string, id str
 	return targetKindPlugin, id, nil
 }
 
-func regularFileExists(path string) bool {
-	info, err := os.Stat(path)
+// regularManifestExists reports whether path is an existing regular file
+// without following symlinks. A target cannot present a symlinked or special
+// manifest to be classified: an untrusted target could point its manifest at a
+// host file outside the target, so only a real regular file counts here.
+func regularManifestExists(path string) bool {
+	info, err := os.Lstat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
 // readPluginID parses the stable plugin identity from a plugin manifest and
 // validates it against the canonical OpenClaw plugin identifier grammar shared
 // with the Observatory stager, so a plugin the runner accepts also stages.
+//
+// It never follows a symlink: the manifest is opened O_NOFOLLOW and re-checked
+// against a leading lstat, so a target that swaps its regular manifest for a
+// symlink (racing between classification and read) fails closed instead of
+// exposing an outside host file. The lstat/fstat identity check backstops
+// platforms without an O_NOFOLLOW equivalent.
 func readPluginID(manifestPath string) (string, error) {
-	info, err := os.Stat(manifestPath)
+	before, err := os.Lstat(manifestPath)
 	if err != nil {
 		return "", err
 	}
-	if info.Size() > maxPluginManifestBytes {
+	if !before.Mode().IsRegular() {
+		return "", fmt.Errorf("%s must be a regular file, not a symlink or special file", observatory.PluginManifestName)
+	}
+	file, err := os.OpenFile(manifestPath, os.O_RDONLY|openNoFollowFlag, 0)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return "", fmt.Errorf("%s changed while it was being read", observatory.PluginManifestName)
+	}
+	if opened.Size() > maxPluginManifestBytes {
 		return "", fmt.Errorf("%s exceeds 1 MiB", observatory.PluginManifestName)
 	}
-	data, err := os.ReadFile(manifestPath)
+	data, err := io.ReadAll(io.LimitReader(file, maxPluginManifestBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if int64(len(data)) > maxPluginManifestBytes {
+		return "", fmt.Errorf("%s exceeds 1 MiB", observatory.PluginManifestName)
 	}
 	var manifest struct {
 		ID string `json:"id"`

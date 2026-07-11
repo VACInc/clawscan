@@ -118,6 +118,87 @@ func TestResolveTargetRejectsAmbiguousManifests(t *testing.T) {
 	}
 }
 
+func TestResolveTargetIgnoresSymlinkedPluginManifest(t *testing.T) {
+	// A hostile target must not be able to point openclaw.plugin.json at a host
+	// file outside the target and be classified/read as that plugin.
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "openclaw.plugin.json")
+	if err := os.WriteFile(outside, []byte(`{"id":"outside-evil"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "probe-plugin")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(target, "openclaw.plugin.json")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	resolved, err := resolveTarget(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.kind != targetKindSkill || resolved.id != "" {
+		t.Fatalf("symlinked manifest was followed: %#v", resolved)
+	}
+}
+
+func TestReadPluginIDRejectsSymlinkManifest(t *testing.T) {
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "secret.json")
+	if err := os.WriteFile(outside, []byte(`{"id":"outside-evil"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "openclaw.plugin.json")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	id, err := readPluginID(link)
+	if err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("id = %q err = %v", id, err)
+	}
+	if id != "" {
+		t.Fatalf("id leaked from symlinked manifest: %q", id)
+	}
+}
+
+func TestReadPluginIDReadsRegularManifest(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "probe-plugin")
+	writeProbePlugin(t, dir)
+	id, err := readPluginID(filepath.Join(dir, "openclaw.plugin.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "observatory-probe" {
+		t.Fatalf("id = %q", id)
+	}
+}
+
+func TestResolveTargetIgnoresSymlinkManifestNextToSkill(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "mixed")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "openclaw.plugin.json")
+	if err := os.WriteFile(outside, []byte(`{"id":"outside-evil"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "openclaw.plugin.json")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	// The symlinked plugin manifest is not a real manifest, so the directory is
+	// an unambiguous skill rather than a rejected ambiguous target.
+	resolved, err := resolveTarget(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.kind != targetKindSkill || resolved.id != "" {
+		t.Fatalf("resolved = %#v", resolved)
+	}
+}
+
 func TestResolveTargetRejectsInvalidPluginID(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "bad-plugin")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
