@@ -1209,10 +1209,18 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 			t.Fatalf("%s syntax: %v: %s", name, err, output)
 		}
 	}
-	rules := guestFirewallRules("obs_fixture", []string{"10.0.0.2:8000"})
+	rules := guestFirewallRules("obs_fixture", []string{"10.0.0.2:8000"}, MockEgressConfig{})
 	for _, expected := range []string{"policy drop", "ip saddr @MANAGEMENT_IPV4@ tcp dport 22 accept", "ip daddr 10.0.0.2 tcp dport 8000 accept"} {
 		if !strings.Contains(rules, expected) {
 			t.Fatalf("guest firewall missing %q:\n%s", expected, rules)
+		}
+	}
+	if strings.Contains(rules, "controlled-mock-egress-sink") {
+		t.Fatalf("disabled mock egress leaked a firewall rule:\n%s", rules)
+	}
+	for _, required := range []string{"mock-egress-sink.mjs", "run_lane_and_capture baseline", "run_lane_and_capture exercise", "controlled mock egress receipt is missing", "r.mockEgressIps"} {
+		if !strings.Contains(remoteRunScript, required) {
+			t.Fatalf("remote runner missing mock egress wiring %q", required)
 		}
 	}
 	if !strings.Contains(remoteRunScript, "management peer must be literal IPv4") || !strings.Contains(remoteRunScript, `input.replace(marker,peer)`) {
@@ -1348,6 +1356,11 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 		TargetKind       string            `json:"targetKind"`
 		TargetID         string            `json:"targetId"`
 		Canaries         map[string]string `json:"canaries"`
+		MockEgress       struct {
+			Enabled bool   `json:"enabled"`
+			Host    string `json:"host"`
+			Port    int    `json:"port"`
+		} `json:"mockEgress"`
 	}
 	if err := json.Unmarshal(runtimeData, &runtime); err != nil {
 		executor.t.Fatal(err)
@@ -1370,6 +1383,12 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 	entries["meta/canaries.json"] = string(canaryJSON) + "\n"
 	entries["meta/baseline-exit"] = fmt.Sprintf("%d\n", executor.baselineExit)
 	entries["meta/exercise-exit"] = fmt.Sprintf("%d\n", executor.exerciseExit)
+	if runtime.MockEgress.Enabled {
+		host, port := runtime.MockEgress.Host, runtime.MockEgress.Port
+		entries["exercise/trace"] += fmt.Sprintf("201 connect(9<TCP:[127.0.0.3:40000->%s:%d]>, {sa_family=AF_INET, sin_port=htons(%d), sin_addr=inet_addr(%q)}, 16) = 0\n", host, port, port, host)
+		entries["baseline/mock-egress.json"] = mockEgressReceiptJSON(host, port, "baseline", 0, nil)
+		entries["exercise/mock-egress.json"] = mockEgressReceiptJSON(host, port, "exercise", 1, []byte("exfil "+runtime.Canaries["cloud-credentials"]))
+	}
 	if err := writeTestBundle(bundlePath, entries); err != nil {
 		executor.t.Fatal(err)
 	}

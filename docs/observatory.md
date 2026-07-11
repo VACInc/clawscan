@@ -161,6 +161,39 @@ Target digests bind file contents plus file/directory modes. A root-owned mode
 manifest restores permissions and empty directories that Git does not retain;
 target-controlled Git attributes are rejected.
 
+## Controlled mock egress
+
+Controlled mock egress is an opt-in upgrade from safe outbound-attempt evidence
+to payload-aware evidence, without permitting any arbitrary real egress. It is
+disabled by default; when disabled the scan behaves exactly as before.
+
+When enabled under `runtime.mockEgress`, Observatory runs a bounded, guest-local
+loopback sink once per lane, outside the untrusted agent cgroup. The sink is
+pinned to an exact IPv4 loopback address and port, so captured bytes never leave
+the VM. The target reaches it only through a distinct per-lane cgroup allowlist
+entry that is kept separate from the exact model control-plane allowlist;
+everything else stays default-deny. The sink applies strict request, per-request
+byte, total byte, and wall-clock caps, and returns an optional deterministic
+canned response.
+
+The public evidence gains a `mockEgress` section with the sink port class,
+baseline/exercise/delta request and byte counts, a payload digest, a payload
+encoding label, and the IDs of any synthetic canaries observed in the captured
+bytes. Raw captured bytes stay only in the private per-lane receipt inside the
+capture bundle. TLS-encrypted or otherwise opaque payloads are recorded as byte
+counts and are never decoded, and canary scanning is skipped for them — the
+evidence never pretends opaque traffic was read. Connect/send observations to the
+sink are labeled `controlled-sink:<port>`; the raw loopback address is redacted.
+
+The system fails closed: when the sink is enabled the bundle must contain a
+per-lane receipt whose recorded sink identity matches the configured address, and
+a receipt present while the sink is disabled is rejected. The applied guest
+firewall receipt remains required, and the sink is pinned into the stable
+firewall-policy digest so the receipt changes when the sink configuration does.
+
+Sizing: `limits.maxBundleBytes` must leave room for both per-lane receipts, at
+least `mockEgress.maxTotalBytes * 2 + 1 MiB`.
+
 ## Owned fixture proof
 
 Development and validation use only:
@@ -184,6 +217,9 @@ no declared tools require an operator-supplied `exercise.prompt`.
 - One bounded task cannot cover every branch.
 - Results depend on model/tool behavior and synthetic inputs.
 - `strace` provides endpoint addresses, not complete DNS or payload attribution.
+- Payload capture is limited to traffic reaching the pinned controlled mock
+  egress sink; all other destinations stay default-denied and appear only as
+  attempts. Opaque or TLS-encrypted sink payloads are counted, never decoded.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
 - Behavioral correlation is not author intent and is never a safety verdict.

@@ -173,6 +173,9 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
+	if err := verifyCaptureMockEgress(bundle, effectiveConfig.Runtime.MockEgress); err != nil {
+		return ScanResult{RunDirectory: runDir}, err
+	}
 	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
 	if err := ValidateEvidence(evidence); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
@@ -249,6 +252,9 @@ func AnalyzeBundle(target string, config Config, bundlePath string) (Evidence, e
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return Evidence{}, err
 	}
+	if err := verifyCaptureMockEgress(bundle, effectiveConfig.Runtime.MockEgress); err != nil {
+		return Evidence{}, err
+	}
 	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
 	if err := ValidateEvidence(evidence); err != nil {
 		return Evidence{}, err
@@ -305,7 +311,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v14"
+const CaptureProtocolRevision = "observatory.capture-protocol.v15"
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -399,6 +405,8 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"cpuQuotaPercent":     config.Limits.CPUQuotaPct,
 		"maxTasks":            config.Limits.MaxTasks,
 		"controlPlaneIps":     controlPlaneIPs(config.Runtime.ControlPlaneAddresses),
+		"mockEgressIps":       mockEgressCgroupIPs(config.Runtime.MockEgress),
+		"mockEgress":          mockEgressRuntime(config.Runtime.MockEgress, config.Runtime.TimeoutSeconds),
 		"firewallTable":       "observatory_" + runID,
 		"canaries":            canaries,
 		"model": map[string]any{
@@ -429,7 +437,10 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err := writeJSON(filepath.Join(runnerDir, "target-modes.json"), targetModes, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(runnerDir, "firewall.nft"), []byte(guestFirewallRules(runID, config.Runtime.ControlPlaneAddresses)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(runnerDir, "firewall.nft"), []byte(guestFirewallRules(runID, config.Runtime.ControlPlaneAddresses, config.Runtime.MockEgress)), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(runnerDir, "mock-egress-sink.mjs"), []byte(mockEgressSinkScript), 0o644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(runnerDir, "run-agent.sh"), []byte(remoteAgentScript), 0o755); err != nil {
@@ -444,7 +455,7 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	return os.WriteFile(filepath.Join(stageDir, ".gitattributes"), []byte("* -text -filter -ident\n"), 0o644)
 }
 
-func guestFirewallRules(runID string, endpoints []string) string {
+func guestFirewallRules(runID string, endpoints []string, mockEgress MockEgressConfig) string {
 	var rules strings.Builder
 	fmt.Fprintf(&rules, "table inet observatory_%s {\n", runID)
 	rules.WriteString("  chain input {\n    type filter hook input priority -50; policy drop;\n")
@@ -461,6 +472,15 @@ func guestFirewallRules(runID string, endpoints []string) string {
 			family = "ip6"
 		}
 		fmt.Fprintf(&rules, "    %s daddr %s tcp dport %s accept\n", family, strings.Trim(host, "[]"), port)
+	}
+	// Explicit, auditable pin for the loopback controlled sink. Loopback is already
+	// broadly accepted above, so the real per-lane gate is the cgroup allowlist;
+	// this rule binds the exact sink host and port into the policy digest so the
+	// firewall receipt changes whenever the sink configuration does.
+	if mockEgress.Enabled {
+		if host, port, err := mockEgressHostPort(mockEgress.Address); err == nil {
+			fmt.Fprintf(&rules, "    ip daddr %s tcp dport %s accept comment \"controlled-mock-egress-sink\"\n", host, port)
+		}
 	}
 	rules.WriteString("  }\n  chain forward {\n    type filter hook forward priority -50; policy drop;\n  }\n}\n")
 	return rules.String()

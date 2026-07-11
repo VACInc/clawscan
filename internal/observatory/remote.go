@@ -231,8 +231,10 @@ as_root install -m 0600 "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
 as_root install -m 0600 "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
 as_root install -m 0600 "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
 as_root install -m 0600 "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
+as_root install -m 0600 "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
 as_root install -m 0700 "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
 RUNTIME_JSON="$CONTROL/runtime.json"
+MOCK_EGRESS_ENABLED=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.mockEgress && r.mockEgress.enabled ? "1" : "0")' "$RUNTIME_JSON")
 
 SSH_PEER=${SSH_CONNECTION:-}
 SSH_PEER=${SSH_PEER%% *}
@@ -318,6 +320,11 @@ run_lane() {
   while IFS= read -r address; do
     [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
   done < <(node -e 'const r=require(process.argv[1]); for (const value of r.controlPlaneIps) console.log(value)' "$RUNTIME_JSON")
+  # The controlled mock egress sink is a distinct, auditable allowlist entry kept
+  # separate from the exact model control-plane allowlist above.
+  while IFS= read -r address; do
+    [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
+  done < <(node -e 'const r=require(process.argv[1]); for (const value of (r.mockEgressIps||[])) console.log(value)' "$RUNTIME_JSON")
   local code=0
   as_root systemd-run --quiet --wait --collect --unit="$unit" \
     --property=KillMode=control-group \
@@ -361,8 +368,37 @@ run_lane() {
   printf '%s\n' "$code" > "$META/$lane-exit"
 }
 
-run_lane baseline "$BASELINE"
-run_lane exercise "$EXERCISE"
+# run_lane_and_capture brackets each lane with the bounded controlled mock egress
+# sink. The sink runs outside the untrusted agent cgroup, self-terminates on its
+# own caps/deadline, and always leaves a private per-lane receipt behind.
+run_lane_and_capture() {
+  local lane=$1
+  local root=$2
+  local sink_pid=""
+  if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
+    rm -f "$OUT/$lane/mock-egress.json" "$OUT/$lane/mock-egress.json.ready"
+    node "$CONTROL/mock-egress-sink.mjs" "$RUNTIME_JSON" "$OUT/$lane/mock-egress.json" "$lane" &
+    sink_pid=$!
+    local waited=0
+    while [ "$waited" -lt 100 ]; do
+      [ -f "$OUT/$lane/mock-egress.json.ready" ] && break
+      kill -0 "$sink_pid" 2>/dev/null || break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    [ -f "$OUT/$lane/mock-egress.json.ready" ] || fail "controlled mock egress sink did not bind for $lane lane"
+  fi
+  run_lane "$lane" "$root"
+  if [ -n "$sink_pid" ]; then
+    kill -TERM "$sink_pid" 2>/dev/null || true
+    wait "$sink_pid" 2>/dev/null || true
+    rm -f "$OUT/$lane/mock-egress.json.ready"
+    [ -f "$OUT/$lane/mock-egress.json" ] || fail "controlled mock egress receipt is missing for $lane lane"
+  fi
+}
+
+run_lane_and_capture baseline "$BASELINE"
+run_lane_and_capture exercise "$EXERCISE"
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$META/completed-at"
 
 as_root tar -C "$OUT" -czf "$OUT/raw.tar.gz" meta baseline exercise

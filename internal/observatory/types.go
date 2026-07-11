@@ -21,6 +21,7 @@ type Evidence struct {
 	Observations        []Observation       `json:"observations"`
 	Canaries            []CanaryObservation `json:"canaries"`
 	Coverage            CoverageEvidence    `json:"coverage"`
+	MockEgress          *MockEgressEvidence `json:"mockEgress,omitempty"`
 }
 
 type TargetEvidence struct {
@@ -241,6 +242,9 @@ func ValidateEvidence(evidence Evidence) error {
 		if canary.ID == "" || canary.Surface == "" || canary.BaselineInteractions < 0 || canary.ExerciseInteractions < 0 || canary.DeltaInteractions != expectedDelta {
 			return errors.New("evidence contains an invalid canary observation")
 		}
+	}
+	if err := validateMockEgressEvidence(evidence.MockEgress); err != nil {
+		return err
 	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {
