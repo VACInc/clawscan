@@ -3,8 +3,10 @@
 The `behavior` adapter adds paired runtime evidence to Clawscan. Observatory
 runs the same synthetic OpenClaw task without and with a target, subtracts
 baseline runtime activity, and preserves normalized `observatory.behavior.v1`
-evidence. The standalone CLI accepts skills and native OpenClaw plugins; the
-Clawscan adapter remains skill-facing.
+evidence. Both the standalone CLI and the Clawscan `behavior` adapter accept
+skills and native OpenClaw plugins; Clawscan classifies a target directory that
+holds `openclaw.plugin.json` as a plugin and passes it straight to Observatory.
+Skill-only scanners return a clear skipped result for plugin targets.
 The schema intentionally has no verdict, score, or recommendation.
 Canonical public evidence is capped at 64 MiB; generation and rendering enforce
 the same bound. When rendering from a full multi-scanner Clawscan artifact, the
@@ -68,6 +70,20 @@ go run ./cmd/clawscan ./path/to/skill \
   --sandbox off \
   --output ./artifacts/behavior.json
 ```
+
+Point the same command at a directory that contains `openclaw.plugin.json` to
+scan a native plugin; Clawscan records `target.kind: plugin` plus the manifest
+`id` in the artifact and passes the directory straight to Observatory:
+
+```bash
+go run ./cmd/clawscan ./path/to/plugin \
+  --scanner behavior \
+  --sandbox off \
+  --output ./artifacts/behavior.json
+```
+
+The recorded `target.id` is the manifest identifier, never a host path. Clawscan
+never auto-discovers plugins; a plugin directory must be named explicitly.
 
 Valid JSON evidence survives a nonzero Observatory exit. Infrastructure
 failures without evidence remain scanner failures. Clawscan stores only an

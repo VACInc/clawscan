@@ -11,6 +11,10 @@ type ScannerAdapter interface {
 	Requirements(env map[string]string) []EnvRequirement
 	Info() ScannerInfo
 	InstallPlan() InstallPlan
+	// SupportsTargetKind reports whether the adapter can analyze a target of the
+	// given kind. Adapters support skill and URL targets by default; only
+	// plugin-aware adapters accept native OpenClaw plugin targets.
+	SupportsTargetKind(kind string) bool
 	Run(runner ExternalScannerRunner, target string, startedAt string) (ScannerResult, error)
 }
 
@@ -108,7 +112,10 @@ type scannerAdapter struct {
 	info          ScannerInfo
 	installPlan   InstallPlan
 	commandBacked bool
-	run           func(runner ExternalScannerRunner, target string, startedAt string) (ScannerResult, error)
+	// supportsPlugins marks adapters that can analyze native OpenClaw plugin
+	// targets. Skill and URL kinds are always supported.
+	supportsPlugins bool
+	run             func(runner ExternalScannerRunner, target string, startedAt string) (ScannerResult, error)
 }
 
 func (adapter scannerAdapter) ID() string {
@@ -156,6 +163,13 @@ func (adapter scannerAdapter) InstallPlan() InstallPlan {
 	return plan
 }
 
+func (adapter scannerAdapter) SupportsTargetKind(kind string) bool {
+	if kind == targetKindPlugin {
+		return adapter.supportsPlugins
+	}
+	return true
+}
+
 func (adapter scannerAdapter) Run(runner ExternalScannerRunner, target string, startedAt string) (ScannerResult, error) {
 	return adapter.run(runner, target, startedAt)
 }
@@ -195,13 +209,14 @@ func defaultScannerAdapters() []ScannerAdapter {
 			run: ExternalScannerRunner.runAgentVerus,
 		},
 		scannerAdapter{
-			id:            "behavior",
-			requirements:  behaviorRequirements,
-			commandBacked: true,
+			id:              "behavior",
+			requirements:    behaviorRequirements,
+			commandBacked:   true,
+			supportsPlugins: true,
 			info: ScannerInfo{
 				DisplayName:   "ClawHub Observatory Behavior",
 				RepositoryURL: "https://github.com/VACInc/clawhub-observatory",
-				Description:   "Paired baseline/exercise runtime evidence for OpenClaw skills in a separately isolated disposable environment. Requires --sandbox off because the scanner provisions its own remote boundary.",
+				Description:   "Paired baseline/exercise runtime evidence for OpenClaw skills and native plugins in a separately isolated disposable environment. Requires --sandbox off because the scanner provisions its own remote boundary.",
 				OptionalEnv:   []string{"CLAWSCAN_BEHAVIOR_BIN"},
 			},
 			installPlan: InstallPlan{
