@@ -1,6 +1,7 @@
 package observatory
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,14 @@ const VersionDeltaSchemaVersion = "observatory.version-delta.v1"
 // but finite so a damaged or oversized index fails closed instead of being
 // parsed unbounded.
 const MaxHistoryIndexBytes = 16 << 20
+
+// defaultHistoryMaxPerIdentity is the built-in bounded cap on recorded
+// snapshots per stable identity. History is append-only, so reaching the cap
+// fails a new record closed rather than deleting prior snapshots.
+const defaultHistoryMaxPerIdentity = 1000
+
+// maxHistoryMaxPerIdentity bounds the configurable cap.
+const maxHistoryMaxPerIdentity = 100000
 
 // ErrHistoryNoStableIdentity is returned when evidence has no stable
 // lineage/plugin identity to index by. Such captures cannot participate in
@@ -164,11 +173,13 @@ func (store *HistoryStore) writeIndex(index historyIndex) error {
 	return nil
 }
 
-// Record appends completed evidence to history and prunes the identity's
-// snapshots to retain. It never touches per-run artifact directories or raw
-// bundles. Recording the same run twice replaces the prior snapshot rather than
-// duplicating it.
-func (store *HistoryStore) Record(evidence Evidence, retain int) error {
+// Record appends completed evidence to the append-only history under a bounded
+// per-identity cap. It never deletes or overwrites a prior snapshot: recording
+// the same run id succeeds only when the preserved snapshot is valid and
+// byte-identical, a conflicting payload for the same run id is an error, and
+// reaching maxPerIdentity fails closed instead of pruning older entries. Per-run
+// artifact directories and raw bundles are never touched.
+func (store *HistoryStore) Record(evidence Evidence, maxPerIdentity int) error {
 	if err := ValidateEvidence(evidence); err != nil {
 		return err
 	}
@@ -179,23 +190,44 @@ func (store *HistoryStore) Record(evidence Evidence, retain int) error {
 	if evidence.Run.Status != "completed" {
 		return ErrHistoryIncompleteCapture
 	}
-	if retain < 1 {
-		retain = 1
+	if maxPerIdentity < 1 {
+		maxPerIdentity = defaultHistoryMaxPerIdentity
 	}
 	index, err := store.loadIndex()
 	if err != nil {
 		return err
 	}
+	payload, err := marshalEvidenceSnapshot(evidence)
+	if err != nil {
+		return err
+	}
 	dir := store.snapshotDir(identity)
+	name := historySortKey(evidence) + "-" + shortToken(evidence.Run.ID) + ".json"
+	rel := filepath.Join("snapshots", filepath.Base(dir), name)
+
+	count := 0
+	for i := range index.Entries {
+		if index.Entries[i].Identity != identity {
+			continue
+		}
+		count++
+		if index.Entries[i].RunID == evidence.Run.ID {
+			// Re-recording a run is idempotent only when the preserved snapshot
+			// is valid and byte-identical; conflicting reuse is rejected and the
+			// existing snapshot is left untouched.
+			return store.verifyIdenticalRecord(index.Entries[i], payload)
+		}
+	}
+	if count >= maxPerIdentity {
+		return fmt.Errorf("history: %s already has %d recorded snapshots at the maxPerIdentity bound of %d; history is append-only, so prune it manually before adding more", identity, count, maxPerIdentity)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	name := historySortKey(evidence) + "-" + shortToken(evidence.Run.ID) + ".json"
-	rel := filepath.Join("snapshots", filepath.Base(dir), name)
-	if err := writeJSON(filepath.Join(store.root, rel), evidence, 0o600); err != nil {
+	if err := writeSnapshotNoClobber(filepath.Join(store.root, rel), payload); err != nil {
 		return err
 	}
-	entry := HistoryEntry{
+	index.Entries = append(index.Entries, HistoryEntry{
 		Identity:            identity,
 		Kind:                evidence.Target.Kind,
 		Lineage:             evidence.Target.Lineage,
@@ -207,51 +239,69 @@ func (store *HistoryStore) Record(evidence Evidence, retain int) error {
 		RecordedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 		Status:              evidence.Run.Status,
 		SnapshotPath:        rel,
-	}
-	replaced := false
-	for i := range index.Entries {
-		if index.Entries[i].Identity == identity && index.Entries[i].RunID == entry.RunID {
-			if index.Entries[i].SnapshotPath != rel {
-				if old, resolveErr := store.resolve(index.Entries[i].SnapshotPath); resolveErr == nil {
-					os.Remove(old)
-				}
-			}
-			index.Entries[i] = entry
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		index.Entries = append(index.Entries, entry)
-	}
-	store.prune(&index, identity, retain)
+	})
 	return store.writeIndex(index)
 }
 
-// prune bounds the identity's snapshots to retain, deleting only the pruned
-// history snapshots. Entries for other identities are preserved untouched.
-func (store *HistoryStore) prune(index *historyIndex, identity string, retain int) {
-	matching := []HistoryEntry{}
-	others := []HistoryEntry{}
-	for _, entry := range index.Entries {
-		if entry.Identity == identity {
-			matching = append(matching, entry)
-		} else {
-			others = append(others, entry)
-		}
+// verifyIdenticalRecord accepts a re-record of an existing run only when its
+// preserved snapshot is valid and byte-identical to the new payload. It never
+// modifies the stored snapshot.
+func (store *HistoryStore) verifyIdenticalRecord(entry HistoryEntry, payload []byte) error {
+	path, err := store.resolve(entry.SnapshotPath)
+	if err != nil {
+		return err
 	}
-	sort.SliceStable(matching, func(i, j int) bool {
-		return historyEntryBefore(matching[j], matching[i]) // newest first
-	})
-	if len(matching) > retain {
-		for _, entry := range matching[retain:] {
-			if path, err := store.resolve(entry.SnapshotPath); err == nil {
-				os.Remove(path)
-			}
-		}
-		matching = matching[:retain]
+	if _, err := loadHistorySnapshot(path); err != nil {
+		return err
 	}
-	index.Entries = append(others, matching...)
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(entry.SnapshotPath), err)
+	}
+	if !bytes.Equal(stored, payload) {
+		return fmt.Errorf("history: conflicting record for run %q; the preserved snapshot differs and is not overwritten", entry.RunID)
+	}
+	return nil
+}
+
+// writeSnapshotNoClobber writes a new snapshot without clobbering an existing
+// one. If the target already exists it must be byte-identical; a different
+// existing snapshot is preserved and reported as an error. Only a newly created
+// file that fails mid-write is removed.
+func writeSnapshotNoClobber(path string, payload []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		existing, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(path), readErr)
+		}
+		if !bytes.Equal(existing, payload) {
+			return fmt.Errorf("history: refusing to overwrite existing snapshot %s with different content", filepath.Base(path))
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(payload)
+	closeErr := file.Close()
+	if writeErr != nil {
+		os.Remove(path) // clean up only this newly created, failed snapshot
+		return writeErr
+	}
+	if closeErr != nil {
+		os.Remove(path) // clean up only this newly created, failed snapshot
+		return closeErr
+	}
+	return nil
+}
+
+func marshalEvidenceSnapshot(evidence Evidence) ([]byte, error) {
+	data, err := json.MarshalIndent(evidence, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
 }
 
 // LatestComparable returns the most recent strictly comparable predecessor for

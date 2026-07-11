@@ -1,8 +1,8 @@
 package observatory
 
 import (
+	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,75 +142,61 @@ func TestHistoryFailsClosedOnCorruptSnapshot(t *testing.T) {
 	}
 }
 
-func TestHistoryRetentionIsBounded(t *testing.T) {
+func TestHistoryFailsClosedAtBoundWithoutDeleting(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenHistoryStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A sentinel outside the history tree proves retention prunes only history
-	// snapshots and never wider artifacts.
-	sentinel := filepath.Join(dir, "runs", "obs_0", "evidence.json")
-	if err := os.MkdirAll(filepath.Dir(sentinel), 0o700); err != nil {
+	first := historyFixture("obs_a", "2026-07-10T12:00:00Z")
+	second := historyFixture("obs_b", "2026-07-11T12:00:00Z")
+	if err := store.Record(first, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+	if err := store.Record(second, 2); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
-		evidence := historyFixture(fmt.Sprintf("obs_%d", i), fmt.Sprintf("2026-07-1%dT12:00:00Z", i))
-		if err := store.Record(evidence, 3); err != nil {
-			t.Fatal(err)
-		}
+	third := historyFixture("obs_c", "2026-07-12T12:00:00Z")
+	if err := store.Record(third, 2); err == nil || !strings.Contains(err.Error(), "maxPerIdentity") {
+		t.Fatalf("expected bound failure, err = %v", err)
 	}
+	// The bound must fail closed without dropping either prior entry or snapshot.
 	index, err := store.loadIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(index.Entries) != 3 {
+	if len(index.Entries) != 2 {
 		t.Fatalf("entries = %d", len(index.Entries))
 	}
 	kept := map[string]bool{}
 	for _, entry := range index.Entries {
 		kept[entry.RunID] = true
 	}
-	for _, want := range []string{"obs_2", "obs_3", "obs_4"} {
-		if !kept[want] {
-			t.Fatalf("expected %s retained; entries = %#v", want, index.Entries)
-		}
+	if !kept["obs_a"] || !kept["obs_b"] {
+		t.Fatalf("bound dropped an existing entry: %#v", index.Entries)
 	}
 	snapshotDir := store.snapshotDir("skill:example/fixture-skill")
 	files, err := os.ReadDir(snapshotDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 3 {
-		t.Fatalf("snapshot files retained = %d", len(files))
-	}
-	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "keep" {
-		t.Fatalf("retention touched artifacts outside history: %q err = %v", data, err)
-	}
-	current := historyFixture("obs_new", "2026-07-15T12:00:00Z")
-	selected, err := store.LatestComparable(current)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if selected == nil || selected.Run.ID != "obs_4" {
-		t.Fatalf("selected = %#v", selected)
+	if len(files) != 2 {
+		t.Fatalf("snapshot files = %d", len(files))
 	}
 }
 
-func TestHistoryRecordReplacesSameRun(t *testing.T) {
+func TestHistoryRecordIsIdempotentAndRejectsConflict(t *testing.T) {
 	store, err := OpenHistoryStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := historyFixture("obs_dup", "2026-07-10T12:00:00Z")
-	if err := store.Record(evidence, 10); err != nil {
+	original := historyFixture("obs_dup", "2026-07-10T12:00:00Z")
+	if err := store.Record(original, 10); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Record(evidence, 10); err != nil {
-		t.Fatal(err)
+	// A byte-identical re-record of the same run is an idempotent no-op.
+	if err := store.Record(original, 10); err != nil {
+		t.Fatalf("identical re-record failed: %v", err)
 	}
 	index, err := store.loadIndex()
 	if err != nil {
@@ -218,6 +204,25 @@ func TestHistoryRecordReplacesSameRun(t *testing.T) {
 	}
 	if len(index.Entries) != 1 {
 		t.Fatalf("entries = %d", len(index.Entries))
+	}
+	snapshot := filepath.Join(store.root, index.Entries[0].SnapshotPath)
+	before, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A conflicting payload for the same run id must error and preserve the
+	// existing snapshot untouched.
+	conflict := original
+	conflict.Target.SHA256 = "sha256:" + strings.Repeat("9", 64)
+	if err := store.Record(conflict, 10); err == nil || !strings.Contains(err.Error(), "conflicting record") {
+		t.Fatalf("expected conflict rejection, err = %v", err)
+	}
+	after, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("preserved snapshot was modified")
 	}
 }
 

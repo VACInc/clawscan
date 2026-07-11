@@ -136,11 +136,14 @@ The schema deliberately has no verdict, severity, score, or recommendation field
 1. After explicit VM-teardown approval, validate the owned probe skill and probe plugin in the real isolated Proxmox lane.
 2. Add declared-capability input and observed-capability diffs for ClawHub RFC #2944.
 3. Add version-keyed storage and update diffs. Delivered as a hands-off local
-   history: `scan` records completed evidence in a bounded, per-identity store
-   and selects the latest strictly comparable predecessor to render or emit an
-   evidence-based `observatory.version-delta.v1` document. Selection is offline
-   only, fails closed on incomparable or corrupt history, excludes the current
-   run, and reserves a nil-by-default grade seam. Network catalog-driven
-   version discovery stays out of scope (see item 4).
+   history: `scan` records completed evidence in a bounded, append-only,
+   per-identity store and selects the latest strictly comparable predecessor to
+   render or emit an evidence-based `observatory.version-delta.v1` document.
+   Selection is offline only, excludes the current run, and reserves a
+   nil-by-default grade seam. Prior snapshots are never deleted or overwritten;
+   the per-identity cap fails a new record closed instead of pruning, and
+   unexpected or corrupt history fails the workflow closed without suppressing
+   the valid current evidence. Network catalog-driven version discovery stays
+   out of scope (see item 4).
 4. Add catalog watching, bounded concurrency, retry policy, and private moderation routing.
 5. Publish a small pilot, then propose the adapter upstream with copied real-behavior proof.

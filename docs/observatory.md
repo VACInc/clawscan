@@ -125,31 +125,42 @@ delta — no version, target, or history is ever fetched from the network.
 ```
 
 The evidence JSON on stdout is unchanged; delta selection is a side channel and
-never pollutes the Clawscan adapter contract. The current run is recorded before
-selection and is excluded from its own predecessor search. Selection reuses the
-same comparability gate as `--previous`: a mismatched capture protocol,
-isolation receipt, prompt, model, resource limits, or target kind/identity is
-skipped rather than diffed, and a completed run with no comparable predecessor
-simply renders current evidence only. Corrupt history (an unparseable index or a
-damaged snapshot) fails closed: `scan` omits the delta with a diagnostic, and an
-explicit `render --auto-previous` returns an error. The structured
+never pollutes the Clawscan adapter contract. Selection runs before the current
+run is recorded and also excludes it by run ID, so a run is never its own
+predecessor. Selection reuses the same comparability gate as `--previous`: a
+mismatched capture protocol, isolation receipt, prompt, model, resource limits,
+or target kind/identity is skipped rather than diffed. The structured
 `observatory.version-delta.v1` document carries the behavioral `changes` plus a
 reserved, nil-by-default `grade` field so a future external grade signal can be
 integrated alongside — never in place of — the evidence-based delta.
+
+The history workflow fails closed. When history is enabled, an unexpected
+failure — an unavailable store, a corrupt index or snapshot, a failed selection
+or recording, or an unexpected comparison error — makes `scan` exit nonzero
+after the valid current evidence has already been emitted on stdout; the same
+condition makes `render --auto-previous` return an error. Only clean cases
+degrade with a diagnostic and no delta: a completed run with no comparable
+predecessor, a target with no stable lineage/plugin ID, an incomplete capture,
+or history disabled. Because a delta needs history, `--delta` combined with
+`--no-history` (or with history disabled) is rejected rather than ignored.
 
 History is configured under `history` in the Observatory YAML:
 
 ```yaml
 history:
-  enabled: true   # default; set false to disable recording and diffs
-  retain: 10      # bounded snapshots kept per stable lineage/plugin ID (1..1000)
+  enabled: true       # default; set false to disable recording and diffs
+  maxPerIdentity: 1000  # bounded high cap per stable lineage/plugin ID (1..100000)
 ```
 
-Retention prunes only the private history snapshots; canonical per-run artifact
-directories and raw capture bundles are never removed. History snapshots live
-under `<artifactsDir>/history` with owner-only permissions and contain only the
-public evidence projection, preserving the private/public artifact boundary.
-Use `--no-history` to skip recording and diffing for a single run.
+History is append-only. Prior snapshots are never deleted or overwritten:
+re-recording the same run id succeeds only when the preserved snapshot is valid
+and byte-identical, a conflicting payload for the same run id is rejected, and
+reaching `maxPerIdentity` fails a new record closed instead of pruning older
+entries. Canonical per-run artifact directories and raw capture bundles are
+never touched. History snapshots live under `<artifactsDir>/history` with
+owner-only permissions and contain only the public evidence projection,
+preserving the private/public artifact boundary. Use `--no-history` to skip
+recording and diffing for a single run.
 
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for

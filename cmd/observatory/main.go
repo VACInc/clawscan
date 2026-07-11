@@ -16,6 +16,10 @@ import (
 
 var version = "dev"
 
+// scanFn is the scan entrypoint, overridable in tests so the history side
+// channel can be exercised without provisioning a real isolated runner.
+var scanFn = observatory.Scan
+
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -61,11 +65,14 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	if flags.NArg() != 1 {
 		return errors.New("usage: observatory scan [--config path] [--json] [--site dir] [--delta path] [--no-history] <target>")
 	}
+	if *noHistory && *deltaOutput != "" {
+		return errors.New("--delta cannot be combined with --no-history: a version delta requires local history")
+	}
 	config, err := observatory.LoadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	result, err := observatory.Scan(ctx, flags.Arg(0), config, nil)
+	result, err := scanFn(ctx, flags.Arg(0), config, nil)
 	hasEvidence := result.Evidence.SchemaVersion != ""
 	if hasEvidence && *output != "" {
 		if err := writeEvidence(*output, result.Evidence); err != nil {
@@ -91,65 +98,69 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 // recordAndDiff runs the hands-off local-history workflow as a side channel: it
 // records the completed capture, selects the latest strictly comparable
 // predecessor, and renders or emits the version delta. It never writes to stdout
-// so the evidence JSON contract with the Clawscan adapter is preserved.
-// Corrupt or incomparable history fails closed by omitting the delta; only an
-// explicitly requested --site or --delta write can return an error.
+// so the evidence JSON contract with the Clawscan adapter is preserved; the
+// caller emits evidence before invoking this so a fail-closed history error
+// never suppresses valid current evidence.
+//
+// When history is enabled, unexpected failures (store unavailable, corrupt
+// index or snapshot, failed selection or recording, or an unexpected
+// comparison error) fail closed by returning an error. Only clean cases degrade
+// with a diagnostic: no comparable predecessor, no stable identity, an
+// incomplete capture, or history explicitly disabled.
 func recordAndDiff(config observatory.Config, evidence observatory.Evidence, sitePath string, deltaPath string, noHistory bool, stderr io.Writer) error {
 	if noHistory || !config.HistoryEnabled() {
-		return renderCurrentOnly(sitePath, evidence, stderr)
+		if deltaPath != "" {
+			return errors.New("--delta requires history to be enabled")
+		}
+		return renderSiteIfRequested(sitePath, evidence, nil, stderr)
 	}
 	store, err := observatory.OpenHistoryStore(config.ArtifactsDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "history unavailable: %v\n", err)
-		return renderCurrentOnly(sitePath, evidence, stderr)
+		return fmt.Errorf("history unavailable: %w", err)
 	}
 	// Select before recording so the current run is never its own predecessor.
-	previous, selErr := store.LatestComparable(evidence)
-	if selErr != nil {
-		fmt.Fprintf(stderr, "version delta unavailable: %v\n", selErr)
-		previous = nil
+	previous, err := store.LatestComparable(evidence)
+	if err != nil {
+		return fmt.Errorf("version delta unavailable: %w", err)
 	}
-	if recErr := store.Record(evidence, config.HistoryRetain()); recErr != nil {
+	recorded := true
+	if recErr := store.Record(evidence, config.HistoryMaxPerIdentity()); recErr != nil {
 		switch {
 		case errors.Is(recErr, observatory.ErrHistoryNoStableIdentity):
+			recorded = false
 			fmt.Fprintln(stderr, "history: target has no stable lineage/plugin ID; version diffs disabled")
 		case errors.Is(recErr, observatory.ErrHistoryIncompleteCapture):
+			recorded = false
 			fmt.Fprintln(stderr, "history: incomplete capture not recorded")
 		default:
-			fmt.Fprintf(stderr, "history record failed: %v\n", recErr)
+			return fmt.Errorf("history record failed: %w", recErr)
 		}
 	}
-	if previous != nil {
-		delta, err := observatory.ComputeVersionDelta(*previous, evidence)
-		if err != nil {
-			fmt.Fprintf(stderr, "version delta unavailable: %v\n", err)
-			previous = nil
-		} else {
-			if deltaPath != "" {
-				if err := writeVersionDelta(deltaPath, delta); err != nil {
-					return err
-				}
-				fmt.Fprintf(stderr, "version delta written: %s\n", deltaPath)
-			}
-			fmt.Fprintf(stderr, "version delta: %d change(s) vs prior run %s\n", len(delta.Changes), previous.Run.ID)
+	if previous == nil {
+		if recorded {
+			fmt.Fprintln(stderr, "version delta: no comparable predecessor in local history")
 		}
-	} else {
-		fmt.Fprintln(stderr, "version delta: no comparable predecessor in local history")
+		return renderSiteIfRequested(sitePath, evidence, nil, stderr)
 	}
-	if sitePath != "" {
-		if err := observatory.RenderSite(sitePath, evidence, previous); err != nil {
+	delta, err := observatory.ComputeVersionDelta(*previous, evidence)
+	if err != nil {
+		return fmt.Errorf("version delta unavailable: %w", err)
+	}
+	if deltaPath != "" {
+		if err := writeVersionDelta(deltaPath, delta); err != nil {
 			return err
 		}
-		fmt.Fprintf(stderr, "site: %s\n", filepath.Join(sitePath, "index.html"))
+		fmt.Fprintf(stderr, "version delta written: %s\n", deltaPath)
 	}
-	return nil
+	fmt.Fprintf(stderr, "version delta: %d change(s) vs prior run %s\n", len(delta.Changes), previous.Run.ID)
+	return renderSiteIfRequested(sitePath, evidence, previous, stderr)
 }
 
-func renderCurrentOnly(sitePath string, evidence observatory.Evidence, stderr io.Writer) error {
+func renderSiteIfRequested(sitePath string, evidence observatory.Evidence, previous *observatory.Evidence, stderr io.Writer) error {
 	if sitePath == "" {
 		return nil
 	}
-	if err := observatory.RenderSite(sitePath, evidence, nil); err != nil {
+	if err := observatory.RenderSite(sitePath, evidence, previous); err != nil {
 		return err
 	}
 	fmt.Fprintf(stderr, "site: %s\n", filepath.Join(sitePath, "index.html"))

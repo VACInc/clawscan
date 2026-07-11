@@ -63,6 +63,127 @@ func writeHistoryConfig(t *testing.T, dir string, artifactsDir string) string {
 	return path
 }
 
+func stubScan(evidence observatory.Evidence, runDir string) func() {
+	previous := scanFn
+	scanFn = func(_ context.Context, _ string, _ observatory.Config, _ observatory.CommandExecutor) (observatory.ScanResult, error) {
+		return observatory.ScanResult{Evidence: evidence, RunDirectory: runDir}, nil
+	}
+	return func() { scanFn = previous }
+}
+
+func countSnapshotFiles(t *testing.T, artifactsDir string) int {
+	t.Helper()
+	root := filepath.Join(artifactsDir, "history", "snapshots")
+	identities, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, identity := range identities {
+		if !identity.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(root, identity.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range files {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".json") {
+				total++
+			}
+		}
+	}
+	return total
+}
+
+func TestScanFailsClosedOnCorruptHistoryButKeepsEvidence(t *testing.T) {
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Record(cliEvidence("obs_prev", "2026-07-10T12:00:00Z"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactsDir, "history", "index.json"), []byte("{ broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	defer stubScan(current, dir)()
+
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"scan", "--config", configPath, "--json", "./target"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "corrupt history") {
+		t.Fatalf("expected corrupt-history failure, err = %v", err)
+	}
+	// Valid current evidence must still have been emitted to stdout.
+	if !strings.Contains(stdout.String(), observatory.EvidenceSchemaVersion) || !strings.Contains(stdout.String(), "obs_cur") {
+		t.Fatalf("valid current evidence was suppressed: %s", stdout.String())
+	}
+	// The prior snapshot must be preserved, not cleaned up.
+	if got := countSnapshotFiles(t, artifactsDir); got != 1 {
+		t.Fatalf("prior snapshot not preserved: %d snapshot files", got)
+	}
+}
+
+func TestScanRecordsHistoryAndEmitsVersionDelta(t *testing.T) {
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Record(cliEvidence("obs_prev", "2026-07-10T12:00:00Z"), 10); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	current.Target.SHA256 = "sha256:" + strings.Repeat("f", 64)
+	current.Observations = append(current.Observations, observatory.Observation{
+		Kind: "network", Operation: "connect", Subject: "93.184.216.34:443", Outcome: "succeeded", Role: "external", ExerciseCount: 1, DeltaCount: 1,
+	})
+	defer stubScan(current, dir)()
+
+	deltaPath := filepath.Join(dir, "delta.json")
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"scan", "--config", configPath, "--json", "--delta", deltaPath, "./target"}, &stdout, &stderr); err != nil {
+		t.Fatalf("scan: %v (stderr=%s)", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "obs_cur") {
+		t.Fatalf("evidence missing from stdout: %s", stdout.String())
+	}
+	data, err := os.ReadFile(deltaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delta observatory.VersionDelta
+	if err := json.Unmarshal(data, &delta); err != nil {
+		t.Fatal(err)
+	}
+	if delta.SchemaVersion != observatory.VersionDeltaSchemaVersion || delta.Previous.RunID != "obs_prev" || len(delta.Changes) != 1 {
+		t.Fatalf("delta = %#v", delta)
+	}
+	// The current run is now recorded and the prior snapshot is preserved.
+	if got := countSnapshotFiles(t, artifactsDir); got != 2 {
+		t.Fatalf("snapshots after scan = %d", got)
+	}
+}
+
+func TestScanRejectsDeltaWithNoHistory(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"scan", "--no-history", "--delta", "delta.json", "./target"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "--delta cannot be combined with --no-history") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestRenderAutoPreviousSelectsHistoryPredecessor(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("secure site rendering requires Linux")

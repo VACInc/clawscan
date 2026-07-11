@@ -102,11 +102,12 @@ type HistoryConfig struct {
 	// Enabled defaults to true when omitted; set false to opt out of recording
 	// and automatic predecessor selection entirely.
 	Enabled *bool `yaml:"enabled"`
-	// Retain bounds how many prior evidence snapshots are kept per stable
-	// lineage/plugin identity. Older snapshots beyond this bound are pruned from
-	// the history store only; canonical per-run artifact directories and raw
-	// capture bundles are never touched. Zero selects the built-in default.
-	Retain int `yaml:"retain"`
+	// MaxPerIdentity is a bounded high cap on how many evidence snapshots may be
+	// recorded per stable lineage/plugin identity. History is append-only: prior
+	// snapshots are never deleted or overwritten. When the cap is reached,
+	// recording a new run fails closed instead of pruning older entries. Zero
+	// selects the built-in default.
+	MaxPerIdentity int `yaml:"maxPerIdentity"`
 }
 
 // HistoryEnabled reports whether local version-diff history is active. History
@@ -115,13 +116,13 @@ func (config Config) HistoryEnabled() bool {
 	return config.History.Enabled == nil || *config.History.Enabled
 }
 
-// HistoryRetain resolves the effective bounded retention count, applying the
+// HistoryMaxPerIdentity resolves the effective bounded cap, applying the
 // built-in default when the operator left it unset.
-func (config Config) HistoryRetain() int {
-	if config.History.Retain <= 0 {
-		return 10
+func (config Config) HistoryMaxPerIdentity() int {
+	if config.History.MaxPerIdentity <= 0 {
+		return defaultHistoryMaxPerIdentity
 	}
-	return config.History.Retain
+	return config.History.MaxPerIdentity
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -235,8 +236,8 @@ func (config *Config) applyDefaults() {
 	if config.Limits.MaxTasks == 0 {
 		config.Limits.MaxTasks = 256
 	}
-	if config.History.Retain == 0 {
-		config.History.Retain = 10
+	if config.History.MaxPerIdentity == 0 {
+		config.History.MaxPerIdentity = defaultHistoryMaxPerIdentity
 	}
 	if config.ArtifactsDir == "" {
 		if cacheDir, err := os.UserCacheDir(); err == nil {
@@ -327,10 +328,10 @@ func (config Config) Validate() error {
 		return errors.New("limits.maxTasks must be between 32 and 1024")
 	}
 	// Zero means "use the built-in default"; anything outside the bound is a
-	// misconfiguration. Retention is intentionally capped so history cannot grow
-	// without limit.
-	if config.History.Retain < 0 || config.History.Retain > 1000 {
-		return errors.New("history.retain must be between 1 and 1000")
+	// misconfiguration. The cap is intentionally high and finite: history is
+	// append-only, so a new record fails closed at the cap rather than pruning.
+	if config.History.MaxPerIdentity < 0 || config.History.MaxPerIdentity > maxHistoryMaxPerIdentity {
+		return fmt.Errorf("history.maxPerIdentity must be between 1 and %d", maxHistoryMaxPerIdentity)
 	}
 	return nil
 }
