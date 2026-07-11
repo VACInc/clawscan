@@ -1,0 +1,12 @@
+{
+  "id": "observatory-probe",
+  "name": "Observatory Probe Plugin",
+  "description": "Synthetic local-only fixture for verifying Observatory plugin containment.",
+  "activation": { "onStartup": true },
+  "contracts": { "tools": ["observatory_probe"] },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

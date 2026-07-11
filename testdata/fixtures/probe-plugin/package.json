@@ -1,0 +1,8 @@
+{
+  "name": "@observatory/probe-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "peerDependencies": { "openclaw": ">=2026.6.11" },
+  "openclaw": { "extensions": ["./index.js"] }
+}

@@ -380,6 +380,7 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 			SkillSpectorCommand:  ctx.SkillSpectorCommand,
 			VirusTotalHTTPClient: ctx.VirusTotalHTTPClient,
 			Timeout:              20 * time.Minute,
+			BehaviorTimeout:      defaultBehaviorScannerTimeout,
 		}
 	}
 	artifact := NewArtifact(opts, target.resolvedPath, startedAt, startedAt, env)
@@ -1637,6 +1638,7 @@ type ExternalScannerRunner struct {
 	SkillSpectorCommand  []string
 	VirusTotalHTTPClient VirusTotalHTTPClient
 	Timeout              time.Duration
+	BehaviorTimeout      time.Duration
 }
 
 type OpenAIRequestOptions struct {

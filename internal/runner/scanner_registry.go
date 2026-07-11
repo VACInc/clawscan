@@ -195,6 +195,23 @@ func defaultScannerAdapters() []ScannerAdapter {
 			run: ExternalScannerRunner.runAgentVerus,
 		},
 		scannerAdapter{
+			id:            "behavior",
+			requirements:  behaviorRequirements,
+			commandBacked: true,
+			info: ScannerInfo{
+				DisplayName:   "ClawHub Observatory Behavior",
+				RepositoryURL: "https://github.com/VACInc/clawhub-observatory",
+				Description:   "Paired baseline/exercise runtime evidence for OpenClaw skills in a separately isolated disposable environment. Requires --sandbox off because the scanner provisions its own remote boundary.",
+				OptionalEnv:   []string{"CLAWSCAN_BEHAVIOR_BIN"},
+			},
+			installPlan: InstallPlan{
+				ScannerID:                "behavior",
+				Name:                     "ClawHub Observatory Behavior",
+				InstallUnsupportedReason: "Build the Observatory CLI from cmd/observatory and place it on PATH.",
+			},
+			run: ExternalScannerRunner.runBehavior,
+		},
+		scannerAdapter{
 			id:            "aig",
 			requirements:  aigRequirements,
 			commandBacked: true,

@@ -611,6 +611,7 @@ Built-in profiles:
 
 Required environment variables:
   aig: LLM_API_KEY or OPENAI_API_KEY. Use "clawscan scanners aig" for local scanner details and optional model configuration.
+  behavior: CLAWSCAN_BEHAVIOR_CONFIG; optional CLAWSCAN_BEHAVIOR_BIN selects the Observatory CLI. Run with --sandbox off.
   socket: SOCKET_CLI_API_TOKEN
   snyk: SNYK_TOKEN
   virustotal: VIRUSTOTAL_API_KEY

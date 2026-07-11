@@ -1,0 +1,60 @@
+version: 1
+
+# Keep false until the Proxmox network and guest-user controls below have an
+# independent verification receipt.
+live: false
+# Stable public ID required when rendering version deltas for skills.
+targetLineage: example/demo-skill
+artifactsDir: ~/.cache/clawhub-observatory/runs
+
+executor:
+  kind: crabbox
+  command: crabbox
+  # If command is a credential wrapper, pin the audited Crabbox binary here.
+  crabboxBinary: ""
+  crabboxConfig: /path/to/isolated-observatory.crabbox.yml
+  # Observatory pins the provider, target, full-clone, teardown, and TTL flags.
+  args: []
+
+isolation:
+  substrate: proxmox-vm
+  networkMode: deny-except-model
+  verified: false
+  verification: pending
+  vmTemplateId: 9400
+  networkBridge: vmbr-observatory
+  freshVm: true
+  dedicatedNetwork: true
+  defaultDenyEgress: true
+  noHostMounts: true
+  noRuntimeSockets: true
+  syntheticIdentityOnly: true
+
+runtime:
+  openclawCommand: openclaw
+  agentUser: observatory
+  timeoutSeconds: 600
+  model:
+    provider: observatory
+    baseUrl: http://10.0.0.20:8000/v1
+    id: local-tool-model
+    api: openai-completions
+    contextWindow: 65536
+    maxTokens: 4096
+  # Addresses as seen from the guest. Values never enter public evidence.
+  controlPlaneAddresses: [10.0.0.20:8000]
+
+exercise:
+  turnLimit: 1
+  # Omit prompt to use the target-aware default. Plugin scans then invoke the
+  # first declared tool; set an explicit prompt only for a custom scenario.
+
+limits:
+  maxFiles: 5000
+  maxFileBytes: 10485760
+  maxTotalBytes: 104857600
+  maxBundleBytes: 67108864
+  maxLaneBytes: 268435456
+  maxMemoryBytes: 2147483648
+  cpuQuotaPercent: 200
+  maxTasks: 256
