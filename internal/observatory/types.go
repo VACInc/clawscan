@@ -12,6 +12,29 @@ import (
 const EvidenceSchemaVersion = "observatory.behavior.v1"
 const MaxEvidenceBytes = 64 << 20
 
+// Canary interaction stages are stable, publicly safe labels for how a canary
+// was touched. read/write/execute are derived from path- and descriptor-based
+// syscall correlation and are available whenever paired file/process traces
+// exist. outbound and tool are value-correlation stages: they only surface a
+// hit when the capture actually carries the canary value (a network payload or
+// the agent tool/output stream). Absence of such a value is limited coverage,
+// not proof the token went unused.
+const (
+	CanaryStageRead     = "read"
+	CanaryStageWrite    = "write"
+	CanaryStageExecute  = "execute"
+	CanaryStageOutbound = "outbound"
+	CanaryStageTool     = "tool"
+)
+
+// canaryStageSequence fixes the canonical order used for deterministic
+// serialization, coverage reporting, and version comparison.
+var canaryStageSequence = []string{CanaryStageRead, CanaryStageWrite, CanaryStageExecute, CanaryStageOutbound, CanaryStageTool}
+
+// maxCanaryInteractionCount bounds published interaction counters so an
+// adversarially large capture cannot inflate evidence or its encoded size.
+const maxCanaryInteractionCount = 1 << 20
+
 type Evidence struct {
 	SchemaVersion       string              `json:"schemaVersion"`
 	CaptureConfigSHA256 string              `json:"captureConfigSha256"`
@@ -108,20 +131,45 @@ type Observation struct {
 }
 
 type CanaryObservation struct {
-	ID                   string `json:"id"`
-	Surface              string `json:"surface"`
+	ID                   string                   `json:"id"`
+	Surface              string                   `json:"surface"`
+	Class                string                   `json:"class"`
+	BaselineInteractions int                      `json:"baselineInteractions"`
+	ExerciseInteractions int                      `json:"exerciseInteractions"`
+	DeltaInteractions    int                      `json:"deltaInteractions"`
+	Stages               []CanaryStageInteraction `json:"stages"`
+}
+
+// CanaryStageInteraction records how many times a single canary was touched in
+// a specific interaction stage. Baseline/exercise totals count distinct trace
+// lines (the tool stage counts appearances in the captured agent output), and a
+// line may map to more than one stage, so per-stage counts need not sum to the
+// canary total.
+type CanaryStageInteraction struct {
+	Stage                string `json:"stage"`
 	BaselineInteractions int    `json:"baselineInteractions"`
 	ExerciseInteractions int    `json:"exerciseInteractions"`
 	DeltaInteractions    int    `json:"deltaInteractions"`
 }
 
+// CanaryStageCoverage documents whether the capture protocol can positively
+// detect a given interaction stage. "limited" means a zero interaction count is
+// inconclusive (limited coverage, not proof of non-use); any nonzero stage
+// interaction is still a real observation regardless of coverage.
+type CanaryStageCoverage struct {
+	Stage    string `json:"stage"`
+	Coverage string `json:"coverage"`
+	Source   string `json:"source"`
+}
+
 type CoverageEvidence struct {
-	SyscallScope    string   `json:"syscallScope"`
-	FileSyscalls    bool     `json:"fileSyscalls"`
-	ProcessSyscalls bool     `json:"processSyscalls"`
-	NetworkSyscalls bool     `json:"networkSyscalls"`
-	BaselinePaired  bool     `json:"baselinePaired"`
-	Limitations     []string `json:"limitations"`
+	SyscallScope    string                `json:"syscallScope"`
+	FileSyscalls    bool                  `json:"fileSyscalls"`
+	ProcessSyscalls bool                  `json:"processSyscalls"`
+	NetworkSyscalls bool                  `json:"networkSyscalls"`
+	BaselinePaired  bool                  `json:"baselinePaired"`
+	CanaryStages    []CanaryStageCoverage `json:"canaryStages"`
+	Limitations     []string              `json:"limitations"`
 }
 
 type CaptureMetadata struct {
@@ -149,6 +197,7 @@ type CaptureMetadata struct {
 type CanaryDefinition struct {
 	ID      string
 	Surface string
+	Class   string
 	Path    string
 	Marker  string
 }
@@ -222,6 +271,9 @@ func ValidateEvidence(evidence Evidence) error {
 	if evidence.Coverage.SyscallScope != "selected-mvp-syscalls" {
 		return errors.New("evidence syscall coverage scope is missing or unsupported")
 	}
+	if err := validateCanaryStageCoverage(evidence.Coverage.CanaryStages); err != nil {
+		return err
+	}
 	completeCapture := evidence.Run.LaneExitCode == (LaneExitCodes{}) && evidence.Coverage.BaselinePaired &&
 		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
 	if (evidence.Run.Status == "completed") != completeCapture {
@@ -241,12 +293,73 @@ func ValidateEvidence(evidence Evidence) error {
 		if canary.ID == "" || canary.Surface == "" || canary.BaselineInteractions < 0 || canary.ExerciseInteractions < 0 || canary.DeltaInteractions != expectedDelta {
 			return errors.New("evidence contains an invalid canary observation")
 		}
+		if strings.TrimSpace(canary.Class) == "" || len(canary.Class) > 40 || strings.ContainsAny(canary.Class, "\x00\r\n") {
+			return errors.New("evidence contains an invalid canary class")
+		}
+		if err := validateCanaryStages(canary.Stages); err != nil {
+			return err
+		}
 	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {
 		return fmt.Errorf("evidence exceeds maximum encoded size (%d bytes)", MaxEvidenceBytes)
 	}
 	return nil
+}
+
+// validateCanaryStages enforces canonical stage ordering, non-empty stages, and
+// per-stage delta consistency so stage-level correlation stays deterministic and
+// safe to grade and diff across versions.
+func validateCanaryStages(stages []CanaryStageInteraction) error {
+	lastRank := -1
+	for _, stage := range stages {
+		rank, ok := canaryStageRank(stage.Stage)
+		if !ok || rank <= lastRank {
+			return errors.New("evidence canary stages are unknown, duplicated, or out of order")
+		}
+		lastRank = rank
+		expected := stage.ExerciseInteractions - stage.BaselineInteractions
+		if expected < 0 {
+			expected = 0
+		}
+		if stage.BaselineInteractions < 0 || stage.ExerciseInteractions < 0 || stage.DeltaInteractions != expected {
+			return errors.New("evidence contains an invalid canary stage interaction")
+		}
+		if stage.BaselineInteractions == 0 && stage.ExerciseInteractions == 0 {
+			return errors.New("evidence canary stage has no interactions")
+		}
+	}
+	return nil
+}
+
+// validateCanaryStageCoverage requires every interaction stage to declare its
+// coverage exactly once and in canonical order, so absence of a stage hit can
+// never be silently misread as proof of non-use.
+func validateCanaryStageCoverage(coverage []CanaryStageCoverage) error {
+	if len(coverage) != len(canaryStageSequence) {
+		return errors.New("evidence canary stage coverage is incomplete")
+	}
+	for i, entry := range coverage {
+		if entry.Stage != canaryStageSequence[i] {
+			return errors.New("evidence canary stage coverage is missing or out of order")
+		}
+		if entry.Coverage != "observed" && entry.Coverage != "limited" {
+			return errors.New("evidence canary stage coverage state is invalid")
+		}
+		if strings.TrimSpace(entry.Source) == "" || len(entry.Source) > 80 || strings.ContainsAny(entry.Source, "\x00\r\n") {
+			return errors.New("evidence canary stage coverage source is invalid")
+		}
+	}
+	return nil
+}
+
+func canaryStageRank(stage string) (int, bool) {
+	for rank, name := range canaryStageSequence {
+		if name == stage {
+			return rank, true
+		}
+	}
+	return 0, false
 }
 
 func isSHA256Digest(value string) bool {

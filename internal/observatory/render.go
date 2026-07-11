@@ -255,6 +255,7 @@ func DiffEvidence(previous Evidence, current Evidence) []VersionChange {
 			PreviousDelta: canary.DeltaInteractions,
 		})
 	}
+	changes = append(changes, diffCanaryStages(previousCanaries, currentCanaries)...)
 	sort.Slice(changes, func(i, j int) bool {
 		order := map[string]int{"added": 0, "changed": 1, "removed": 2}
 		a, b := changes[i], changes[j]
@@ -263,6 +264,59 @@ func DiffEvidence(previous Evidence, current Evidence) []VersionChange {
 		}
 		return a.Kind+"\x00"+a.Operation+"\x00"+a.Subject < b.Kind+"\x00"+b.Operation+"\x00"+b.Subject
 	})
+	return changes
+}
+
+// diffCanaryStages surfaces stage-level canary correlation changes so a version
+// comparison shows not only whether canary interaction changed but which
+// interaction stage (read/write/execute/outbound/tool) moved.
+func diffCanaryStages(previous map[string]CanaryObservation, current map[string]CanaryObservation) []VersionChange {
+	type stageKey struct {
+		canary string
+		stage  string
+	}
+	previousStages := map[stageKey]int{}
+	labels := map[stageKey]string{}
+	for key, canary := range previous {
+		for _, stage := range canary.Stages {
+			id := stageKey{key, stage.Stage}
+			previousStages[id] = stage.DeltaInteractions
+			labels[id] = canary.ID + " (" + canary.Surface + ") · " + stage.Stage
+		}
+	}
+	currentStages := map[stageKey]bool{}
+	changes := []VersionChange{}
+	for key, canary := range current {
+		for _, stage := range canary.Stages {
+			id := stageKey{key, stage.Stage}
+			currentStages[id] = true
+			labels[id] = canary.ID + " (" + canary.Surface + ") · " + stage.Stage
+			before, exists := previousStages[id]
+			if exists && before == stage.DeltaInteractions {
+				continue
+			}
+			if !exists && stage.DeltaInteractions == 0 {
+				continue
+			}
+			change := "added"
+			if exists {
+				change = "changed"
+			}
+			changes = append(changes, VersionChange{
+				Change: change, Kind: "canary", Operation: "stage:" + stage.Stage, Subject: labels[id], Outcome: "observed", Role: "synthetic-canary",
+				PreviousDelta: before, CurrentDelta: stage.DeltaInteractions,
+			})
+		}
+	}
+	for id, before := range previousStages {
+		if currentStages[id] || before == 0 {
+			continue
+		}
+		changes = append(changes, VersionChange{
+			Change: "removed", Kind: "canary", Operation: "stage:" + id.stage, Subject: labels[id], Outcome: "observed", Role: "synthetic-canary",
+			PreviousDelta: before,
+		})
+	}
 	return changes
 }
 
@@ -350,9 +404,12 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   <section class="panel"><h2>Observed exercise deltas</h2>{{if .Evidence.Observations}}<div class="table-wrap"><table><thead><tr><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Observations}}<tr><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{.BaselineCount}}</td><td>{{.ExerciseCount}}</td><td>+{{.DeltaCount}}</td></tr>{{end}}
   </tbody></table></div>{{else}}<p class="muted">No trace event increased in the exercise lane.</p>{{end}}</section>
-  <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
-    {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
+  <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Class</th><th>Surface</th><th>Stages (baseline→exercise)</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
+    {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td><span class="kind">{{.Class}}</span></td><td>{{.Surface}}</td><td>{{range .Stages}}<span class="muted">{{.Stage}}</span> {{.BaselineInteractions}}→{{.ExerciseInteractions}}{{if .DeltaInteractions}} <span class="change-added">+{{.DeltaInteractions}}</span>{{end}} {{else}}<span class="muted">—</span>{{end}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
+  <section class="panel"><h2>Canary stage coverage</h2><div class="table-wrap"><table><thead><tr><th>Stage</th><th>Coverage</th><th>Source</th></tr></thead><tbody>
+    {{range .Evidence.Coverage.CanaryStages}}<tr><td><span class="kind">{{.Stage}}</span></td><td>{{if eq .Coverage "observed"}}<span class="change-added">observed</span>{{else}}<span class="change-changed">limited</span>{{end}}</td><td><code>{{.Source}}</code></td></tr>{{end}}
+  </tbody></table></div><p class="muted" style="margin-top:12px">Limited coverage means a zero interaction count for that stage is inconclusive, not proof of non-use. Any nonzero interaction is a real observation.</p></section>
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>
 </main></body></html>`))

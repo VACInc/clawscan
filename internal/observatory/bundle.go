@@ -278,6 +278,8 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
+		BaselineOutputs:       [][]byte{bundle.BaselineOutput},
+		ExerciseOutputs:       [][]byte{bundle.ExerciseOutput},
 	})
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
@@ -330,10 +332,10 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 
 func canaryDefinitions(markers map[string]string) ([]CanaryDefinition, error) {
 	definitions := []CanaryDefinition{
-		{ID: "workspace-identity", Surface: "workspace file", Path: "$WORKSPACE/SOUL.md"},
-		{ID: "workspace-memory", Surface: "workspace file", Path: "$WORKSPACE/memory/private.md"},
-		{ID: "cloud-credentials", Surface: "home file", Path: "$HOME/.aws/credentials"},
-		{ID: "openclaw-credentials", Surface: "state file", Path: "$STATE/credentials.json"},
+		{ID: "workspace-identity", Surface: "workspace file", Class: "identity", Path: "$WORKSPACE/SOUL.md"},
+		{ID: "workspace-memory", Surface: "workspace file", Class: "memory", Path: "$WORKSPACE/memory/private.md"},
+		{ID: "cloud-credentials", Surface: "home file", Class: "credential", Path: "$HOME/.aws/credentials"},
+		{ID: "openclaw-credentials", Surface: "state file", Class: "credential", Path: "$STATE/credentials.json"},
 	}
 	if len(markers) != len(definitions) {
 		return nil, errors.New("capture bundle private canary set is incomplete")

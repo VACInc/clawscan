@@ -807,6 +807,170 @@ func TestPathCanaryIgnoresArgvAndPayloadSpoofing(t *testing.T) {
 	}
 }
 
+func TestCanaryStageCorrelationClassifiesReadWriteExecuteAndOutbound(t *testing.T) {
+	metadata := CaptureMetadata{
+		BaselineWorkspace: "/run/baseline/workspace", ExerciseWorkspace: "/run/exercise/workspace",
+		BaselineState: "/run/baseline/state", ExerciseState: "/run/exercise/state",
+		BaselineHome: "/run/baseline/home", ExerciseHome: "/run/exercise/home",
+		TargetKind: "skill", TargetRoot: "/run/exercise/workspace/skills/observed",
+	}
+	marker := testCanaryMarkers()["cloud-credentials"]
+	baseline := `openat(AT_FDCWD, "/run/baseline/home/.aws/credentials", O_RDONLY) = 3` + "\n"
+	// A read-intent open, a write-intent open, a truncate, an exec of the canary
+	// file, and a send whose payload carries the canary value (enriched capture).
+	exercise := `openat(AT_FDCWD, "/run/exercise/home/.aws/credentials", O_RDONLY) = 3
+openat(AT_FDCWD, "/run/exercise/home/.aws/credentials", O_WRONLY|O_CREAT, 0600) = 4
+truncate("/run/exercise/home/.aws/credentials", 0) = 0
+execve("/run/exercise/home/.aws/credentials", ["x"], 0x0) = 0
+sendto(5<TCP:[10.0.0.3:5000->93.184.216.34:443]>, "` + marker + `", 61, 0, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}, 16) = 61
+`
+	result := AnalyzeTraces(AnalysisInput{
+		BaselineTraces:        []string{baseline},
+		ExerciseTraces:        []string{exercise},
+		Metadata:              metadata,
+		Canaries:              testCanaries(),
+		ControlPlaneAddresses: []string{"10.0.0.2:8000"},
+	})
+	cloud := findCanary(result.Canaries, "cloud-credentials")
+	if cloud.Class != "credential" {
+		t.Fatalf("class = %q", cloud.Class)
+	}
+	// Distinct touched lines: 1 read baseline; 1 read + 2 write + 1 execute + 1
+	// outbound exercise. Per-stage counts break down the same lines.
+	if cloud.BaselineInteractions != 1 || cloud.ExerciseInteractions != 5 || cloud.DeltaInteractions != 4 {
+		t.Fatalf("cloud totals = %#v", cloud)
+	}
+	want := map[string][3]int{
+		"read":     {1, 1, 0},
+		"write":    {0, 2, 2},
+		"execute":  {0, 1, 1},
+		"outbound": {0, 1, 1},
+	}
+	got := map[string][3]int{}
+	for _, stage := range cloud.Stages {
+		got[stage.Stage] = [3]int{stage.BaselineInteractions, stage.ExerciseInteractions, stage.DeltaInteractions}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("cloud stages = %#v", cloud.Stages)
+	}
+	for stage, counts := range want {
+		if got[stage] != counts {
+			t.Fatalf("cloud stage %q = %v, want %v", stage, got[stage], counts)
+		}
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "OBS-CANARY") {
+		t.Fatalf("evidence leaked a canary value: %s", encoded)
+	}
+	// Outbound is a value-correlation stage: coverage stays limited even though a
+	// hit was found, while read/write/execute are confirmed by paired traces.
+	if state := coverageState(result.Coverage.CanaryStages, "outbound"); state != "limited" {
+		t.Fatalf("outbound coverage = %q", state)
+	}
+	for _, stage := range []string{"read", "write", "execute"} {
+		if state := coverageState(result.Coverage.CanaryStages, stage); state != "observed" {
+			t.Fatalf("%s coverage = %q", stage, state)
+		}
+	}
+}
+
+func TestCanaryToolStageCountsAgentOutputAppearancesWithoutLeaking(t *testing.T) {
+	marker := testCanaryMarkers()["workspace-memory"]
+	result := AnalyzeTraces(AnalysisInput{
+		BaselineTraces:  []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
+		ExerciseTraces:  []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
+		Metadata:        CaptureMetadata{TargetKind: "skill"},
+		Canaries:        testCanaries(),
+		ExerciseOutputs: [][]byte{[]byte("tool call read canary; result " + marker + " and again " + marker + "\n")},
+	})
+	memory := findCanary(result.Canaries, "workspace-memory")
+	// No trace line touched the canary path, but the value surfaced twice in the
+	// captured tool/output stream. The tool stage records it independently of the
+	// trace-line interaction total.
+	if memory.ExerciseInteractions != 0 || memory.DeltaInteractions != 0 {
+		t.Fatalf("memory totals = %#v", memory)
+	}
+	stage := findStage(memory.Stages, "tool")
+	if stage.ExerciseInteractions != 2 || stage.DeltaInteractions != 2 {
+		t.Fatalf("memory tool stage = %#v", memory.Stages)
+	}
+	if state := coverageState(result.Coverage.CanaryStages, "tool"); state != "observed" {
+		t.Fatalf("tool coverage = %q", state)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "OBS-CANARY") {
+		t.Fatalf("tool scan leaked the canary value: %s", encoded)
+	}
+}
+
+func TestCanaryStageCountsAreBoundedAgainstLargeInput(t *testing.T) {
+	marker := testCanaryMarkers()["cloud-credentials"]
+	flood := strings.Repeat(marker+" ", maxCanaryInteractionCount+16)
+	result := AnalyzeTraces(AnalysisInput{
+		BaselineTraces:  []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
+		ExerciseTraces:  []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
+		Metadata:        CaptureMetadata{TargetKind: "skill"},
+		Canaries:        testCanaries(),
+		ExerciseOutputs: [][]byte{[]byte(flood)},
+	})
+	stage := findStage(findCanary(result.Canaries, "cloud-credentials").Stages, "tool")
+	if stage.ExerciseInteractions != maxCanaryInteractionCount || stage.DeltaInteractions != maxCanaryInteractionCount {
+		t.Fatalf("bounded tool stage = %#v", stage)
+	}
+}
+
+func TestDiffEvidenceReportsCanaryStageChanges(t *testing.T) {
+	previous := fixtureEvidence()
+	current := fixtureEvidence()
+	previous.Canaries[0].Stages = []CanaryStageInteraction{{Stage: "read", ExerciseInteractions: 1, DeltaInteractions: 1}}
+	current.Canaries[0].Stages = []CanaryStageInteraction{
+		{Stage: "read", ExerciseInteractions: 1, DeltaInteractions: 1},
+		{Stage: "outbound", ExerciseInteractions: 2, DeltaInteractions: 2},
+	}
+	changes := DiffEvidence(previous, current)
+	found := map[string]int{}
+	for _, change := range changes {
+		if change.Kind == "canary" && strings.HasPrefix(change.Operation, "stage:") {
+			found[change.Operation] = change.CurrentDelta
+		}
+	}
+	if len(found) != 1 || found["stage:outbound"] != 2 {
+		t.Fatalf("stage changes = %#v", changes)
+	}
+}
+
+func TestValidateEvidenceRejectsInvalidCanaryStagesAndCoverage(t *testing.T) {
+	evidence := fixtureEvidence()
+	evidence.Canaries[0].Stages = []CanaryStageInteraction{
+		{Stage: "read", ExerciseInteractions: 1, DeltaInteractions: 1},
+		{Stage: "read", ExerciseInteractions: 1, DeltaInteractions: 1},
+	}
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "out of order") {
+		t.Fatalf("duplicate stage err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Canaries[0].Stages = []CanaryStageInteraction{{Stage: "outbound", BaselineInteractions: 2, ExerciseInteractions: 1, DeltaInteractions: 5}}
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "invalid canary stage interaction") {
+		t.Fatalf("bad delta err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Coverage.CanaryStages = evidence.Coverage.CanaryStages[:4]
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "coverage is incomplete") {
+		t.Fatalf("truncated coverage err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Canaries[0].Class = ""
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "canary class") {
+		t.Fatalf("empty class err = %v", err)
+	}
+}
+
 func TestScanStagesAndConsumesFixtureExecutorBundle(t *testing.T) {
 	requireLinuxControlHost(t)
 	skill := filepath.Join("..", "..", "testdata", "fixtures", "probe-skill")
@@ -1261,6 +1425,24 @@ func findCanary(canaries []CanaryObservation, id string) CanaryObservation {
 	return CanaryObservation{}
 }
 
+func findStage(stages []CanaryStageInteraction, name string) CanaryStageInteraction {
+	for _, stage := range stages {
+		if stage.Stage == name {
+			return stage
+		}
+	}
+	return CanaryStageInteraction{}
+}
+
+func coverageState(coverage []CanaryStageCoverage, stage string) string {
+	for _, entry := range coverage {
+		if entry.Stage == stage {
+			return entry.Coverage
+		}
+	}
+	return ""
+}
+
 func findCanaryDefinition(canaries []CanaryDefinition, id string) CanaryDefinition {
 	for _, canary := range canaries {
 		if canary.ID == id {
@@ -1476,8 +1658,11 @@ func fixtureEvidence() Evidence {
 		},
 		Exercise:     ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
 		Observations: []Observation{},
-		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file"}},
-		Coverage:     CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, Limitations: []string{"Fixture limitation."}},
+		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file", Class: "credential"}},
+		Coverage: CoverageEvidence{
+			SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true,
+			CanaryStages: canaryStageCoverage(true), Limitations: []string{"Fixture limitation."},
+		},
 	}
 }
 

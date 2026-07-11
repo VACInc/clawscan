@@ -18,7 +18,7 @@ const behaviorFixture = `{
   "run":{"id":"obs_test","status":"completed","startedAt":"2026-07-10T12:00:00Z","completedAt":"2026-07-10T12:00:01Z","durationMs":1000,"executor":"fixture","isolation":{"substrate":"fixture","networkMode":"none","containmentProfile":"fixture","guestFirewallSha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","guestFirewallPolicySha256":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","verification":"fixture"},"runtime":{"openclawVersion":"OpenClaw fixture","straceVersion":"strace fixture","modelProvider":"fixture","modelId":"fixture","modelEndpoint":"private"},"laneExitCode":{"baseline":0,"exercise":0}},
   "exercise":{"promptSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","turnLimit":1},
   "observations":[],"canaries":[],
-  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"limitations":[]}
+  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"canaryStages":[{"stage":"read","coverage":"observed","source":"file-open-and-descriptor-syscall-trace"},{"stage":"write","coverage":"observed","source":"file-mutation-syscall-trace"},{"stage":"execute","coverage":"observed","source":"exec-syscall-trace"},{"stage":"outbound","coverage":"limited","source":"socket-send-payload"},{"stage":"tool","coverage":"observed","source":"agent-tool-output-stream"}],"limitations":[]}
 }`
 
 func TestParseArgsAcceptsBehaviorScanner(t *testing.T) {

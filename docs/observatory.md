@@ -102,8 +102,43 @@ and public JSON projection. A skill capture needs the same explicit
 native plugins use their manifest ID. The renderer also requires matching
 effective-capture digests, runtime versions, isolation receipts, prompts, and
 coverage, and refuses incomplete captures. It never labels incomparable runs as
-a version delta. Version deltas include both normalized trace observations and
-synthetic-canary interaction changes.
+a version delta. Version deltas include normalized trace observations, overall
+synthetic-canary interaction changes, and per-stage canary correlation changes.
+
+## Honeytoken / canary correlation
+
+Each run seeds four synthetic canaries — a workspace identity file, a workspace
+memory file, a synthetic cloud credential, and a synthetic OpenClaw credential —
+with random per-run marker values. Correlation is deterministic and secret-safe:
+the public evidence identifies stable canary classes and interaction stages, but
+never the marker values, raw arguments, private paths, or addresses.
+
+Every canary observation carries a stable `class` (`identity`, `memory`, or
+`credential`) and a `stages` breakdown. Interactions are classified into stages:
+
+- `read` — the canary file was opened for reading (read-intent opens; individual
+  `read()` syscalls are outside the selected scope);
+- `write` — the canary file was created, written, truncated, deleted, renamed, or
+  linked;
+- `execute` — the canary file itself was executed, or its value was passed to an
+  exec;
+- `outbound` — the canary value appeared in an outbound socket payload;
+- `tool` — the canary value surfaced in the captured agent tool/output stream.
+
+`read`, `write`, and `execute` come from path- and descriptor-based syscall
+correlation and are available whenever paired traces exist. `outbound` and `tool`
+are value-correlation stages that only produce a hit when the capture actually
+carries the canary value. Correlation never inspects `argv` or payload bytes for
+a bare path string, so spoofing a canary path in an unrelated argument cannot
+forge an interaction.
+
+`coverage.canaryStages` records, per stage, whether the capture protocol can
+positively confirm it. Because the live capture uses `strace -s 0`, network send
+payloads are stripped, so the `outbound` stage is reported as `limited`: a zero
+outbound count is limited coverage, not proof the token was not exfiltrated. A
+`limited` stage only weakens a negative; any nonzero interaction is still a real
+observation. Interaction counters are bounded so an adversarially large capture
+cannot inflate the evidence.
 
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
@@ -184,6 +219,9 @@ no declared tools require an operator-supplied `exercise.prompt`.
 - One bounded task cannot cover every branch.
 - Results depend on model/tool behavior and synthetic inputs.
 - `strace` provides endpoint addresses, not complete DNS or payload attribution.
+- Canary `outbound` and `tool` stages depend on the capture retaining a value
+  channel; under the live `-s 0` protocol a zero count is limited coverage, not
+  proof the token was unused.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
 - Behavioral correlation is not author intent and is never a safety verdict.

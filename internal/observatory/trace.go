@@ -16,6 +16,13 @@ type AnalysisInput struct {
 	Metadata              CaptureMetadata
 	Canaries              []CanaryDefinition
 	ControlPlaneAddresses []string
+	// BaselineOutputs and ExerciseOutputs are optional captured tool/output
+	// value channels (the agent tool/output stream today). They are scanned for
+	// canary values to derive the tool interaction stage and are never
+	// published. Enhancements that capture a richer structured tool-event stream
+	// can supply it here without changing the evidence schema.
+	BaselineOutputs [][]byte
+	ExerciseOutputs [][]byte
 }
 
 type analysisResult struct {
@@ -80,10 +87,18 @@ var (
 func AnalyzeTraces(input AnalysisInput) analysisResult {
 	counts := map[string]*observationCounts{}
 	observationsByKey := map[string]traceObservation{}
-	baselineCanaries := make(map[string]int, len(input.Canaries))
-	exerciseCanaries := make(map[string]int, len(input.Canaries))
+	baselineCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
+	exerciseCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
+	for _, canary := range input.Canaries {
+		baselineCanaries[canary.ID] = newCanaryLaneCounts()
+		exerciseCanaries[canary.ID] = newCanaryLaneCounts()
+	}
 
 	consume := func(traces []string, exercise bool) {
+		laneCanaries := baselineCanaries
+		if exercise {
+			laneCanaries = exerciseCanaries
+		}
 		for _, trace := range traces {
 			initialCWD := input.Metadata.BaselineWorkspace
 			if exercise {
@@ -97,12 +112,14 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 				}
 				cwd := processes.cwd(record.PID)
 				for _, canary := range input.Canaries {
-					if lineTouchesCanaryAtCWD(line, canary, input.Metadata, cwd) {
-						if exercise {
-							exerciseCanaries[canary.ID]++
-						} else {
-							baselineCanaries[canary.ID]++
-						}
+					stages := canaryLineStages(line, canary, input.Metadata, cwd)
+					if len(stages) == 0 {
+						continue
+					}
+					lane := laneCanaries[canary.ID]
+					lane.total++
+					for _, stage := range stages {
+						lane.stages[stage]++
 					}
 				}
 				for _, observation := range parseTraceLineAtCWD(line, input.Metadata, input.ControlPlaneAddresses, exercise, cwd) {
@@ -160,16 +177,38 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	for _, canary := range input.Canaries {
 		baseline := baselineCanaries[canary.ID]
 		exercise := exerciseCanaries[canary.ID]
-		delta := exercise - baseline
-		if delta < 0 {
-			delta = 0
+		// The tool stage is not tied to a syscall trace line: it counts canary
+		// values surfacing in the captured agent tool/output stream. Scanning is
+		// bounded and only counts are published.
+		baselineTool := clampCanaryCount(countCanaryInStreams(input.BaselineOutputs, canary.Marker))
+		exerciseTool := clampCanaryCount(countCanaryInStreams(input.ExerciseOutputs, canary.Marker))
+		stages := []CanaryStageInteraction{}
+		for _, stage := range canaryStageSequence {
+			baselineStage := clampCanaryCount(baseline.stages[stage])
+			exerciseStage := clampCanaryCount(exercise.stages[stage])
+			if stage == CanaryStageTool {
+				baselineStage, exerciseStage = baselineTool, exerciseTool
+			}
+			if baselineStage == 0 && exerciseStage == 0 {
+				continue
+			}
+			stages = append(stages, CanaryStageInteraction{
+				Stage:                stage,
+				BaselineInteractions: baselineStage,
+				ExerciseInteractions: exerciseStage,
+				DeltaInteractions:    positiveDelta(exerciseStage, baselineStage),
+			})
 		}
+		baselineTotal := clampCanaryCount(baseline.total)
+		exerciseTotal := clampCanaryCount(exercise.total)
 		result.Canaries = append(result.Canaries, CanaryObservation{
 			ID:                   canary.ID,
 			Surface:              canary.Surface,
-			BaselineInteractions: baseline,
-			ExerciseInteractions: exercise,
-			DeltaInteractions:    delta,
+			Class:                canary.Class,
+			BaselineInteractions: baselineTotal,
+			ExerciseInteractions: exerciseTotal,
+			DeltaInteractions:    positiveDelta(exerciseTotal, baselineTotal),
+			Stages:               stages,
 		})
 	}
 	sort.Slice(result.Canaries, func(i, j int) bool { return result.Canaries[i].ID < result.Canaries[j].ID })
@@ -181,15 +220,81 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 		ProcessSyscalls: pairedTraceReceipts,
 		NetworkSyscalls: pairedTraceReceipts,
 		BaselinePaired:  pairedTraceReceipts,
+		CanaryStages:    canaryStageCoverage(pairedTraceReceipts),
 		Limitations: []string{
 			"Coverage booleans confirm paired trace receipts for selected MVP syscall families; they do not claim an exhaustive Linux syscall audit.",
 			"Observed behavior is input- and model-dependent; unexercised branches remain invisible.",
 			"System-call tracing records endpoint addresses but does not provide complete DNS-name or payload attribution.",
 			"A behavioral delta shows correlation with the exercise lane, not author intent or a safety verdict.",
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
+			"Canary correlation classifies interactions into read, write, execute, outbound, and tool stages; the read stage reflects read-intent file opens, not individual read() syscalls, which are outside the selected scope.",
+			"Outbound and tool are value-correlation stages: the capture strips network payloads, so a zero outbound count is limited coverage, not proof the token was not exfiltrated. Any nonzero stage interaction remains a real observation.",
 		},
 	}
 	return result
+}
+
+type canaryLaneCounts struct {
+	total  int
+	stages map[string]int
+}
+
+func newCanaryLaneCounts() *canaryLaneCounts {
+	return &canaryLaneCounts{stages: map[string]int{}}
+}
+
+// canaryStageCoverage reports, per interaction stage, whether the capture
+// protocol can positively confirm it. The value is a stable function of the
+// protocol and capture completeness, so two runs of the same protocol compare
+// as equal. read/write/execute are confirmed by paired file/process traces;
+// outbound is limited because the -s 0 capture strips send payloads; the agent
+// tool/output stream is always captured, so the tool stage is confirmed.
+func canaryStageCoverage(pairedTraceReceipts bool) []CanaryStageCoverage {
+	traceState := "limited"
+	if pairedTraceReceipts {
+		traceState = "observed"
+	}
+	return []CanaryStageCoverage{
+		{Stage: CanaryStageRead, Coverage: traceState, Source: "file-open-and-descriptor-syscall-trace"},
+		{Stage: CanaryStageWrite, Coverage: traceState, Source: "file-mutation-syscall-trace"},
+		{Stage: CanaryStageExecute, Coverage: traceState, Source: "exec-syscall-trace"},
+		{Stage: CanaryStageOutbound, Coverage: "limited", Source: "socket-send-payload"},
+		{Stage: CanaryStageTool, Coverage: "observed", Source: "agent-tool-output-stream"},
+	}
+}
+
+func countCanaryInStreams(streams [][]byte, marker string) int {
+	if marker == "" {
+		return 0
+	}
+	total := 0
+	for _, stream := range streams {
+		if len(stream) == 0 {
+			continue
+		}
+		total += strings.Count(string(stream), marker)
+		if total >= maxCanaryInteractionCount {
+			return maxCanaryInteractionCount
+		}
+	}
+	return total
+}
+
+func clampCanaryCount(count int) int {
+	if count > maxCanaryInteractionCount {
+		return maxCanaryInteractionCount
+	}
+	if count < 0 {
+		return 0
+	}
+	return count
+}
+
+func positiveDelta(exercise int, baseline int) int {
+	if exercise > baseline {
+		return exercise - baseline
+	}
+	return 0
 }
 
 func traceLaneHasCompleteSyscall(traces []string) bool {
@@ -860,55 +965,165 @@ func lineTouchesCanary(line string, canary CanaryDefinition, metadata CaptureMet
 }
 
 func lineTouchesCanaryAtCWD(line string, canary CanaryDefinition, metadata CaptureMetadata, cwd string) bool {
+	return len(canaryLineStages(line, canary, metadata, cwd)) > 0
+}
+
+// canaryLineStages returns the deduplicated, canonically ordered interaction
+// stages a single trace line represents for one canary. A line is counted as a
+// canary interaction exactly when this returns a non-empty set. Two triggers
+// contribute: value correlation (the canary's secret marker literally appears in
+// the line) and path/descriptor correlation (a path operand resolves to the
+// canary path). Neither ever inspects argv or payload bytes for a bare path
+// string, so spoofing the canary path in an unrelated argument cannot forge an
+// interaction.
+func canaryLineStages(line string, canary CanaryDefinition, metadata CaptureMetadata, cwd string) []string {
+	present := map[string]bool{}
 	if canary.Marker != "" && strings.Contains(line, canary.Marker) {
-		return true
+		for _, stage := range canaryValueStages(line) {
+			present[stage] = true
+		}
 	}
+	for _, stage := range canaryPathStages(line, canary, metadata, cwd) {
+		present[stage] = true
+	}
+	ordered := make([]string, 0, len(present))
+	for _, stage := range canaryStageSequence {
+		if present[stage] {
+			ordered = append(ordered, stage)
+		}
+	}
+	return ordered
+}
+
+// canaryValueStages classifies a line whose canary marker value is present by
+// the syscall that carried it. Under the -s 0 capture protocol argv and payload
+// strings are stripped, so this only fires for enriched re-analysis or for
+// values that surface through filenames; the value is never republished.
+func canaryValueStages(line string) []string {
+	open := strings.IndexByte(line, '(')
+	if open <= 0 {
+		return []string{CanaryStageRead}
+	}
+	syscall := strings.TrimSpace(line[:open])
+	switch syscall {
+	case "open", "openat", "openat2":
+		quoted := quotedTraceStrings(line)
+		if len(quoted) == 0 {
+			return []string{CanaryStageRead}
+		}
+		return openStages(openOperation(line, syscall, quoted[0]))
+	case "creat":
+		return []string{CanaryStageWrite}
+	case "execve", "execveat":
+		return []string{CanaryStageExecute}
+	case "connect", "sendto", "sendmsg", "sendmmsg":
+		return []string{CanaryStageOutbound}
+	case "write", "writev":
+		if subject, _ := networkFDSubject(line, nil); subject != "" {
+			return []string{CanaryStageOutbound}
+		}
+		return []string{CanaryStageWrite}
+	case "link", "linkat", "symlink", "symlinkat", "unlink", "unlinkat",
+		"rename", "renameat", "renameat2", "mkdir", "mkdirat", "rmdir",
+		"truncate", "ftruncate":
+		return []string{CanaryStageWrite}
+	default:
+		return []string{CanaryStageRead}
+	}
+}
+
+// canaryPathStages classifies a line whose path operand (or annotated
+// descriptor) resolves to the canary path. Path resolution mirrors the
+// observation parser: relative operands are resolved against the PID-aware cwd,
+// and both lane labelings are considered before comparing to the canary path.
+func canaryPathStages(line string, canary CanaryDefinition, metadata CaptureMetadata, cwd string) []string {
 	if canary.Path == "" {
-		return false
+		return nil
 	}
 	open := strings.IndexByte(line, '(')
 	if open <= 0 {
-		return false
+		return nil
 	}
 	syscall := strings.TrimSpace(line[:open])
 	quoted := quotedTraceStrings(line)
-	pathOperands := []traceString{}
+	matches := func(operand traceString) bool {
+		for _, exercise := range []bool{false, true} {
+			if normalizePath(resolveTracePath(operand, line, cwd), metadata, exercise) == canary.Path {
+				return true
+			}
+		}
+		return false
+	}
 	switch syscall {
-	case "open", "openat", "openat2", "creat", "unlink", "unlinkat", "rmdir", "mkdir", "mkdirat", "truncate":
-		if len(quoted) > 0 {
-			pathOperands = quoted[:1]
+	case "open", "openat", "openat2":
+		if len(quoted) > 0 && matches(quoted[0]) {
+			return openStages(openOperation(line, syscall, quoted[0]))
 		}
-	case "rename", "renameat", "renameat2", "link", "linkat":
-		if len(quoted) > 2 {
-			quoted = quoted[:2]
+	case "creat":
+		if len(quoted) > 0 && matches(quoted[0]) {
+			return []string{CanaryStageWrite}
 		}
-		pathOperands = quoted
-		if syscall == "linkat" && len(pathOperands) > 0 && pathOperands[0].Value == "" && strings.Contains(line, "AT_EMPTY_PATH") {
-			pathOperands[0] = traceString{Value: annotatedFDPathBefore(line, pathOperands[0].Start), Start: -1, End: -1}
-		}
-	case "symlink", "symlinkat":
-		if len(quoted) >= 2 {
-			pathOperands = quoted[len(quoted)-1:]
+	case "unlink", "unlinkat", "rmdir", "mkdir", "mkdirat", "truncate":
+		if len(quoted) > 0 && matches(quoted[0]) {
+			return []string{CanaryStageWrite}
 		}
 	case "ftruncate":
 		path := annotatedFDPathBefore(line, strings.IndexByte(line, ','))
 		for _, exercise := range []bool{false, true} {
 			if normalizePath(path, metadata, exercise) == canary.Path {
-				return true
+				return []string{CanaryStageWrite}
 			}
 		}
-		return false
+	case "rename", "renameat", "renameat2":
+		operands := quoted
+		if len(operands) > 2 {
+			operands = operands[:2]
+		}
+		for _, operand := range operands {
+			if matches(operand) {
+				return []string{CanaryStageWrite}
+			}
+		}
+	case "link", "linkat":
+		operands := append([]traceString{}, quoted...)
+		if len(operands) > 2 {
+			operands = operands[:2]
+		}
+		if syscall == "linkat" && len(operands) > 0 && operands[0].Value == "" && strings.Contains(line, "AT_EMPTY_PATH") {
+			operands[0] = traceString{Value: annotatedFDPathBefore(line, operands[0].Start), Start: -1, End: -1}
+		}
+		for _, operand := range operands {
+			if matches(operand) {
+				return []string{CanaryStageWrite}
+			}
+		}
+	case "symlink", "symlinkat":
+		if len(quoted) >= 2 && matches(quoted[len(quoted)-1]) {
+			return []string{CanaryStageWrite}
+		}
+	case "execve", "execveat":
+		if len(quoted) > 0 {
+			program := quoted[0]
+			if syscall == "execveat" && program.Value == "" && strings.Contains(line, "AT_EMPTY_PATH") {
+				program = traceString{Value: annotatedFDPathBefore(line, program.Start), Start: -1, End: -1}
+			}
+			if matches(program) {
+				return []string{CanaryStageExecute}
+			}
+		}
+	}
+	return nil
+}
+
+func openStages(operation string) []string {
+	switch operation {
+	case "open-for-write":
+		return []string{CanaryStageWrite}
+	case "open-for-read-write":
+		return []string{CanaryStageRead, CanaryStageWrite}
 	default:
-		return false
+		return []string{CanaryStageRead}
 	}
-	for _, exercise := range []bool{false, true} {
-		for _, operand := range pathOperands {
-			if normalizePath(resolveTracePath(operand, line, cwd), metadata, exercise) == canary.Path {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func observationKey(observation traceObservation) string {

@@ -103,7 +103,10 @@ Top-level sections:
 - `observations`: kind, operation, normalized subject, baseline/exercise/delta
   counts, outcome; file descriptor acquisition is labeled `open-for-*` and is
   never presented as a completed read or write;
-- `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
+- `canaries`: canary ID/class/surface, baseline/exercise interaction counts, and
+  a per-stage (read/write/execute/outbound/tool) correlation breakdown, never
+  values; `coverage.canaryStages` records whether each stage is positively
+  detectable so absence is read as limited coverage, not proof of non-use;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), and concrete limitations.
 
