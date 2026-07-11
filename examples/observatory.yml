@@ -58,3 +58,27 @@ limits:
   maxMemoryBytes: 2147483648
   cpuQuotaPercent: 200
   maxTasks: 256
+
+# Optional, opt-in model/runtime comparison matrix. Leave it out for the normal
+# default: exactly one model and one paired scan. When present, only the
+# `observatory matrix` subcommand runs it; a plain `observatory scan` still uses
+# the single `runtime.model` above. Each variant is a sparse override of the base
+# model/runtime; unset fields inherit. Every variant runs as its own fresh-VM
+# paired scan, sequentially. Give each variant a distinct model/runtime override
+# and a unique id; two ids for the same effective config are rejected as
+# ambiguous. Between 2 and 8 variants are allowed. Run
+# `observatory matrix --dry-run <target>` to see the resource multiplier first.
+#matrix:
+#  variants:
+#    - id: baseline-model
+#      model:
+#        id: local-tool-model
+#    - id: wider-context
+#      model:
+#        id: local-tool-model
+#        contextWindow: 131072
+#    - id: alternate-endpoint
+#      model:
+#        id: local-tool-model-b
+#        baseUrl: http://10.0.0.21:8000/v1
+#      controlPlaneAddresses: [10.0.0.21:8000]

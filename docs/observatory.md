@@ -111,6 +111,62 @@ capture. Their canonical digest
 is stored in both the raw bundle and public evidence; drift fails closed instead
 of relabeling old data.
 
+## Model/runtime comparison matrix
+
+The default scan runs exactly one model and one paired capture. An optional,
+opt-in matrix compares how the same target behaves under a bounded list of
+model/runtime variants. The matrix never changes the default: a plain
+`observatory scan` always uses the single `runtime.model`, even when a `matrix`
+block is present. Only the `matrix` subcommand reads the variants.
+
+Define variants as sparse overrides of the base model/runtime; unset fields
+inherit. Between 2 and 8 variants are allowed. Each variant needs a unique,
+stable `id` and a distinct effective configuration — two ids for the same
+effective config, or two variants that resolve to the same capture digest, are
+rejected as ambiguous rather than silently merged.
+
+```yaml
+matrix:
+  variants:
+    - id: baseline-model
+      model: { id: local-tool-model }
+    - id: alternate-endpoint
+      model: { id: local-tool-model-b, baseUrl: http://10.0.0.21:8000/v1 }
+      controlPlaneAddresses: [10.0.0.21:8000]
+```
+
+Because a matrix multiplies resource use, the resource multiplier is always
+shown before any VM is provisioned, and `--dry-run` prints the plan (multiplier,
+fresh-VM count, worst-case wall clock, and per-variant model/endpoint class and
+capture digest) without provisioning anything:
+
+```bash
+./bin/observatory matrix --config ./observatory.yml --dry-run ./path/to/target
+```
+
+A real matrix run executes each variant as its own fresh-VM paired scan,
+sequentially (never concurrently), reusing the shared executor, isolation,
+target staging, exercise prompt, and limits so that captures differ only on the
+model/runtime axis. Each variant fully re-validates the live isolation contract
+before it starts. Use `--fail-fast` to stop at the first failing variant;
+otherwise the whole matrix runs and per-variant status is reported.
+
+```bash
+./bin/observatory matrix --config ./observatory.yml --output ./matrix ./path/to/target
+```
+
+The output is `observatory.matrix.v1`: a structured, side-by-side comparison of
+grade-ready behavioral signals. Each variant carries its bound
+`captureConfigSha256`, model receipt (provider, id, endpoint class), firewall
+policy digest, and per-kind signal totals. Each observed behavior appears once
+with its per-variant delta counts and a `uniform` flag. The comparison only
+covers variants whose captures are genuinely comparable — same target digest,
+prompt, coverage, isolation profile, and runtime versions. It refuses to compare
+captures that differ in anything other than the model/runtime axis, and lists
+incomplete or failed variants under `excluded` with a reason category. It never
+labels an incomparable capture as a behavioral difference, and it carries no
+verdict, score, or recommendation.
+
 ## Isolation contract
 
 Crabbox provisions and operates the runner; it is not itself a hostile-code

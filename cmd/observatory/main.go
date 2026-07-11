@@ -35,6 +35,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	switch args[0] {
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
+	case "matrix":
+		return runMatrix(ctx, args[1:], stdout, stderr)
 	case "analyze":
 		return runAnalyze(args[1:], stdout)
 	case "render":
@@ -78,6 +80,91 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 		fmt.Fprintf(stderr, "run_directory: %s\n", result.RunDirectory)
 	}
 	return err
+}
+
+func runMatrix(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("matrix", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", defaultConfigPath(), "Observatory YAML config")
+	output := flags.String("output", "", "directory for comparison.json and per-variant evidence")
+	jsonOutput := flags.Bool("json", false, "write the comparison JSON to stdout")
+	dryRun := flags.Bool("dry-run", false, "show the resource multiplier and plan without provisioning any VM")
+	failFast := flags.Bool("fail-fast", false, "stop at the first variant that fails instead of running the whole matrix")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: observatory matrix [--config path] [--dry-run] [--fail-fast] [--output dir] [--json] <target>")
+	}
+	config, err := observatory.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	// The matrix is strictly opt-in: it only runs from this subcommand, never
+	// from a plain scan. The plan (with its resource multiplier) is printed to
+	// stderr before any VM is provisioned.
+	options := observatory.MatrixOptions{DryRun: *dryRun, FailFast: *failFast, Progress: stderr}
+	result, runErr := observatory.RunMatrix(ctx, flags.Arg(0), config, nil, options)
+	if *dryRun {
+		if err := encodeJSON(stdout, result.Plan); err != nil {
+			return err
+		}
+		return runErr
+	}
+	for _, run := range result.Runs {
+		if run.RunDirectory != "" {
+			fmt.Fprintf(stderr, "variant %s: %s run_directory: %s\n", run.ID, run.Status, run.RunDirectory)
+		} else {
+			fmt.Fprintf(stderr, "variant %s: %s\n", run.ID, run.Status)
+		}
+		if run.Note != "" {
+			fmt.Fprintf(stderr, "variant %s: note: %s\n", run.ID, run.Note)
+		}
+	}
+	if result.Comparison.Schema != "" {
+		if *output != "" {
+			if err := writeMatrixOutput(*output, result); err != nil {
+				return err
+			}
+		}
+		if *jsonOutput || *output == "" {
+			if err := encodeJSON(stdout, result.Comparison); err != nil {
+				return err
+			}
+		}
+	}
+	return runErr
+}
+
+func writeMatrixOutput(dir string, result observatory.MatrixResult) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := writeJSONFile(filepath.Join(dir, "comparison.json"), result.Comparison); err != nil {
+		return err
+	}
+	for _, run := range result.Runs {
+		if run.Evidence == nil {
+			continue
+		}
+		if err := writeEvidence(filepath.Join(dir, "variant-"+run.ID+".json"), *run.Evidence); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeJSONFile(path string, value any) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	encodeErr := encodeJSON(file, value)
+	closeErr := file.Close()
+	if encodeErr != nil {
+		return encodeErr
+	}
+	return closeErr
 }
 
 func runAnalyze(args []string, stdout io.Writer) error {
@@ -202,9 +289,15 @@ const helpText = `ClawHub Observatory — paired behavioral evidence for OpenCla
 
 Usage:
   observatory scan [--config path] [--json] <target>
+  observatory matrix [--config path] [--dry-run] [--fail-fast] [--output dir] [--json] <target>
   observatory analyze --config path --bundle raw.tar.gz [--json] <target>
   observatory render --input evidence.json --output site [--previous evidence.json]
   observatory validate-config [--live] <config>
+
+The default scan runs exactly one model and one paired capture. The optional
+matrix subcommand is opt-in: it runs each configured model/runtime variant as its
+own fresh-VM paired scan, sequentially, and emits a structured comparison of the
+comparable captures. --dry-run prints the resource multiplier without provisioning.
 
 The output is evidence, never a safety verdict. Live scans fail closed until the
 config attests a disposable Proxmox VM and an isolated deny/sinkhole network.

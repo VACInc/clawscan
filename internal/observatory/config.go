@@ -25,6 +25,15 @@ var verificationReceiptPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._: -
 var isolatedBridgePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
 var guestAccountPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 var targetLineagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$`)
+var matrixVariantIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// MinMatrixVariants and MaxMatrixVariants bound an opt-in comparison matrix. A
+// matrix of one variant is not a comparison; the upper bound caps how many
+// disposable VMs a single hands-off invocation may provision sequentially.
+const (
+	MinMatrixVariants = 2
+	MaxMatrixVariants = 8
+)
 
 type Config struct {
 	Version       int             `yaml:"version"`
@@ -36,6 +45,28 @@ type Config struct {
 	Runtime       RuntimeConfig   `yaml:"runtime"`
 	Exercise      ExerciseConfig  `yaml:"exercise"`
 	Limits        LimitsConfig    `yaml:"limits"`
+	Matrix        MatrixConfig    `yaml:"matrix"`
+}
+
+// MatrixConfig is an optional, opt-in comparison over model/runtime variants.
+// Its presence never changes the default single-model scan; only the explicit
+// matrix workflow reads it. Each variant reuses the shared executor, isolation,
+// target staging, exercise, and limits, and overrides only the model/runtime
+// axis under comparison so that captures differ solely in that axis.
+type MatrixConfig struct {
+	Variants []MatrixVariant `yaml:"variants"`
+}
+
+// MatrixVariant is a sparse override of the base model/runtime configuration.
+// Empty fields inherit the base value. The ID is the stable public label the
+// comparison uses to name the variant; it never enters the guest or the capture
+// digest, so two labels for the same effective configuration are ambiguous and
+// rejected rather than silently treated as one experiment.
+type MatrixVariant struct {
+	ID                    string      `yaml:"id"`
+	Model                 ModelConfig `yaml:"model"`
+	ControlPlaneAddresses []string    `yaml:"controlPlaneAddresses"`
+	TimeoutSeconds        int         `yaml:"timeoutSeconds"`
 }
 
 type ExecutorConfig struct {
@@ -292,6 +323,83 @@ func (config Config) Validate() error {
 	}
 	if config.Limits.MaxTasks < 32 || config.Limits.MaxTasks > 1024 {
 		return errors.New("limits.maxTasks must be between 32 and 1024")
+	}
+	if err := config.validateMatrix(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// VariantConfig applies a matrix variant onto the base configuration and returns
+// the effective single-scan config for that variant. The returned config carries
+// no matrix block so it validates and runs like any ordinary paired scan, and so
+// each variant provisions its own fresh VM through the normal Scan path.
+func (config Config) VariantConfig(variant MatrixVariant) Config {
+	effective := config
+	effective.Matrix = MatrixConfig{}
+	model := config.Runtime.Model
+	if variant.Model.Provider != "" {
+		model.Provider = variant.Model.Provider
+	}
+	if variant.Model.BaseURL != "" {
+		model.BaseURL = variant.Model.BaseURL
+	}
+	if variant.Model.ID != "" {
+		model.ID = variant.Model.ID
+	}
+	if variant.Model.API != "" {
+		model.API = variant.Model.API
+	}
+	if variant.Model.ContextWindow != 0 {
+		model.ContextWindow = variant.Model.ContextWindow
+	}
+	if variant.Model.MaxTokens != 0 {
+		model.MaxTokens = variant.Model.MaxTokens
+	}
+	effective.Runtime.Model = model
+	if len(variant.ControlPlaneAddresses) != 0 {
+		effective.Runtime.ControlPlaneAddresses = append([]string(nil), variant.ControlPlaneAddresses...)
+	}
+	if variant.TimeoutSeconds != 0 {
+		effective.Runtime.TimeoutSeconds = variant.TimeoutSeconds
+	}
+	return effective
+}
+
+func (config Config) validateMatrix() error {
+	variants := config.Matrix.Variants
+	if len(variants) == 0 {
+		return nil
+	}
+	if len(variants) < MinMatrixVariants {
+		return fmt.Errorf("matrix.variants must define at least %d variants when present", MinMatrixVariants)
+	}
+	if len(variants) > MaxMatrixVariants {
+		return fmt.Errorf("matrix.variants must define at most %d variants", MaxMatrixVariants)
+	}
+	seenID := map[string]bool{}
+	seenDigest := map[string]string{}
+	for _, variant := range variants {
+		if !matrixVariantIDPattern.MatchString(variant.ID) {
+			return fmt.Errorf("matrix variant id must be a stable label of at most 64 URL-safe characters: %q", variant.ID)
+		}
+		normalizedID := strings.ToLower(variant.ID)
+		if seenID[normalizedID] {
+			return fmt.Errorf("matrix variant ids must be unique and unambiguous: %q", variant.ID)
+		}
+		seenID[normalizedID] = true
+		if variant.TimeoutSeconds < 0 {
+			return fmt.Errorf("matrix variant %q timeoutSeconds must not be negative", variant.ID)
+		}
+		effective := config.VariantConfig(variant)
+		if err := effective.Validate(); err != nil {
+			return fmt.Errorf("matrix variant %q: %w", variant.ID, err)
+		}
+		digest := captureConfigSHA256(effective)
+		if other, ok := seenDigest[digest]; ok {
+			return fmt.Errorf("matrix variants %q and %q resolve to the same effective configuration; give each a distinct model/runtime override", other, variant.ID)
+		}
+		seenDigest[digest] = variant.ID
 	}
 	return nil
 }
