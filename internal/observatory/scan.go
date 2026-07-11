@@ -305,7 +305,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v14"
+const CaptureProtocolRevision = "observatory.capture-protocol.v15"
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -319,6 +319,7 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 		Isolation               IsolationConfig `json:"isolation"`
 		Runtime                 RuntimeConfig   `json:"runtime"`
 		Exercise                ExerciseConfig  `json:"exercise"`
+		Redirect                RedirectConfig  `json:"redirect"`
 		Limits                  LimitsConfig    `json:"limits"`
 	}{
 		CaptureProtocolRevision: protocolRevision,
@@ -327,6 +328,7 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 		Isolation:               config.Isolation,
 		Runtime:                 config.Runtime,
 		Exercise:                config.Exercise,
+		Redirect:                config.Redirect,
 		Limits:                  config.Limits,
 	}
 	data, err := json.Marshal(binding)
@@ -384,6 +386,14 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err != nil {
 		return fmt.Errorf("generate private canary markers: %w", err)
 	}
+	redirectMarkers, err := newRedirectMarkers()
+	if err != nil {
+		return fmt.Errorf("generate synthetic redirect markers: %w", err)
+	}
+	redirectSeedFiles, err := redirectSeeds(redirectMarkers)
+	if err != nil {
+		return fmt.Errorf("render synthetic redirect seeds: %w", err)
+	}
 	runtime := map[string]any{
 		"runId":               runID,
 		"targetSha256":        target.SHA256,
@@ -401,6 +411,8 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"controlPlaneIps":     controlPlaneIPs(config.Runtime.ControlPlaneAddresses),
 		"firewallTable":       "observatory_" + runID,
 		"canaries":            canaries,
+		"redirects":           redirectMarkers,
+		"redirectSeeds":       redirectSeedFiles,
 		"model": map[string]any{
 			"provider":      config.Runtime.Model.Provider,
 			"baseUrl":       config.Runtime.Model.BaseURL,

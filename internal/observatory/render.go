@@ -95,12 +95,15 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 		return err
 	}
 	defer directory.Close()
-	counts := map[string]int{"file": 0, "process": 0, "network": 0, "canary": 0}
+	counts := map[string]int{"file": 0, "process": 0, "network": 0, "canary": 0, "redirect": 0}
 	for _, observation := range evidence.Observations {
 		counts[observation.Kind] += observation.DeltaCount
 	}
 	for _, canary := range evidence.Canaries {
 		counts["canary"] += canary.DeltaInteractions
+	}
+	for _, probe := range evidence.RedirectProbes {
+		counts["redirect"] += probe.DeviatedDelta
 	}
 	file, err := openRenderOutputFile(directory, "index.html", 0o644)
 	if err != nil {
@@ -255,6 +258,40 @@ func DiffEvidence(previous Evidence, current Evidence) []VersionChange {
 			PreviousDelta: canary.DeltaInteractions,
 		})
 	}
+	previousRedirects := map[string]RedirectProbeObservation{}
+	currentRedirects := map[string]RedirectProbeObservation{}
+	for _, probe := range previous.RedirectProbes {
+		previousRedirects[probe.ID] = probe
+	}
+	for _, probe := range current.RedirectProbes {
+		currentRedirects[probe.ID] = probe
+	}
+	for id, probe := range currentRedirects {
+		before, exists := previousRedirects[id]
+		if exists && before.Attributed == probe.Attributed && before.DeviatedDelta == probe.DeviatedDelta {
+			continue
+		}
+		if !exists && probe.Attributed == redirectTierNone && probe.DeviatedDelta == 0 {
+			continue
+		}
+		change := "added"
+		if exists {
+			change = "changed"
+		}
+		changes = append(changes, VersionChange{
+			Change: change, Kind: "redirect", Operation: "escalation", Subject: probe.ID + " (" + probe.Surface + ")", Outcome: probe.Attributed, Role: "redirect-probe",
+			PreviousDelta: before.DeviatedDelta, CurrentDelta: probe.DeviatedDelta,
+		})
+	}
+	for id, probe := range previousRedirects {
+		if _, exists := currentRedirects[id]; exists || (probe.Attributed == redirectTierNone && probe.DeviatedDelta == 0) {
+			continue
+		}
+		changes = append(changes, VersionChange{
+			Change: "removed", Kind: "redirect", Operation: "escalation", Subject: probe.ID + " (" + probe.Surface + ")", Outcome: probe.Attributed, Role: "redirect-probe",
+			PreviousDelta: probe.DeviatedDelta,
+		})
+	}
 	sort.Slice(changes, func(i, j int) bool {
 		order := map[string]int{"added": 0, "changed": 1, "removed": 2}
 		a, b := changes[i], changes[j]
@@ -300,7 +337,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     .badge { display:inline-flex; width:max-content; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line); border-radius:999px; background:#0b111b; color:var(--muted); font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace; }
     .badge::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 12px var(--green); }
     .badge.incomplete::before { background:var(--amber); box-shadow:0 0 12px var(--amber); }
-    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:24px 0; }
+    .grid { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:24px 0; }
     .metric,.panel { border:1px solid var(--line); border-radius:14px; background:linear-gradient(150deg,rgba(21,30,45,.96),rgba(12,17,26,.96)); box-shadow:0 18px 55px rgba(0,0,0,.22); }
     .metric { padding:18px; }
     .metric strong { display:block; font-size:28px; line-height:1; }
@@ -335,6 +372,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div class="metric"><strong>{{index .Counts "process"}}</strong><span>Process events</span></div>
     <div class="metric"><strong>{{index .Counts "network"}}</strong><span>Network events</span></div>
     <div class="metric"><strong>{{index .Counts "canary"}}</strong><span>Canary deltas</span></div>
+    <div class="metric"><strong>{{index .Counts "redirect"}}</strong><span>Redirect deviations</span></div>
   </section>
   <section class="panel"><h2>Run receipt</h2><dl class="meta">
     <div><dt>Target digest</dt><dd>{{shortHash .Evidence.Target.SHA256}}</dd></div>
@@ -352,6 +390,9 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   </tbody></table></div>{{else}}<p class="muted">No trace event increased in the exercise lane.</p>{{end}}</section>
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
+  </tbody></table></div></section>
+  <section class="panel"><h2>Redirect instruction probes</h2><p class="muted">Synthetic injected instructions seeded in workspace content. Reading or repeating a marker is not evidence of prompt injection; only a deviation delta shows the exercise lane performed the harmless sentinel action the instruction named.</p><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Surface</th><th>Vector</th><th>Escalation</th><th>Attributed</th><th>Read Δ</th><th>Repeat Δ</th><th>Deviate Δ</th></tr></thead><tbody>
+    {{range .Evidence.RedirectProbes}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.Vector}}</td><td class="{{if eq .Escalation "deviated"}}change-removed{{else if eq .Escalation "none"}}muted{{end}}">{{upper .Escalation}}</td><td class="{{if eq .Attributed "deviated"}}change-removed{{else if eq .Attributed "none"}}muted{{end}}">{{upper .Attributed}}</td><td>{{if .ReadDelta}}+{{.ReadDelta}}{{else}}0{{end}}</td><td>{{if .RepeatedDelta}}+{{.RepeatedDelta}}{{else}}0{{end}}</td><td>{{if .DeviatedDelta}}+{{.DeviatedDelta}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>

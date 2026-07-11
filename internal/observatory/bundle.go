@@ -151,6 +151,15 @@ func captureMetadataFromEntries(entries map[string][]byte) (CaptureMetadata, err
 		return CaptureMetadata{}, canaryErr
 	}
 	metadata.Canaries = canaries
+	var redirectMarkerMap map[string]string
+	if err := json.Unmarshal(entries["meta/redirects.json"], &redirectMarkerMap); err != nil {
+		return CaptureMetadata{}, errors.New("capture bundle has invalid meta/redirects.json")
+	}
+	redirects, redirectErr := redirectProbeDefinitions(redirectMarkerMap)
+	if redirectErr != nil {
+		return CaptureMetadata{}, redirectErr
+	}
+	metadata.Redirects = redirects
 	if metadata.RunID == "" {
 		return CaptureMetadata{}, errors.New("capture bundle is missing meta/run-id")
 	}
@@ -275,9 +284,13 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 	analysis := AnalyzeTraces(AnalysisInput{
 		BaselineTraces:        bundle.BaselineTraces,
 		ExerciseTraces:        bundle.ExerciseTraces,
+		BaselineOutput:        bundle.BaselineOutput,
+		ExerciseOutput:        bundle.ExerciseOutput,
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
+		RedirectProbes:        bundle.Metadata.Redirects,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
+		RedirectDeepMode:      config.Redirect.Deep,
 	})
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
@@ -322,9 +335,10 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 			BaselineOutputSHA: digestBytes(bundle.BaselineOutput),
 			ExerciseOutputSHA: digestBytes(bundle.ExerciseOutput),
 		},
-		Observations: analysis.Observations,
-		Canaries:     analysis.Canaries,
-		Coverage:     analysis.Coverage,
+		Observations:   analysis.Observations,
+		Canaries:       analysis.Canaries,
+		RedirectProbes: analysis.RedirectProbes,
+		Coverage:       analysis.Coverage,
 	}
 }
 

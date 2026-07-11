@@ -17,8 +17,8 @@ const behaviorFixture = `{
   "target":{"name":"demo","kind":"skill","id":"demo","sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fileCount":1,"directoryCount":1,"totalBytes":7,"files":[{"path":"SKILL.md","bytes":7,"mode":"0644"}],"directories":[{"path":".","mode":"0755"}]},
   "run":{"id":"obs_test","status":"completed","startedAt":"2026-07-10T12:00:00Z","completedAt":"2026-07-10T12:00:01Z","durationMs":1000,"executor":"fixture","isolation":{"substrate":"fixture","networkMode":"none","containmentProfile":"fixture","guestFirewallSha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","guestFirewallPolicySha256":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","verification":"fixture"},"runtime":{"openclawVersion":"OpenClaw fixture","straceVersion":"strace fixture","modelProvider":"fixture","modelId":"fixture","modelEndpoint":"private"},"laneExitCode":{"baseline":0,"exercise":0}},
   "exercise":{"promptSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","turnLimit":1},
-  "observations":[],"canaries":[],
-  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"limitations":[]}
+  "observations":[],"canaries":[],"redirectProbes":[],
+  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"redirectProbeScope":"seeded-workspace-redirects","redirectProbeCount":0,"redirectDeepMode":false,"limitations":[]}
 }`
 
 func TestParseArgsAcceptsBehaviorScanner(t *testing.T) {

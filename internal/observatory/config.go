@@ -35,6 +35,7 @@ type Config struct {
 	Isolation     IsolationConfig `yaml:"isolation"`
 	Runtime       RuntimeConfig   `yaml:"runtime"`
 	Exercise      ExerciseConfig  `yaml:"exercise"`
+	Redirect      RedirectConfig  `yaml:"redirect"`
 	Limits        LimitsConfig    `yaml:"limits"`
 }
 
@@ -81,6 +82,14 @@ type ModelConfig struct {
 type ExerciseConfig struct {
 	Prompt    string `yaml:"prompt"`
 	TurnLimit int    `yaml:"turnLimit"`
+}
+
+// RedirectConfig exposes the optional deep/repeat redirect mode. The knob is
+// present for forward compatibility but stays off in the MVP: the default path
+// runs exactly one Crabbox deployment and one paired baseline/exercise trial, and
+// enabling deep mode fails closed rather than multiplying trials.
+type RedirectConfig struct {
+	Deep bool `yaml:"deep"`
 }
 
 type LimitsConfig struct {
@@ -268,6 +277,9 @@ func (config Config) Validate() error {
 	}
 	if len(config.Exercise.Prompt) > 64<<10 || strings.ContainsRune(config.Exercise.Prompt, '\x00') {
 		return errors.New("exercise.prompt must be at most 65536 bytes and contain no NUL")
+	}
+	if config.Redirect.Deep {
+		return errors.New("redirect.deep is reserved for a future deep/repeat mode and is not enabled in the MVP")
 	}
 	if config.Limits.MaxFiles < 1 || config.Limits.MaxFileBytes < 1 || config.Limits.MaxTotalBytes < 1 {
 		return errors.New("all limits must be positive")

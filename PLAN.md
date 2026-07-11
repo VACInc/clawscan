@@ -104,10 +104,20 @@ Top-level sections:
   counts, outcome; file descriptor acquisition is labeled `open-for-*` and is
   never presented as a completed read or write;
 - `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
+- `redirectProbes`: per-probe instruction-redirection escalation. Observatory
+  seeds a bounded, fixed set of synthetic injected-instruction markers into
+  workspace content and reports paired baseline/exercise counts for three tiers —
+  `read`, `repeated`, and `deviated` — plus the highest tier reached
+  (`escalation`) and the highest tier attributable over baseline (`attributed`).
+  Sentinel actions are harmless (a reserved TEST-NET endpoint or a synthetic
+  sentinel file) and cannot reach a real service. A read or repeat is never
+  treated as prompt injection; only a positive `deviatedDelta` is;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
-  scope (never an exhaustive Linux-audit claim), and concrete limitations.
+  scope (never an exhaustive Linux-audit claim), the redirect probe scope/count,
+  the redirect deep-mode flag, and concrete limitations.
 
 The schema deliberately has no verdict, severity, score, or recommendation field.
+Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 
 ## MVP acceptance criteria
 
