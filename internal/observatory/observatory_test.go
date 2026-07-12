@@ -1187,6 +1187,11 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 		`/bin/bash "$CONTROL/run-agent.sh"`, `install -m 0600 "$OUT/raw.tar.gz" "$DOWNLOAD_OUT/raw.tar.gz"`,
 		`local session="observatory-$RUN_ID"`,
 		"lane storage must be a bounded tmpfs",
+		"audit --agent observatory --kind tool_action --limit 500 --json",
+		"capture_tool_audit baseline",
+		"capture_tool_audit exercise",
+		`printf 'captured\n' > "$META/$lane-audit-status"`,
+		`printf 'unavailable\n' > "$META/$lane-audit-status"`,
 	} {
 		if !strings.Contains(remoteRunScript, required) {
 			t.Fatalf("remote runner missing %q", required)
@@ -1392,6 +1397,10 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"201 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n" +
 		"201 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n"
 	canaryJSON, _ := json.Marshal(testCanaryMarkers())
+	toolName := "observatory_probe"
+	if targetKind == "skill" {
+		toolName = "bash"
+	}
 	return map[string]string{
 		"meta/run-id":                runID + "\n",
 		"meta/target-sha256":         targetSHA256 + "\n",
@@ -1412,11 +1421,26 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"meta/openclaw-version":      "OpenClaw fixture\n",
 		"meta/strace-version":        "strace fixture\n",
 		"meta/firewall-sha256":       strings.Repeat("a", 64) + "\n",
+		"meta/baseline-audit-status": "captured\n",
+		"meta/exercise-audit-status": "captured\n",
 		"baseline/trace":             "101 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n",
 		"exercise/trace":             exerciseTrace,
 		"baseline/agent.stdout":      "baseline\n",
 		"exercise/agent.stdout":      "exercise\n",
+		"baseline/audit.json":        `{"events":[]}` + "\n",
+		"exercise/audit.json":        fixtureToolAuditJSON(toolName),
 	}
+}
+
+// fixtureToolAuditJSON builds a newest-first AuditListResult with one completed
+// tool call (started+finished), matching how the CLI returns records.
+func fixtureToolAuditJSON(tool string) string {
+	events := []map[string]any{
+		{"eventId": "e2", "sequence": 2, "sourceSequence": 2, "occurredAt": 1000, "kind": "tool_action", "action": "tool.action.finished", "status": "succeeded", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
+		{"eventId": "e1", "sequence": 1, "sourceSequence": 1, "occurredAt": 900, "kind": "tool_action", "action": "tool.action.started", "status": "started", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
+	}
+	encoded, _ := json.Marshal(map[string]any{"events": events})
+	return string(encoded) + "\n"
 }
 
 func testCanaryMarkers() map[string]string {
@@ -1478,10 +1502,17 @@ func fixtureEvidence() Evidence {
 		Observations: []Observation{},
 		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file"}},
 		Coverage:     CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, Limitations: []string{"Fixture limitation."}},
-		Timeline: Timeline{
-			MaxEventsPerLane: MaxTimelineEventsPerLane,
-			Baseline:         TimelineLane{Events: []TimelineEvent{}},
-			Exercise:         TimelineLane{Events: []TimelineEvent{}},
+		ToolCallLedger: ToolCallLedger{
+			Source:            ToolCallLedgerSource,
+			MaxCallsPerLane:   MaxToolCallsPerLane,
+			ArgumentSummaries: ToolArgumentCoverage{Available: false, Reason: "Fixture: argument summaries unavailable."},
+			Baseline:          ToolCallLane{Coverage: "complete", Reason: "No tool calls were recorded in this lane.", Calls: []ToolCall{}},
+			Exercise:          ToolCallLane{Coverage: "complete", Reason: "No tool calls were recorded in this lane.", Calls: []ToolCall{}},
+		},
+		RuntimeTimeline: RuntimeTimeline{
+			MaxEventsPerLane: MaxRuntimeTimelineEventsPerLane,
+			Baseline:         RuntimeTimelineLane{Events: []RuntimeTimelineEvent{}},
+			Exercise:         RuntimeTimelineLane{Events: []RuntimeTimelineEvent{}},
 		},
 	}
 }
@@ -1713,9 +1744,9 @@ func TestGeneratedPluginConfigDiscoversOwnedFixtureWhenCLIAvailable(t *testing.T
 	}
 }
 
-func timelineTestMetadata() CaptureMetadata {
+func runtimeTimelineTestMetadata() CaptureMetadata {
 	return CaptureMetadata{
-		RunID:             "obs_timeline",
+		RunID:             "obs_runtimeTimeline",
 		BaselineWorkspace: "/run/baseline/workspace", ExerciseWorkspace: "/run/exercise/workspace",
 		BaselineState: "/run/baseline/state", ExerciseState: "/run/exercise/state",
 		BaselineHome: "/run/baseline/home", ExerciseHome: "/run/exercise/home",
@@ -1723,7 +1754,7 @@ func timelineTestMetadata() CaptureMetadata {
 	}
 }
 
-func TestBuildTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T) {
+func TestBuildRuntimeTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T) {
 	cloudMarker := testCanaryMarkers()["cloud-credentials"]
 	baseline := "100 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
 	exercise := "200 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
@@ -1732,21 +1763,21 @@ func TestBuildTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T)
 		"200 1001.250000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n" +
 		"200 1002.000000 connect(3<TCP:[1]>, {sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr(\"203.0.113.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n" +
 		"200 1002.500000 sendto(4, \"" + cloudMarker + "\", 61, 0, {sa_family=AF_INET, sin_port=htons(8000), sin_addr=inet_addr(\"10.0.0.2\")}, 16) = 61\n"
-	timeline := BuildTimeline(AnalysisInput{
+	runtimeTimeline := BuildRuntimeTimeline(AnalysisInput{
 		BaselineTraces:        []string{baseline},
 		ExerciseTraces:        []string{exercise},
-		Metadata:              timelineTestMetadata(),
+		Metadata:              runtimeTimelineTestMetadata(),
 		Canaries:              testCanaries(),
 		ControlPlaneAddresses: []string{"10.0.0.2:8000"},
 	})
-	if timeline.MaxEventsPerLane != MaxTimelineEventsPerLane {
-		t.Fatalf("event bound = %d", timeline.MaxEventsPerLane)
+	if runtimeTimeline.MaxEventsPerLane != MaxRuntimeTimelineEventsPerLane {
+		t.Fatalf("event bound = %d", runtimeTimeline.MaxEventsPerLane)
 	}
 	// Both lanes are published in full rather than baseline-subtracted.
-	if timeline.Baseline.EventCount != 1 || timeline.Baseline.Events[0].Subject != "node" || !timeline.Baseline.Timed {
-		t.Fatalf("baseline lane = %#v", timeline.Baseline)
+	if runtimeTimeline.Baseline.EventCount != 1 || runtimeTimeline.Baseline.Events[0].Subject != "node" || !runtimeTimeline.Baseline.Timed {
+		t.Fatalf("baseline lane = %#v", runtimeTimeline.Baseline)
 	}
-	exerciseLane := timeline.Exercise
+	exerciseLane := runtimeTimeline.Exercise
 	if !exerciseLane.Timed || exerciseLane.DurationMs == nil || *exerciseLane.DurationMs != 2500 {
 		t.Fatalf("exercise timing = %#v (duration %v)", exerciseLane, exerciseLane.DurationMs)
 	}
@@ -1775,25 +1806,25 @@ func TestBuildTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T)
 			t.Fatalf("event %d offset = %v, want %d", index, event.OffsetMs, exp.offset)
 		}
 	}
-	encoded, err := json.Marshal(timeline)
+	encoded, err := json.Marshal(runtimeTimeline)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, leaked := range []string{cloudMarker, "OBS-CANARY", "10.0.0.2"} {
 		if strings.Contains(string(encoded), leaked) {
-			t.Fatalf("timeline leaked private value %q: %s", leaked, encoded)
+			t.Fatalf("runtimeTimeline leaked private value %q: %s", leaked, encoded)
 		}
 	}
-	if err := validateTimeline(timeline); err != nil {
-		t.Fatalf("validate timeline: %v", err)
+	if err := validateRuntimeTimeline(runtimeTimeline); err != nil {
+		t.Fatalf("validate runtimeTimeline: %v", err)
 	}
 }
 
-func TestBuildTimelineWithoutTimestampsOmitsOffsets(t *testing.T) {
+func TestBuildRuntimeTimelineWithoutTimestampsOmitsOffsets(t *testing.T) {
 	exercise := "200 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
 		"200 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT) = 5\n"
-	timeline := BuildTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: timelineTestMetadata(), Canaries: testCanaries()})
-	lane := timeline.Exercise
+	runtimeTimeline := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: runtimeTimelineTestMetadata(), Canaries: testCanaries()})
+	lane := runtimeTimeline.Exercise
 	if lane.Timed || lane.DurationMs != nil || lane.EventCount != 2 {
 		t.Fatalf("untimed lane = %#v", lane)
 	}
@@ -1802,82 +1833,82 @@ func TestBuildTimelineWithoutTimestampsOmitsOffsets(t *testing.T) {
 			t.Fatalf("untimed event carried an offset: %#v", event)
 		}
 	}
-	if err := validateTimeline(timeline); err != nil {
-		t.Fatalf("validate timeline: %v", err)
+	if err := validateRuntimeTimeline(runtimeTimeline); err != nil {
+		t.Fatalf("validate runtimeTimeline: %v", err)
 	}
 }
 
-func TestBuildTimelineRejectsNonMonotonicTimestamps(t *testing.T) {
+func TestBuildRuntimeTimelineRejectsNonMonotonicTimestamps(t *testing.T) {
 	// A backwards stamp makes timing untrustworthy for the whole lane, but the
 	// ordered sequence is still preserved.
 	exercise := "200 1005.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
 		"200 1002.000000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_RDONLY) = 3\n"
-	lane := BuildTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: timelineTestMetadata()}).Exercise
+	lane := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: runtimeTimelineTestMetadata()}).Exercise
 	if lane.Timed || lane.EventCount != 2 || lane.Events[0].OffsetMs != nil {
 		t.Fatalf("non-monotonic lane = %#v", lane)
 	}
 }
 
-func TestBuildTimelineBoundsEventsPerLane(t *testing.T) {
+func TestBuildRuntimeTimelineBoundsEventsPerLane(t *testing.T) {
 	var builder strings.Builder
-	total := MaxTimelineEventsPerLane + 25
+	total := MaxRuntimeTimelineEventsPerLane + 25
 	for index := 0; index < total; index++ {
 		fmt.Fprintf(&builder, "200 openat(AT_FDCWD, \"/tmp/f%d\", O_RDONLY) = 3\n", index)
 	}
-	lane := BuildTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: timelineTestMetadata()}).Exercise
-	if lane.EventCount != MaxTimelineEventsPerLane || lane.TotalEvents != total || !lane.Truncated {
+	lane := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: runtimeTimelineTestMetadata()}).Exercise
+	if lane.EventCount != MaxRuntimeTimelineEventsPerLane || lane.TotalEvents != total || !lane.Truncated {
 		t.Fatalf("bounded lane = eventCount %d totalEvents %d truncated %v", lane.EventCount, lane.TotalEvents, lane.Truncated)
 	}
-	if lane.Events[0].Sequence != 1 || lane.Events[len(lane.Events)-1].Sequence != MaxTimelineEventsPerLane {
+	if lane.Events[0].Sequence != 1 || lane.Events[len(lane.Events)-1].Sequence != MaxRuntimeTimelineEventsPerLane {
 		t.Fatalf("sequence bounds = %d..%d", lane.Events[0].Sequence, lane.Events[len(lane.Events)-1].Sequence)
 	}
-	if err := validateTimeline(BuildTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: timelineTestMetadata()})); err != nil {
-		t.Fatalf("validate bounded timeline: %v", err)
+	if err := validateRuntimeTimeline(BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: runtimeTimelineTestMetadata()})); err != nil {
+		t.Fatalf("validate bounded runtimeTimeline: %v", err)
 	}
 }
 
-func TestValidateEvidenceRejectsMalformedTimeline(t *testing.T) {
+func TestValidateEvidenceRejectsMalformedRuntimeTimeline(t *testing.T) {
 	offset := func(value int64) *int64 { return &value }
 	tests := []struct {
 		name   string
 		mutate func(*Evidence)
 		want   string
 	}{
-		{"missing bound", func(e *Evidence) { e.Timeline.MaxEventsPerLane = 0 }, "per-lane event bound"},
-		{"nil events", func(e *Evidence) { e.Timeline.Exercise.Events = nil }, "events are required"},
+		{"missing bound", func(e *Evidence) { e.RuntimeTimeline.MaxEventsPerLane = 0 }, "per-lane event bound"},
+		{"nil events", func(e *Evidence) { e.RuntimeTimeline.Exercise.Events = nil }, "events are required"},
 		{"count mismatch", func(e *Evidence) {
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
-			e.Timeline.Exercise.EventCount = 2
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 2
 		}, "event count does not match"},
 		{"non-contiguous sequence", func(e *Evidence) {
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 2, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
-			e.Timeline.Exercise.EventCount = 1
-			e.Timeline.Exercise.TotalEvents = 1
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 2, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
 		}, "sequence is not contiguous"},
 		{"bad outcome", func(e *Evidence) {
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "succeeded"}}
-			e.Timeline.Exercise.EventCount = 1
-			e.Timeline.Exercise.TotalEvents = 1
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "succeeded"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
 		}, "outcome is unsupported"},
 		{"truncation mismatch", func(e *Evidence) {
-			e.Timeline.Exercise.TotalEvents = 5
+			e.RuntimeTimeline.Exercise.TotalEvents = 5
 		}, "truncation flag is inconsistent"},
 		{"offset on untimed", func(e *Evidence) {
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed", OffsetMs: offset(3)}}
-			e.Timeline.Exercise.EventCount = 1
-			e.Timeline.Exercise.TotalEvents = 1
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed", OffsetMs: offset(3)}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
 		}, "untimed event must not report an offset"},
 		{"missing offset on timed", func(e *Evidence) {
-			e.Timeline.Exercise.Timed = true
-			e.Timeline.Exercise.DurationMs = offset(10)
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
-			e.Timeline.Exercise.EventCount = 1
-			e.Timeline.Exercise.TotalEvents = 1
+			e.RuntimeTimeline.Exercise.Timed = true
+			e.RuntimeTimeline.Exercise.DurationMs = offset(10)
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
 		}, "timed event must report a non-negative offset"},
 		{"unsafe subject", func(e *Evidence) {
-			e.Timeline.Exercise.Events = []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x\ninjected", Outcome: "completed"}}
-			e.Timeline.Exercise.EventCount = 1
-			e.Timeline.Exercise.TotalEvents = 1
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x\ninjected", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
 		}, "unsafe characters"},
 	}
 	for _, test := range tests {
@@ -1891,9 +1922,9 @@ func TestValidateEvidenceRejectsMalformedTimeline(t *testing.T) {
 	}
 }
 
-func TestBuildEvidenceEmitsValidatedTimedTimelineFromBundle(t *testing.T) {
+func TestBuildEvidenceEmitsValidatedTimedRuntimeTimelineFromBundle(t *testing.T) {
 	config := validTestConfig(t, t.TempDir())
-	entries := fixtureBundleEntries("obs_timeline_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "skill", "")
+	entries := fixtureBundleEntries("obs_runtimeTimeline_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "skill", "")
 	entries["baseline/trace"] = "101 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
 	entries["exercise/trace"] = "201 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
 		"201 2000.750000 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
@@ -1910,9 +1941,9 @@ func TestBuildEvidenceEmitsValidatedTimedTimelineFromBundle(t *testing.T) {
 	if err := ValidateEvidence(evidence); err != nil {
 		t.Fatalf("validate evidence: %v", err)
 	}
-	exercise := evidence.Timeline.Exercise
+	exercise := evidence.RuntimeTimeline.Exercise
 	if !exercise.Timed || exercise.EventCount != 3 || exercise.DurationMs == nil || *exercise.DurationMs != 1000 {
-		t.Fatalf("exercise timeline = %#v", exercise)
+		t.Fatalf("exercise runtimeTimeline = %#v", exercise)
 	}
 	credentials := exercise.Events[1]
 	if credentials.Subject != "$HOME/.aws/credentials" || credentials.Canary != "cloud-credentials" {
@@ -1921,17 +1952,21 @@ func TestBuildEvidenceEmitsValidatedTimedTimelineFromBundle(t *testing.T) {
 	if exercise.Events[2].Outcome != "denied" {
 		t.Fatalf("shadow event = %#v", exercise.Events[2])
 	}
-	if evidence.Timeline.Baseline.EventCount != 1 {
-		t.Fatalf("baseline timeline = %#v", evidence.Timeline.Baseline)
+	if evidence.RuntimeTimeline.Baseline.EventCount != 1 {
+		t.Fatalf("baseline runtimeTimeline = %#v", evidence.RuntimeTimeline.Baseline)
 	}
 }
 
-func TestRenderSiteShowsToolEventTimeline(t *testing.T) {
+func TestRenderSiteShowsRuntimeTimelineAndToolCallLedger(t *testing.T) {
 	requireLinuxControlHost(t)
 	evidence := fixtureEvidence()
-	evidence.Timeline.Exercise = TimelineLane{
+	evidence.RuntimeTimeline.Exercise = RuntimeTimelineLane{
 		EventCount: 1, TotalEvents: 1, Timed: true, DurationMs: func() *int64 { v := int64(42); return &v }(),
-		Events: []TimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$HOME/.aws/credentials", Outcome: "denied", Canary: "cloud-credentials", OffsetMs: func() *int64 { v := int64(42); return &v }()}},
+		Events: []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$HOME/.aws/credentials", Outcome: "denied", Canary: "cloud-credentials", OffsetMs: func() *int64 { v := int64(42); return &v }()}},
+	}
+	evidence.ToolCallLedger.Exercise = ToolCallLane{
+		Coverage: "complete", CallCount: 1, TotalCalls: 1, Timed: true, DurationMs: func() *int64 { v := int64(0); return &v }(),
+		Calls: []ToolCall{{Sequence: 1, Tool: "observatory_probe", State: "blocked", ErrorCode: "tool_blocked", DurationMs: func() *int64 { v := int64(7); return &v }(), OffsetMs: func() *int64 { v := int64(0); return &v }()}},
 	}
 	output := t.TempDir()
 	if err := RenderSite(output, evidence, nil); err != nil {
@@ -1941,9 +1976,302 @@ func TestRenderSiteShowsToolEventTimeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"Tool-event timeline", "$HOME/.aws/credentials", "denied", "42 ms", "canary · cloud-credentials"} {
+	for _, expected := range []string{
+		"Runtime syscall timeline", "$HOME/.aws/credentials", "denied", "42 ms", "canary · cloud-credentials",
+		"OpenClaw tool-call ledger", "observatory_probe", "blocked", "tool_blocked", "unavailable",
+	} {
 		if !strings.Contains(string(html), expected) {
-			t.Fatalf("timeline HTML missing %q", expected)
+			t.Fatalf("evidence HTML missing %q", expected)
 		}
+	}
+}
+
+func auditStartedEvent(seq int, at int64, callID string, tool string) map[string]any {
+	return map[string]any{
+		"eventId": fmt.Sprintf("s%d", seq), "sequence": seq, "sourceSequence": seq, "occurredAt": at,
+		"kind": "tool_action", "action": "tool.action.started", "status": "started",
+		"actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory",
+		"runId": "run-secret-3f9a", "toolCallId": callID, "toolName": tool, "redaction": "metadata_only",
+	}
+}
+
+func auditFinishedEvent(seq int, at int64, callID string, tool string, status string, errorCode string) map[string]any {
+	event := map[string]any{
+		"eventId": fmt.Sprintf("f%d", seq), "sequence": seq, "sourceSequence": seq, "occurredAt": at,
+		"kind": "tool_action", "action": "tool.action.finished", "status": status,
+		"actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory",
+		"runId": "run-secret-3f9a", "toolCallId": callID, "toolName": tool, "redaction": "metadata_only",
+	}
+	if errorCode != "" {
+		event["errorCode"] = errorCode
+	}
+	return event
+}
+
+func auditLedgerBytes(events ...map[string]any) []byte {
+	if events == nil {
+		events = []map[string]any{}
+	}
+	data, _ := json.Marshal(map[string]any{"events": events})
+	return data
+}
+
+func toolLaneFromEvents(t *testing.T, events ...map[string]any) ToolCallLane {
+	t.Helper()
+	parsed, err := parseToolAuditLedger(auditLedgerBytes(events...))
+	if err != nil {
+		t.Fatalf("parse tool audit ledger: %v", err)
+	}
+	return buildToolCallLane("captured", parsed)
+}
+
+func TestBuildToolCallLedgerClassifiesTerminalStatesAndTiming(t *testing.T) {
+	// Records arrive newest-first from the CLI; ordering is by ledger sequence.
+	lane := toolLaneFromEvents(t,
+		auditFinishedEvent(8, 999, "c4", "fetch", "timed_out", "tool_timed_out"),
+		auditStartedEvent(7, 400, "c4", "fetch"),
+		auditFinishedEvent(6, 340, "c3", "write", "failed", "tool_failed"),
+		auditStartedEvent(5, 300, "c3", "write"),
+		auditFinishedEvent(4, 260, "c2", "bash", "blocked", "tool_blocked"),
+		auditStartedEvent(3, 200, "c2", "bash"),
+		auditFinishedEvent(2, 150, "c1", "read", "succeeded", ""),
+		auditStartedEvent(1, 100, "c1", "read"),
+	)
+	if lane.Coverage != "complete" || lane.CallCount != 4 || lane.TotalCalls != 4 || lane.Truncated || !lane.Timed {
+		t.Fatalf("lane = %#v", lane)
+	}
+	if lane.DurationMs == nil || *lane.DurationMs != 300 {
+		t.Fatalf("duration = %v", lane.DurationMs)
+	}
+	type want struct {
+		tool, state, errorCode string
+		duration, offset       int64
+	}
+	expected := []want{
+		{"read", "succeeded", "", 50, 0},
+		{"bash", "blocked", "tool_blocked", 60, 100},
+		{"write", "failed", "tool_failed", 40, 200},
+		{"fetch", "timed_out", "tool_timed_out", 599, 300},
+	}
+	for index, call := range lane.Calls {
+		exp := expected[index]
+		if call.Sequence != index+1 || call.Tool != exp.tool || call.State != exp.state || call.ErrorCode != exp.errorCode {
+			t.Fatalf("call %d = %#v, want %#v", index, call, exp)
+		}
+		if call.DurationMs == nil || *call.DurationMs != exp.duration || call.OffsetMs == nil || *call.OffsetMs != exp.offset {
+			t.Fatalf("call %d timing = dur %v off %v, want %d/%d", index, call.DurationMs, call.OffsetMs, exp.duration, exp.offset)
+		}
+	}
+}
+
+func TestBuildToolCallLedgerMarksMissingTerminalIncomplete(t *testing.T) {
+	lane := toolLaneFromEvents(t, auditStartedEvent(1, 100, "c1", "read"))
+	if lane.Coverage != "incomplete" || lane.CallCount != 1 || lane.Calls[0].State != "started" {
+		t.Fatalf("lane = %#v", lane)
+	}
+	if lane.Calls[0].DurationMs != nil {
+		t.Fatalf("missing-terminal call reported a duration: %#v", lane.Calls[0])
+	}
+	if !strings.Contains(lane.Reason, "no paired") {
+		t.Fatalf("reason = %q", lane.Reason)
+	}
+}
+
+func TestBuildToolCallLedgerNoToolLaneIsComplete(t *testing.T) {
+	lane := toolLaneFromEvents(t)
+	if lane.Coverage != "complete" || lane.CallCount != 0 || lane.TotalCalls != 0 || lane.Timed {
+		t.Fatalf("no-tool lane = %#v", lane)
+	}
+	if lane.Calls == nil {
+		t.Fatal("calls slice must be non-nil")
+	}
+}
+
+func TestBuildToolCallLedgerUnavailableLane(t *testing.T) {
+	lane := buildToolCallLane("unavailable", nil)
+	if lane.Coverage != "unavailable" || lane.CallCount != 0 || lane.Timed || lane.DurationMs != nil {
+		t.Fatalf("unavailable lane = %#v", lane)
+	}
+	if lane.Calls == nil || strings.TrimSpace(lane.Reason) == "" {
+		t.Fatalf("unavailable lane = %#v", lane)
+	}
+}
+
+func TestBuildToolCallLedgerBoundsCallsPerLane(t *testing.T) {
+	events := []map[string]any{}
+	total := MaxToolCallsPerLane + 5
+	for index := 0; index < total; index++ {
+		call := fmt.Sprintf("c%d", index)
+		events = append(events,
+			auditStartedEvent(index*2+1, int64(index*2+1), call, "read"),
+			auditFinishedEvent(index*2+2, int64(index*2+2), call, "read", "succeeded", ""))
+	}
+	lane := toolLaneFromEvents(t, events...)
+	if lane.CallCount != MaxToolCallsPerLane || lane.TotalCalls != total || !lane.Truncated || lane.Coverage != "incomplete" {
+		t.Fatalf("bounded lane = callCount %d total %d truncated %v coverage %q", lane.CallCount, lane.TotalCalls, lane.Truncated, lane.Coverage)
+	}
+	if lane.Calls[len(lane.Calls)-1].Sequence != MaxToolCallsPerLane {
+		t.Fatalf("final sequence = %d", lane.Calls[len(lane.Calls)-1].Sequence)
+	}
+}
+
+func TestBuildToolCallLedgerNeverPublishesRawIdentifiers(t *testing.T) {
+	lane := toolLaneFromEvents(t,
+		auditStartedEvent(1, 100, "call-secret-9c1f", "read"),
+		auditFinishedEvent(2, 150, "call-secret-9c1f", "read", "succeeded", ""),
+	)
+	encoded, err := json.Marshal(lane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"call-secret-9c1f", "run-secret-3f9a", "sha256:", "eventId", "toolCallId"} {
+		if strings.Contains(string(encoded), leaked) {
+			t.Fatalf("ledger leaked %q: %s", leaked, encoded)
+		}
+	}
+}
+
+func TestBuildToolCallLedgerNormalizesUnsafeToolNames(t *testing.T) {
+	lane := toolLaneFromEvents(t,
+		auditStartedEvent(1, 100, "c1", "unknown"),
+		auditFinishedEvent(2, 150, "c1", "not a safe/name", "succeeded", ""),
+	)
+	if lane.Calls[0].Tool != "unknown" {
+		t.Fatalf("tool name = %q", lane.Calls[0].Tool)
+	}
+}
+
+func TestReadCaptureBundleFailsClosedOnMalformedOrMissingToolAudit(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+		want   string
+	}{
+		{"invalid json", func(e map[string]string) { e["exercise/audit.json"] = "{not json" }, "exercise lane tool audit ledger is malformed"},
+		{"bad enum", func(e map[string]string) {
+			e["exercise/audit.json"] = `{"events":[{"eventId":"e1","sequence":1,"sourceSequence":1,"occurredAt":1,"kind":"tool_action","action":"tool.action.started","status":"weird","agentId":"observatory","runId":"r","redaction":"metadata_only"}]}`
+		}, "malformed"},
+		{"not redacted", func(e map[string]string) {
+			e["exercise/audit.json"] = `{"events":[{"eventId":"e1","sequence":1,"sourceSequence":1,"occurredAt":1,"kind":"tool_action","action":"tool.action.started","status":"started","agentId":"observatory","runId":"r","redaction":"full"}]}`
+		}, "malformed"},
+		{"missing events array", func(e map[string]string) { e["exercise/audit.json"] = `{}` }, "malformed"},
+		{"claims captured but absent", func(e map[string]string) { delete(e, "exercise/audit.json") }, "claims a tool audit ledger but none is present"},
+		{"invalid status", func(e map[string]string) { e["meta/exercise-audit-status"] = "maybe\n" }, "invalid or missing meta/exercise-audit-status"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries := fixtureBundleEntries("obs_audit", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+			test.mutate(entries)
+			path := filepath.Join(t.TempDir(), "capture.tar.gz")
+			if err := writeTestBundle(path, entries); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadCaptureBundle(path, 1<<20); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+func TestReadCaptureBundleAcceptsUnavailableToolAudit(t *testing.T) {
+	entries := fixtureBundleEntries("obs_audit_unavail", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+	entries["meta/exercise-audit-status"] = "unavailable\n"
+	delete(entries, "exercise/audit.json")
+	path := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(path, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(path, 1<<20)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	ledger := BuildToolCallLedger(bundle)
+	if ledger.Exercise.Coverage != "unavailable" || ledger.Baseline.Coverage != "complete" {
+		t.Fatalf("ledger coverage baseline=%q exercise=%q", ledger.Baseline.Coverage, ledger.Exercise.Coverage)
+	}
+}
+
+func TestBuildEvidenceEmitsPairedToolCallLedger(t *testing.T) {
+	config := validTestConfig(t, t.TempDir())
+	entries := fixtureBundleEntries("obs_ledger_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "plugin", "observatory-probe")
+	bundlePath := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(bundlePath, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(bundlePath, config.Limits.MaxBundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := BuildEvidence(fixtureEvidence().Target, config, bundle)
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatalf("validate evidence: %v", err)
+	}
+	ledger := evidence.ToolCallLedger
+	if ledger.Source != ToolCallLedgerSource || ledger.ArgumentSummaries.Available {
+		t.Fatalf("ledger header = %#v", ledger)
+	}
+	if ledger.Baseline.Coverage != "complete" || ledger.Baseline.CallCount != 0 {
+		t.Fatalf("baseline ledger = %#v", ledger.Baseline)
+	}
+	if ledger.Exercise.Coverage != "complete" || ledger.Exercise.CallCount != 1 || ledger.Exercise.Calls[0].Tool != "observatory_probe" || ledger.Exercise.Calls[0].State != "succeeded" {
+		t.Fatalf("exercise ledger = %#v", ledger.Exercise)
+	}
+}
+
+func TestValidateEvidenceRejectsMalformedToolCallLedger(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Evidence)
+		want   string
+	}{
+		{"bad source", func(e *Evidence) { e.ToolCallLedger.Source = "trajectory" }, "ledger source"},
+		{"bad bound", func(e *Evidence) { e.ToolCallLedger.MaxCallsPerLane = 1 }, "ledger per-lane bound"},
+		{"empty argument reason", func(e *Evidence) { e.ToolCallLedger.ArgumentSummaries.Reason = "" }, "argument-summary coverage"},
+		{"bad coverage", func(e *Evidence) { e.ToolCallLedger.Exercise.Coverage = "partial" }, "coverage is unsupported"},
+		{"nil calls", func(e *Evidence) { e.ToolCallLedger.Exercise.Calls = nil }, "calls are required"},
+		{"count mismatch", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 2
+		}, "call count does not match"},
+		{"complete with started", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "complete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "started"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "without a terminal record"},
+		{"unavailable with calls", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "unavailable"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "unavailable lane must carry no calls"},
+		{"unsafe tool name", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "bad name", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "tool name is missing or unsafe"},
+		{"bad state", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "done"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "call state is unsupported"},
+		{"offset on untimed", func(e *Evidence) {
+			off := int64(5)
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded", OffsetMs: &off}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "untimed call must not report an offset"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := fixtureEvidence()
+			test.mutate(&evidence)
+			if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
 	}
 }

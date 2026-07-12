@@ -20,11 +20,13 @@ import (
 )
 
 type CaptureBundle struct {
-	Metadata       CaptureMetadata
-	BaselineTraces []string
-	ExerciseTraces []string
-	BaselineOutput []byte
-	ExerciseOutput []byte
+	Metadata          CaptureMetadata
+	BaselineTraces    []string
+	ExerciseTraces    []string
+	BaselineOutput    []byte
+	ExerciseOutput    []byte
+	BaselineToolAudit []auditEvent
+	ExerciseToolAudit []auditEvent
 }
 
 func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error) {
@@ -119,7 +121,35 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 	if !traceLaneHasCompleteSyscall(bundle.ExerciseTraces) {
 		return CaptureBundle{}, errors.New("capture bundle exercise lane contains no complete syscall trace record")
 	}
+	bundle.BaselineToolAudit, err = resolveToolAudit(metadata.BaselineAuditStatus, entries["baseline/audit.json"], "baseline")
+	if err != nil {
+		return CaptureBundle{}, err
+	}
+	bundle.ExerciseToolAudit, err = resolveToolAudit(metadata.ExerciseAuditStatus, entries["exercise/audit.json"], "exercise")
+	if err != nil {
+		return CaptureBundle{}, err
+	}
 	return bundle, nil
+}
+
+// resolveToolAudit fails closed on a claimed-complete but missing or malformed
+// tool audit ledger; an explicitly unavailable lane carries no records.
+func resolveToolAudit(status string, data []byte, lane string) ([]auditEvent, error) {
+	switch status {
+	case "unavailable":
+		return nil, nil
+	case "captured":
+		if len(data) == 0 {
+			return nil, fmt.Errorf("capture bundle %s lane claims a tool audit ledger but none is present", lane)
+		}
+		events, err := parseToolAuditLedger(data)
+		if err != nil {
+			return nil, fmt.Errorf("capture bundle %s lane tool audit ledger is malformed: %w", lane, err)
+		}
+		return events, nil
+	default:
+		return nil, fmt.Errorf("capture bundle %s lane has an invalid tool audit status", lane)
+	}
 }
 
 func captureMetadataFromEntries(entries map[string][]byte) (CaptureMetadata, error) {
@@ -127,20 +157,22 @@ func captureMetadataFromEntries(entries map[string][]byte) (CaptureMetadata, err
 		return strings.TrimSpace(string(entries["meta/"+name]))
 	}
 	metadata := CaptureMetadata{
-		RunID:             read("run-id"),
-		TargetSHA256:      read("target-sha256"),
-		CaptureConfigSHA:  read("capture-config-sha256"),
-		BaselineWorkspace: read("baseline-workspace"),
-		ExerciseWorkspace: read("exercise-workspace"),
-		BaselineState:     read("baseline-state"),
-		ExerciseState:     read("exercise-state"),
-		BaselineHome:      read("baseline-home"),
-		ExerciseHome:      read("exercise-home"),
-		TargetKind:        read("target-kind"),
-		TargetRoot:        read("target-root"),
-		OpenClawVersion:   safeVersion(read("openclaw-version")),
-		StraceVersion:     safeVersion(read("strace-version")),
-		FirewallSHA256:    read("firewall-sha256"),
+		RunID:               read("run-id"),
+		TargetSHA256:        read("target-sha256"),
+		CaptureConfigSHA:    read("capture-config-sha256"),
+		BaselineWorkspace:   read("baseline-workspace"),
+		ExerciseWorkspace:   read("exercise-workspace"),
+		BaselineState:       read("baseline-state"),
+		ExerciseState:       read("exercise-state"),
+		BaselineHome:        read("baseline-home"),
+		ExerciseHome:        read("exercise-home"),
+		TargetKind:          read("target-kind"),
+		TargetRoot:          read("target-root"),
+		OpenClawVersion:     safeVersion(read("openclaw-version")),
+		StraceVersion:       safeVersion(read("strace-version")),
+		FirewallSHA256:      read("firewall-sha256"),
+		BaselineAuditStatus: read("baseline-audit-status"),
+		ExerciseAuditStatus: read("exercise-audit-status"),
 	}
 	var markerMap map[string]string
 	if err := json.Unmarshal(entries["meta/canaries.json"], &markerMap); err != nil {
@@ -174,6 +206,17 @@ func captureMetadataFromEntries(entries map[string][]byte) (CaptureMetadata, err
 	}
 	if matched, _ := regexp.MatchString(`^[a-f0-9]{64}$`, metadata.FirewallSHA256); !matched {
 		return CaptureMetadata{}, errors.New("capture bundle has invalid meta/firewall-sha256")
+	}
+	for _, status := range []struct {
+		name  string
+		value string
+	}{
+		{"baseline-audit-status", metadata.BaselineAuditStatus},
+		{"exercise-audit-status", metadata.ExerciseAuditStatus},
+	} {
+		if status.value != "captured" && status.value != "unavailable" {
+			return CaptureMetadata{}, fmt.Errorf("capture bundle has invalid or missing meta/%s", status.name)
+		}
 	}
 	var err error
 	metadata.BaselineExitCode, err = parseExitCode(read("baseline-exit"), "baseline")
@@ -280,7 +323,8 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
 	}
 	analysis := AnalyzeTraces(analysisInput)
-	timeline := BuildTimeline(analysisInput)
+	runtimeTimeline := BuildRuntimeTimeline(analysisInput)
+	toolCallLedger := BuildToolCallLedger(bundle)
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
@@ -324,10 +368,11 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 			BaselineOutputSHA: digestBytes(bundle.BaselineOutput),
 			ExerciseOutputSHA: digestBytes(bundle.ExerciseOutput),
 		},
-		Observations: analysis.Observations,
-		Canaries:     analysis.Canaries,
-		Coverage:     analysis.Coverage,
-		Timeline:     timeline,
+		Observations:    analysis.Observations,
+		Canaries:        analysis.Canaries,
+		Coverage:        analysis.Coverage,
+		ToolCallLedger:  toolCallLedger,
+		RuntimeTimeline: runtimeTimeline,
 	}
 }
 

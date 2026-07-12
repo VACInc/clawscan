@@ -361,8 +361,34 @@ run_lane() {
   printf '%s\n' "$code" > "$META/$lane-exit"
 }
 
+# capture_tool_audit exports OpenClaw's metadata-only tool audit ledger for a lane
+# after its agent unit has been collected. It runs as the unprivileged agent user
+# outside the per-lane sandbox so it can read the lane's own OpenClaw state, and
+# never widens the network policy. When the audit surface is unavailable the lane
+# is marked so the analyzer publishes explicit unavailable coverage instead of an
+# empty ledger presented as complete.
+capture_tool_audit() {
+  local lane=$1
+  local root=$2
+  local trace_dir="$OUT/$lane"
+  local state="$root/state"
+  local home="$root/home"
+  if as_root runuser -u "$AGENT_USER" -- env -i \
+       HOME="$home" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+       OPENCLAW_STATE_DIR="$state" OPENCLAW_CONFIG_PATH="$state/openclaw.json" \
+       "$OPENCLAW_COMMAND" audit --agent observatory --kind tool_action --limit 500 --json \
+       > "$trace_dir/audit.json" 2>/dev/null; then
+    printf 'captured\n' > "$META/$lane-audit-status"
+  else
+    rm -f "$trace_dir/audit.json"
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+  fi
+}
+
 run_lane baseline "$BASELINE"
 run_lane exercise "$EXERCISE"
+capture_tool_audit baseline "$BASELINE"
+capture_tool_audit exercise "$EXERCISE"
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$META/completed-at"
 
 as_root tar -C "$OUT" -czf "$OUT/raw.tar.gz" meta baseline exercise

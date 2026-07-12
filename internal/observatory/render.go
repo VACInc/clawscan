@@ -14,11 +14,14 @@ import (
 
 const MaxClawscanArtifactBytes = 256 << 20
 
-// maxTimelineDisplayRows bounds how many timeline rows each lane renders into the
-// HTML page. The complete ordered timeline always ships in the JSON projection;
-// the page shows only an earliest-first preview so a busy exercise cannot bloat
-// the static evidence page.
-const maxTimelineDisplayRows = 250
+// maxRuntimeTimelineDisplayRows bounds how many runtime syscall timeline rows each
+// lane renders into the HTML page. The complete ordered timeline always ships in
+// the JSON projection; the page shows only an earliest-first preview so a busy
+// exercise cannot bloat the static evidence page.
+const maxRuntimeTimelineDisplayRows = 250
+
+// maxToolCallDisplayRows bounds how many tool-call ledger rows each lane renders.
+const maxToolCallDisplayRows = 250
 
 type VersionChange struct {
 	Change        string
@@ -285,11 +288,17 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
 		return value
 	},
 	"upper": strings.ToUpper,
-	"timelinePreview": func(events []TimelineEvent) []TimelineEvent {
-		if len(events) > maxTimelineDisplayRows {
-			return events[:maxTimelineDisplayRows]
+	"runtimeTimelinePreview": func(events []RuntimeTimelineEvent) []RuntimeTimelineEvent {
+		if len(events) > maxRuntimeTimelineDisplayRows {
+			return events[:maxRuntimeTimelineDisplayRows]
 		}
 		return events
+	},
+	"toolCallPreview": func(calls []ToolCall) []ToolCall {
+		if len(calls) > maxToolCallDisplayRows {
+			return calls[:maxToolCallDisplayRows]
+		}
+		return calls
 	},
 }).Parse(`<!doctype html>
 <html lang="en">
@@ -366,16 +375,27 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
-  <section class="panel"><h2>Tool-event timeline</h2>
-    <p class="muted">Ordered, normalized tool events for each lane. Subjects are redacted and raw arguments are never shown; the complete ordered sequence ships in the JSON projection while this page previews up to 250 events per lane.</p>
-    <h3>Baseline lane · {{.Evidence.Timeline.Baseline.EventCount}} event(s){{if .Evidence.Timeline.Baseline.Truncated}} · {{.Evidence.Timeline.Baseline.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.Timeline.Baseline.Timed}} · {{.Evidence.Timeline.Baseline.DurationMs}} ms span{{end}}</h3>
-    {{template "timelineLane" .Evidence.Timeline.Baseline}}
-    <h3>Exercise lane · {{.Evidence.Timeline.Exercise.EventCount}} event(s){{if .Evidence.Timeline.Exercise.Truncated}} · {{.Evidence.Timeline.Exercise.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.Timeline.Exercise.Timed}} · {{.Evidence.Timeline.Exercise.DurationMs}} ms span{{end}}</h3>
-    {{template "timelineLane" .Evidence.Timeline.Exercise}}
+  <section class="panel"><h2>OpenClaw tool-call ledger</h2>
+    <p class="muted">Paired baseline and exercise tool calls projected from OpenClaw's metadata-only audit ledger: tool name, ordering, terminal state, error code, and duration. Raw tool call ids, arguments, and results are never published.</p>
+    <p class="muted">Argument and result summaries: {{if .Evidence.ToolCallLedger.ArgumentSummaries.Available}}available{{else}}<strong>unavailable</strong>{{end}} — {{.Evidence.ToolCallLedger.ArgumentSummaries.Reason}}</p>
+    <h3>Baseline lane · {{.Evidence.ToolCallLedger.Baseline.Coverage}} · {{.Evidence.ToolCallLedger.Baseline.CallCount}} call(s){{if .Evidence.ToolCallLedger.Baseline.Truncated}} · {{.Evidence.ToolCallLedger.Baseline.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Baseline.Reason}} · {{.Evidence.ToolCallLedger.Baseline.Reason}}{{end}}</h3>
+    {{template "toolCallLane" .Evidence.ToolCallLedger.Baseline}}
+    <h3>Exercise lane · {{.Evidence.ToolCallLedger.Exercise.Coverage}} · {{.Evidence.ToolCallLedger.Exercise.CallCount}} call(s){{if .Evidence.ToolCallLedger.Exercise.Truncated}} · {{.Evidence.ToolCallLedger.Exercise.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Exercise.Reason}} · {{.Evidence.ToolCallLedger.Exercise.Reason}}{{end}}</h3>
+    {{template "toolCallLane" .Evidence.ToolCallLedger.Exercise}}
+  </section>
+  <section class="panel"><h2>Runtime syscall timeline</h2>
+    <p class="muted">Ordered, normalized file/process/network syscalls for each lane — the runtime substrate beneath the tool calls above, not the tool calls themselves. Subjects are redacted and raw arguments are never shown; the complete ordered sequence ships in the JSON projection while this page previews up to 250 events per lane.</p>
+    <h3>Baseline lane · {{.Evidence.RuntimeTimeline.Baseline.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Baseline.Truncated}} · {{.Evidence.RuntimeTimeline.Baseline.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Baseline.Timed}} · {{.Evidence.RuntimeTimeline.Baseline.DurationMs}} ms span{{end}}</h3>
+    {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Baseline}}
+    <h3>Exercise lane · {{.Evidence.RuntimeTimeline.Exercise.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Exercise.Truncated}} · {{.Evidence.RuntimeTimeline.Exercise.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Exercise.Timed}} · {{.Evidence.RuntimeTimeline.Exercise.DurationMs}} ms span{{end}}</h3>
+    {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Exercise}}
   </section>
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>
 </main></body></html>
-{{define "timelineLane"}}{{if .Events}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Offset</th></tr></thead><tbody>
-    {{range timelinePreview .Events}}<tr><td>{{.Sequence}}</td><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Canary}}<div class="muted">canary · {{.Canary}}</div>{{else if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
-  </tbody></table></div>{{else}}<p class="muted">No tool events captured in this lane.</p>{{end}}{{end}}`))
+{{define "runtimeTimelineLane"}}{{if .Events}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Offset</th></tr></thead><tbody>
+    {{range runtimeTimelinePreview .Events}}<tr><td>{{.Sequence}}</td><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Canary}}<div class="muted">canary · {{.Canary}}</div>{{else if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No syscall events captured in this lane.</p>{{end}}{{end}}
+{{define "toolCallLane"}}{{if .Calls}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Tool</th><th>State</th><th>Error</th><th>Duration</th><th>Offset</th></tr></thead><tbody>
+    {{range toolCallPreview .Calls}}<tr><td>{{.Sequence}}</td><td><code>{{.Tool}}</code></td><td>{{.State}}</td><td>{{if .ErrorCode}}{{.ErrorCode}}{{else}}—{{end}}</td><td>{{if .DurationMs}}{{.DurationMs}} ms{{else}}—{{end}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No tool calls recorded in this lane.</p>{{end}}{{end}}`))

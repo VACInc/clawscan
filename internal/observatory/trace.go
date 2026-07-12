@@ -191,35 +191,36 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 			"System-call tracing records endpoint addresses but does not provide complete DNS-name or payload attribution.",
 			"A behavioral delta shows correlation with the exercise lane, not author intent or a safety verdict.",
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
-			"The per-lane tool-event timeline is a bounded, ordered projection of the selected MVP syscalls with normalized, secret-safe subjects; it excludes raw arguments and is capped per lane.",
-			"Timeline timing offsets are relative to each lane's first event and are published only when the capture provides monotonic per-event timestamps.",
+			"The per-lane runtime syscall timeline is a bounded, ordered projection of the selected MVP syscalls with normalized, secret-safe subjects; it records file/process/network syscalls, not OpenClaw tool calls or arguments, and is capped per lane.",
+			"Runtime timeline timing offsets are relative to each lane's first event and are published only when the capture provides monotonic per-event timestamps.",
 		},
 	}
 	return result
 }
 
-// BuildTimeline extracts an ordered, per-lane tool-event timeline from the same
-// records AnalyzeTraces aggregates. Both lanes are published in full (bounded by
-// MaxTimelineEventsPerLane) rather than baseline-subtracted, because the
+// BuildRuntimeTimeline extracts an ordered, per-lane runtime syscall timeline from
+// the same records AnalyzeTraces aggregates. It records file/process/network
+// syscalls, not OpenClaw tool calls. Both lanes are published in full (bounded by
+// MaxRuntimeTimelineEventsPerLane) rather than baseline-subtracted, because the
 // timeline's job is to expose sequence and timing to downstream grading. Every
 // subject reuses AnalyzeTraces' normalization and redaction so the timeline is
 // exactly as secret-safe as the delta observations.
-func BuildTimeline(input AnalysisInput) Timeline {
-	return Timeline{
-		MaxEventsPerLane: MaxTimelineEventsPerLane,
-		Baseline:         buildLaneTimeline(input.BaselineTraces, input.Metadata.BaselineWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, false),
-		Exercise:         buildLaneTimeline(input.ExerciseTraces, input.Metadata.ExerciseWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, true),
+func BuildRuntimeTimeline(input AnalysisInput) RuntimeTimeline {
+	return RuntimeTimeline{
+		MaxEventsPerLane: MaxRuntimeTimelineEventsPerLane,
+		Baseline:         buildLaneRuntimeTimeline(input.BaselineTraces, input.Metadata.BaselineWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, false),
+		Exercise:         buildLaneRuntimeTimeline(input.ExerciseTraces, input.Metadata.ExerciseWorkspace, input.Metadata, input.Canaries, input.ControlPlaneAddresses, true),
 	}
 }
 
-type timelineGroup struct {
-	events       []TimelineEvent
+type runtimeTimelineGroup struct {
+	events       []RuntimeTimelineEvent
 	timestamp    float64
 	hasTimestamp bool
 }
 
-func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetadata, canaries []CanaryDefinition, controlPlaneAddresses []string, exercise bool) TimelineLane {
-	groups := []timelineGroup{}
+func buildLaneRuntimeTimeline(traces []string, initialCWD string, metadata CaptureMetadata, canaries []CanaryDefinition, controlPlaneAddresses []string, exercise bool) RuntimeTimelineLane {
+	groups := []runtimeTimelineGroup{}
 	timed := true
 	monotonic := true
 	seen := false
@@ -231,18 +232,18 @@ func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetad
 				cwd := processes.cwd(record.PID)
 				parsed := parseTraceLineAtCWD(line, metadata, controlPlaneAddresses, exercise, cwd)
 				if len(parsed) > 0 {
-					events := make([]TimelineEvent, 0, len(parsed))
+					events := make([]RuntimeTimelineEvent, 0, len(parsed))
 					for _, observation := range parsed {
-						events = append(events, TimelineEvent{
+						events = append(events, RuntimeTimelineEvent{
 							Kind:      observation.Kind,
 							Operation: observation.Operation,
-							Subject:   timelinePublicSubject(observation, canaries, controlPlaneAddresses),
-							Outcome:   timelineOutcome(observation.Outcome, line),
+							Subject:   runtimeTimelinePublicSubject(observation, canaries, controlPlaneAddresses),
+							Outcome:   runtimeTimelineOutcome(observation.Outcome, line),
 							Role:      observation.Role,
-							Canary:    timelineCanaryID(observation, canaries),
+							Canary:    runtimeTimelineCanaryID(observation, canaries),
 						})
 					}
-					groups = append(groups, timelineGroup{events: events, timestamp: record.Timestamp, hasTimestamp: record.HasTimestamp})
+					groups = append(groups, runtimeTimelineGroup{events: events, timestamp: record.Timestamp, hasTimestamp: record.HasTimestamp})
 					if !record.HasTimestamp {
 						timed = false
 					}
@@ -257,7 +258,7 @@ func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetad
 		}
 	}
 
-	lane := TimelineLane{Events: []TimelineEvent{}}
+	lane := RuntimeTimelineLane{Events: []RuntimeTimelineEvent{}}
 	if len(groups) == 0 {
 		return lane
 	}
@@ -266,7 +267,7 @@ func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetad
 	timed = timed && monotonic
 	base := groups[0].timestamp
 	var duration int64
-	events := make([]TimelineEvent, 0, len(groups))
+	events := make([]RuntimeTimelineEvent, 0, len(groups))
 	for _, group := range groups {
 		var offset int64
 		if timed {
@@ -284,8 +285,8 @@ func buildLaneTimeline(traces []string, initialCWD string, metadata CaptureMetad
 		}
 	}
 	lane.TotalEvents = len(events)
-	if len(events) > MaxTimelineEventsPerLane {
-		events = events[:MaxTimelineEventsPerLane]
+	if len(events) > MaxRuntimeTimelineEventsPerLane {
+		events = events[:MaxRuntimeTimelineEventsPerLane]
 		lane.Truncated = true
 	}
 	for index := range events {
@@ -309,18 +310,18 @@ func relativeOffsetMs(timestamp float64, base float64) int64 {
 	return offset
 }
 
-func timelinePublicSubject(observation traceObservation, canaries []CanaryDefinition, controlPlaneAddresses []string) string {
+func runtimeTimelinePublicSubject(observation traceObservation, canaries []CanaryDefinition, controlPlaneAddresses []string) string {
 	if observation.Kind == "process" {
 		return pathpkg.Base(sanitizeObservationSubject(observation.Subject, canaries, controlPlaneAddresses))
 	}
 	return publicObservationSubject(observation, canaries, controlPlaneAddresses)
 }
 
-// timelineCanaryID attributes a file event to a synthetic canary by exact
+// runtimeTimelineCanaryID attributes a file event to a synthetic canary by exact
 // normalized path. It is intentionally path-only: marker-in-argument
 // interactions are still counted in the aggregate canary section but are never
 // reconstructed into a timeline subject that could leak the marker value.
-func timelineCanaryID(observation traceObservation, canaries []CanaryDefinition) string {
+func runtimeTimelineCanaryID(observation traceObservation, canaries []CanaryDefinition) string {
 	if observation.Kind != "file" {
 		return ""
 	}
@@ -332,11 +333,11 @@ func timelineCanaryID(observation traceObservation, canaries []CanaryDefinition)
 	return ""
 }
 
-// timelineOutcome maps the parser's succeeded/attempted verdict onto the
+// runtimeTimelineOutcome maps the parser's succeeded/attempted verdict onto the
 // timeline's completion/denial/error vocabulary. A permission error is reported
 // as a distinct denial so downstream grading can separate blocked attempts from
 // other failures.
-func timelineOutcome(observationOutcome string, line string) string {
+func runtimeTimelineOutcome(observationOutcome string, line string) string {
 	if observationOutcome == "succeeded" {
 		return "completed"
 	}

@@ -106,8 +106,16 @@ Top-level sections:
 - `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), and concrete limitations;
-- `timeline`: an ordered, per-lane tool-event sequence for both the baseline and
-  exercise lanes with contiguous sequence numbers, normalized secret-safe
+- `toolCallLedger`: a paired baseline/exercise ledger of actual OpenClaw tool
+  calls, projected from OpenClaw's metadata-only audit ledger
+  (`tool.action.started`/`finished`). Each lane reports a coverage verdict
+  (`complete`/`incomplete`/`unavailable`) and ordered calls with a safe ordinal,
+  compact tool name, terminal state, error code, and relative timing. Raw tool
+  call ids are never published; argument/result summaries are explicitly
+  unavailable because the metadata-only ledger carries no arguments and the
+  redacted trajectory cannot guarantee canary safety;
+- `runtimeTimeline`: an ordered, per-lane runtime **syscall** timeline (not tool
+  calls) for both lanes, with contiguous sequence numbers, normalized secret-safe
   subjects, completion/denial/error outcomes, path-based canary attribution, and
   relative `offsetMs` timing published only when the capture provides monotonic
   per-event timestamps. Each lane is bounded and flags truncation; the timeline

@@ -179,14 +179,54 @@ For a plugin using the default exercise prompt, Observatory selects the first
 sorted tool declared in `contracts.tools` and names it explicitly. Plugins with
 no declared tools require an operator-supplied `exercise.prompt`.
 
-## Ordered tool-event timeline
+## OpenClaw tool-call ledger
+
+Every capture carries a `toolCallLedger` section: a paired baseline/exercise
+ledger of actual OpenClaw tool calls, distinct from the syscall timeline below.
+It is projected from OpenClaw's metadata-only audit ledger (`openclaw audit`,
+`tool.action.started`/`finished` records), which by contract records tool
+identity, ordering, terminal state, error code, and timing but never prompts,
+tool arguments, tool results, command output, or raw error text.
+
+Each lane reports a `coverage` verdict and ordered `calls`. A call carries a safe
+per-lane `sequence` used for correlation, the compact `tool` name, a terminal
+`state` (`succeeded`, `failed`, `cancelled`, `timed_out`, `blocked`, `unknown`,
+or `started` when no terminal record was recorded), an optional audit `errorCode`,
+and relative `durationMs`/`offsetMs` timing. Started and finished records are
+correlated internally by their tool call id; the raw call id and its one-way
+fingerprint are never published — only the safe ordinal is. Coverage is:
+
+- `complete` — a claimed-complete ledger where every call has both a started and
+  a terminal record (a lane with no tool calls is complete with zero calls);
+- `incomplete` — a claimed-complete ledger missing a terminal record for a call,
+  or truncated at the 4096-call per-lane cap;
+- `unavailable` — no audit ledger was recorded for the lane.
+
+Bounded, secret-safe argument/result summaries are reported as **unavailable**
+(`argumentSummaries.available: false`) with an explicit reason: the metadata-only
+audit ledger never carries arguments or results, and the redacted trajectory's
+best-effort redaction cannot guarantee synthetic-canary safety. The observatory
+publishes this explicit coverage rather than presenting syscall subjects as tool
+arguments.
+
+The remote runner captures each lane's audit ledger after the agent unit is
+collected, writing `<lane>/audit.json` and a `meta/<lane>-audit-status` marker
+into the private bundle. A claimed-complete but missing or malformed ledger fails
+the bundle read closed; an unavailable lane publishes explicit unavailable
+coverage. The metadata-only audit ledger is recorded by OpenClaw's Gateway; a
+capture whose agent runtime does not surface it marks the lane unavailable rather
+than fabricating a ledger.
+
+## Runtime syscall timeline
 
 Alongside the baseline-subtracted `observations` aggregate, every capture carries
-a `timeline` section: an ordered, per-lane projection of tool activity for both
-the baseline and exercise lanes. Where `observations` answers "what increased in
-the exercise lane", the timeline answers "in what order, and when" so downstream
-deterministic grading and future declared-vs-observed comparison can reason about
-sequence and timing.
+a `runtimeTimeline` section: an ordered, per-lane projection of the underlying
+file/process/network **syscalls** captured by `strace` for both lanes. This is
+the runtime substrate beneath the tool calls, not the OpenClaw tool calls
+themselves — it records syscall subjects, not tool arguments or results. Where
+`observations` answers "what increased in the exercise lane", the timeline
+answers "in what order, and when" so downstream deterministic grading and future
+declared-vs-observed comparison can reason about sequence and timing.
 
 Each lane publishes `events` in capture order with a contiguous `sequence`, the
 event `kind`/`operation`, a normalized secret-safe `subject`, an `outcome` of
@@ -207,9 +247,9 @@ published, and a lane with missing or non-monotonic timestamps omits offsets
 rather than publishing untrustworthy timing. Each lane is bounded at 4096 events;
 a busier lane keeps the earliest-first prefix and sets `truncated: true` with the
 full `totalEvents` count. Malformed, inconsistent, or incompletely timed
-timelines fail closed during evidence validation. The timeline is part of the
-capture-protocol revision, so re-analysis and version comparison reject evidence
-produced by a different protocol.
+timelines fail closed during evidence validation. Both the ledger and the
+timeline are part of the capture-protocol revision, so re-analysis and version
+comparison reject evidence produced by a different protocol.
 
 ## MVP limitations
 
