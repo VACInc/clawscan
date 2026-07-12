@@ -138,18 +138,23 @@ type RedirectProbeObservation struct {
 	DeviatedDelta    int    `json:"deviatedDelta"`
 	Escalation       string `json:"escalation"`
 	Attributed       string `json:"attributed"`
+	// Exercised is true only when the exercise lane actually read the seeded
+	// instruction file. When false the probe was not exposed to the agent, so its
+	// escalation is not meaningful and must not be read as resistance.
+	Exercised bool `json:"exercised"`
 }
 
 type CoverageEvidence struct {
-	SyscallScope       string   `json:"syscallScope"`
-	FileSyscalls       bool     `json:"fileSyscalls"`
-	ProcessSyscalls    bool     `json:"processSyscalls"`
-	NetworkSyscalls    bool     `json:"networkSyscalls"`
-	BaselinePaired     bool     `json:"baselinePaired"`
-	RedirectProbeScope string   `json:"redirectProbeScope"`
-	RedirectProbeCount int      `json:"redirectProbeCount"`
-	RedirectDeepMode   bool     `json:"redirectDeepMode"`
-	Limitations        []string `json:"limitations"`
+	SyscallScope            string   `json:"syscallScope"`
+	FileSyscalls            bool     `json:"fileSyscalls"`
+	ProcessSyscalls         bool     `json:"processSyscalls"`
+	NetworkSyscalls         bool     `json:"networkSyscalls"`
+	BaselinePaired          bool     `json:"baselinePaired"`
+	RedirectProbeScope      string   `json:"redirectProbeScope"`
+	RedirectProbeCount      int      `json:"redirectProbeCount"`
+	RedirectProbesExercised int      `json:"redirectProbesExercised"`
+	RedirectDeepMode        bool     `json:"redirectDeepMode"`
+	Limitations             []string `json:"limitations"`
 }
 
 type CaptureMetadata struct {
@@ -257,6 +262,15 @@ func ValidateEvidence(evidence Evidence) error {
 	if evidence.Coverage.RedirectProbeCount != len(evidence.RedirectProbes) {
 		return errors.New("evidence redirect probe coverage count is inconsistent with its probe list")
 	}
+	exercisedProbes := 0
+	for _, probe := range evidence.RedirectProbes {
+		if probe.Exercised {
+			exercisedProbes++
+		}
+	}
+	if evidence.Coverage.RedirectProbesExercised != exercisedProbes {
+		return errors.New("evidence redirect probe exposure coverage is inconsistent with its probe list")
+	}
 	completeCapture := evidence.Run.LaneExitCode == (LaneExitCodes{}) && evidence.Coverage.BaselinePaired &&
 		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
 	if (evidence.Run.Status == "completed") != completeCapture {
@@ -294,6 +308,9 @@ func ValidateEvidence(evidence Evidence) error {
 		if probe.Escalation != redirectEscalation(probe.ReadExercise, probe.RepeatedExercise, probe.DeviatedExercise) ||
 			probe.Attributed != redirectEscalation(probe.ReadDelta, probe.RepeatedDelta, probe.DeviatedDelta) {
 			return errors.New("evidence redirect probe escalation is inconsistent with its counts")
+		}
+		if probe.Exercised != (probe.ReadExercise > 0) {
+			return errors.New("evidence redirect probe exposure flag is inconsistent with its exercise-lane read")
 		}
 	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
