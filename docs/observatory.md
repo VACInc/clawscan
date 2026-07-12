@@ -136,16 +136,23 @@ Evidence comes from two sources that are correlated per finding:
    attempted/succeeded outcome. This is the authoritative attempt record and the
    only source for denied writes to read-only system locations.
 2. **A before/after lane inventory** snapshots the writable lane surfaces after
-   seeding (before the agent runs) and again after it finishes. The exercise-lane
-   residual set is subtracted by the baseline-lane residual set so runtime noise
-   (state the OpenClaw runtime rewrites in both lanes) is not attributed to the
-   target. The default run does **not** add a reboot cycle; residual confirmation
-   is inventory-based.
+   seeding (before the agent runs) and again after it finishes. Baseline runtime
+   noise (state the OpenClaw runtime rewrites in both lanes) is subtracted by a
+   lane-independent transition identity — path, change kind, and mode transition.
+   Content digests differ per lane and are kept **private**; they are never
+   published. A target-specific change to a path the runtime also rewrites is
+   still confirmed because the succeeded, baseline-subtracted **syscall** write
+   correlates against the full exercise residue set. The default run does **not**
+   add a reboot cycle; residual confirmation is inventory-based.
 
 The inventory records only file digests and modes, never contents, so seeded
-canary values never leave the guest. When an inventory pair is missing, findings
-fall back to syscall evidence and record `residual: unavailable`; the whole
-capture is not failed, because syscalls remain authoritative.
+canary values never leave the guest. The current protocol always emits complete
+before/after inventory receipts, so a capture whose inventory is missing,
+malformed, duplicated, or truncated is **rejected as incomplete** rather than
+graded — an incomplete inventory can never silently yield a `not-observed` or
+clean result. `residual: unavailable` is reserved for read-only system locations
+that cannot be inventoried (for example `/etc/cron.d`), where a denied attempt is
+still recorded from the syscall trace.
 
 `persistence.surfaces` publishes the monitored catalog so coverage is explicit.
 The section never claims exhaustive host persistence detection, carries no
@@ -233,6 +240,10 @@ no declared tools require an operator-supplied `exercise.prompt`.
   are not exercised deeply.
 - Persistence coverage is a curated selection of agent and conventional user
   surfaces, not an exhaustive host persistence audit. Residual confirmation
-  depends on the before/after lane inventory; without it only syscall attempts
-  are reported. No reboot cycle is performed in the default run.
+  depends on a complete before/after lane inventory, which the protocol always
+  emits; a capture with missing, malformed, or truncated inventory is rejected as
+  incomplete. Cross-lane baseline-noise subtraction uses path, change kind, and
+  mode transition, so a target change to a shared path is confirmed through its
+  correlated syscall rather than by comparing lane-specific content. No reboot
+  cycle is performed in the default run.
 - Behavioral correlation is not author intent and is never a safety verdict.

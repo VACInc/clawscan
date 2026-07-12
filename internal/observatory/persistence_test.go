@@ -131,7 +131,11 @@ func TestAnalyzePersistenceWithoutInventoryMarksResidualUnavailable(t *testing.T
 	}
 }
 
-func TestDiffLaneInventoriesSubtractsBaselineNoise(t *testing.T) {
+// sharedPathNoiseInventories models baseline and exercise both modifying the
+// same OpenClaw state path (runtime noise) while the exercise lane also adds a
+// user shell-init file. Content digests differ per lane, as they do for the
+// seeded, timestamped config.
+func sharedPathNoiseInventories() (laneInventory, laneInventory) {
 	baseline := laneInventory{
 		Present: true,
 		Before:  map[string]inventoryEntry{"state/openclaw.json": {Mode: "0600", SHA256: "aaa"}},
@@ -145,14 +149,81 @@ func TestDiffLaneInventoriesSubtractsBaselineNoise(t *testing.T) {
 			"home/.bashrc":        {Mode: "0600", SHA256: "eee"},
 		},
 	}
+	return baseline, exercise
+}
+
+func TestDiffLaneInventoriesRetainsFullExerciseResiduesAndBaselineNoise(t *testing.T) {
+	baseline, exercise := sharedPathNoiseInventories()
 	diff := diffLaneInventories(baseline, exercise)
 	if !diff.Paired {
 		t.Fatal("diff should be paired")
 	}
-	// openclaw.json is modified in both lanes (runtime noise) and must cancel;
-	// only the exercise-only .bashrc addition survives.
-	if len(diff.Residues) != 1 || diff.Residues[0].Subject != "$HOME/.bashrc" || diff.Residues[0].Change != "added" {
+	// The full exercise residue set is retained (not pre-subtracted) so syscall
+	// correlation can still confirm target changes to shared paths.
+	if len(diff.Residues) != 2 {
 		t.Fatalf("residues = %#v", diff.Residues)
+	}
+	if _, noise := diff.baselineNoise[inventoryNoiseKey(inventoryResidue{Subject: "$STATE/openclaw.json", Change: "modified", beforeMode: "0600", afterMode: "0600"})]; !noise {
+		t.Fatalf("baseline noise key missing: %#v", diff.baselineNoise)
+	}
+}
+
+func TestAnalyzePersistenceSubtractsEquivalentBaselineNoise(t *testing.T) {
+	baseline, exercise := sharedPathNoiseInventories()
+	// No syscall observations: openclaw.json changed only via runtime in both
+	// lanes and must be suppressed; the exercise-only .bashrc addition survives.
+	persistence := analyzePersistence(nil, diffLaneInventories(baseline, exercise))
+	if state := findPersistenceFinding(persistence.Findings, "openclaw-config", "$STATE/openclaw.json"); state.Surface != "" {
+		t.Fatalf("equivalent baseline noise was not subtracted: %#v", state)
+	}
+	if bashrc := findPersistenceFinding(persistence.Findings, "shell-init", "$HOME/.bashrc"); bashrc.Evidence != "inventory" || bashrc.Residual != "confirmed" || bashrc.Operation != "create" {
+		t.Fatalf("exercise-only residue = %#v", bashrc)
+	}
+}
+
+func TestAnalyzePersistenceConfirmsTargetChangeToSharedPath(t *testing.T) {
+	baseline, exercise := sharedPathNoiseInventories()
+	// The target writes openclaw.json in the exercise lane (a baseline-subtracted
+	// succeeded syscall delta). Even though the baseline runtime also modified the
+	// same path, the exercise inventory residue must still confirm the change.
+	observations := []Observation{
+		{Kind: "file", Operation: "open-for-write", Subject: "$STATE/openclaw.json", Outcome: "succeeded", BaselineCount: 0, ExerciseCount: 1, DeltaCount: 1},
+	}
+	persistence := analyzePersistence(observations, diffLaneInventories(baseline, exercise))
+	state := findPersistenceFinding(persistence.Findings, "openclaw-config", "$STATE/openclaw.json")
+	if state.Outcome != "succeeded" || state.Residual != "confirmed" || state.Evidence != "syscall+inventory" {
+		t.Fatalf("target change to shared path was hidden: %#v", state)
+	}
+	// The residue is consumed by the syscall finding; no duplicate inventory-only
+	// finding is emitted for the same path.
+	occurrences := 0
+	for _, finding := range persistence.Findings {
+		if finding.Subject == "$STATE/openclaw.json" {
+			occurrences++
+		}
+	}
+	if occurrences != 1 {
+		t.Fatalf("expected a single openclaw.json finding, got %d: %#v", occurrences, persistence.Findings)
+	}
+}
+
+func TestAnalyzePersistenceReportsModeOnlyResidualDifference(t *testing.T) {
+	// Baseline leaves .bashrc mode unchanged; the exercise target makes it
+	// world-executable. The mode transition differs, so it is not equivalent
+	// baseline noise and must surface even without a correlated syscall.
+	baseline := laneInventory{
+		Present: true,
+		Before:  map[string]inventoryEntry{"home/.bashrc": {Mode: "0600", SHA256: "aaa"}},
+		After:   map[string]inventoryEntry{"home/.bashrc": {Mode: "0600", SHA256: "bbb"}},
+	}
+	exercise := laneInventory{
+		Present: true,
+		Before:  map[string]inventoryEntry{"home/.bashrc": {Mode: "0600", SHA256: "aaa"}},
+		After:   map[string]inventoryEntry{"home/.bashrc": {Mode: "0755", SHA256: "ccc"}},
+	}
+	persistence := analyzePersistence(nil, diffLaneInventories(baseline, exercise))
+	if bashrc := findPersistenceFinding(persistence.Findings, "shell-init", "$HOME/.bashrc"); bashrc.Residual != "confirmed" || bashrc.Evidence != "inventory" {
+		t.Fatalf("mode-only residual difference was hidden: %#v", bashrc)
 	}
 }
 
@@ -223,30 +294,91 @@ func TestValidatePersistenceEvidenceRejectsInconsistentResidual(t *testing.T) {
 	}
 }
 
-func TestParseLaneInventoryRejectsMalformedSnapshots(t *testing.T) {
+func TestPersistenceEvidenceNeverPublishesPrivateDigests(t *testing.T) {
+	secret := strings.Repeat("f", 64)
+	baseline := laneInventory{Present: true, Before: map[string]inventoryEntry{}, After: map[string]inventoryEntry{}}
+	exercise := laneInventory{
+		Present: true,
+		Before:  map[string]inventoryEntry{},
+		After:   map[string]inventoryEntry{"home/.bashrc": {Mode: "0600", SHA256: secret}},
+	}
+	persistence := analyzePersistence(nil, diffLaneInventories(baseline, exercise))
+	data, err := json.Marshal(persistence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatalf("published persistence evidence leaked a private inventory digest: %s", data)
+	}
+}
+
+func TestReadLaneInventoryFailsClosedOnIncompleteReceipts(t *testing.T) {
 	good := "0600\t" + strings.Repeat("a", 64) + "\tstate/openclaw.json\n"
-	if inventory := parseLaneInventory([]byte(good), []byte(good)); !inventory.Present || len(inventory.Before) != 1 {
-		t.Fatalf("valid inventory not parsed: %#v", inventory)
-	}
-	if inventory := parseLaneInventory([]byte(good), nil); inventory.Present {
-		t.Fatal("missing after-snapshot should be unpaired")
-	}
-	for _, bad := range []string{
-		"7778\tdigest\tstate/openclaw.json\n",           // invalid mode
-		"0600\t\tstate/openclaw.json\n",                 // empty digest
-		"0600\tdigest\t../escape\n",                     // traversal
-		"0600\tdigest\t/etc/passwd\n",                   // absolute
-		"0600\tdigest\tstate/x\n0600\tother\tstate/x\n", // duplicate path
-		"only-one-field\n",                              // too few fields
-	} {
-		if inventory := parseLaneInventory([]byte(bad), []byte(good)); inventory.Present {
-			t.Fatalf("malformed snapshot accepted: %q", bad)
+	entries := func(before string, after string) map[string][]byte {
+		m := map[string][]byte{}
+		if before != "" {
+			m["exercise/inventory.before"] = []byte(before)
 		}
+		if after != "" {
+			m["exercise/inventory.after"] = []byte(after)
+		}
+		return m
 	}
-	// Informational markers and blank lines are skipped, not rejected.
-	withMarker := good + "# truncated\n\n"
-	if inventory := parseLaneInventory([]byte(withMarker), []byte(good)); !inventory.Present || len(inventory.Before) != 1 {
-		t.Fatalf("marker/blank handling failed: %#v", inventory)
+	inventory, err := readLaneInventory(entries(good, good), "exercise")
+	if err != nil || !inventory.Present || len(inventory.Before) != 1 {
+		t.Fatalf("valid inventory not parsed: %#v err=%v", inventory, err)
+	}
+	// A present-but-empty snapshot is complete (no monitored surfaces exist yet).
+	if empty, err := readLaneInventory(map[string][]byte{"exercise/inventory.before": {}, "exercise/inventory.after": {}}, "exercise"); err != nil || !empty.Present {
+		t.Fatalf("empty snapshot rejected: %#v err=%v", empty, err)
+	}
+	if _, err := readLaneInventory(entries(good, ""), "exercise"); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing after-snapshot err = %v", err)
+	}
+	badCases := map[string]string{
+		"invalid mode":     "7778\tdigest\tstate/openclaw.json\n",
+		"empty digest":     "0600\t\tstate/openclaw.json\n",
+		"traversal":        "0600\tdigest\t../escape\n",
+		"absolute":         "0600\tdigest\t/etc/passwd\n",
+		"duplicate path":   "0600\tdigest\tstate/x\n0600\tother\tstate/x\n",
+		"too few fields":   "only-one-field\n",
+		"truncated marker": good + "# truncated\n",
+		"unknown marker":   good + "# note something\n",
+	}
+	for name, bad := range badCases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := readLaneInventory(entries(bad, good), "exercise"); err == nil {
+				t.Fatalf("incomplete snapshot accepted: %q", bad)
+			}
+		})
+	}
+}
+
+func TestReadCaptureBundleRejectsIncompleteInventory(t *testing.T) {
+	base := func() map[string]string {
+		return fixtureBundleEntries("obs_inventory", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+		want   string
+	}{
+		{name: "missing", mutate: func(m map[string]string) { delete(m, "exercise/inventory.after") }, want: "missing the exercise persistence inventory"},
+		{name: "truncated", mutate: func(m map[string]string) { m["baseline/inventory.before"] += "# truncated\n" }, want: "baseline before-inventory is invalid: incomplete inventory marker"},
+		{name: "malformed", mutate: func(m map[string]string) { m["exercise/inventory.before"] = "not-a-valid-line\n" }, want: "exercise before-inventory is invalid: malformed inventory line"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries := base()
+			test.mutate(entries)
+			path := filepath.Join(t.TempDir(), "capture.tar.gz")
+			if err := writeTestBundle(path, entries); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadCaptureBundle(path, 1<<20); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -307,9 +439,9 @@ func TestInventoryScriptSnapshotsPersistenceSurfaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries, ok := parseInventorySnapshot(data)
-	if !ok {
-		t.Fatalf("inventory snapshot did not parse: %q", data)
+	entries, err := parseInventorySnapshot(data)
+	if err != nil {
+		t.Fatalf("inventory snapshot did not parse: %v: %q", err, data)
 	}
 	if strings.Contains(string(data), "/etc/cron.d/forged") {
 		t.Fatalf("control-character filename forged an inventory line: %q", data)

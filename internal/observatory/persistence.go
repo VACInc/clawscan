@@ -12,7 +12,7 @@ var persistenceSurfaceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`
 // inventory-diff semantics. It is folded into CaptureProtocolRevision so that a
 // change to what counts as a persistence surface cannot silently mix evidence
 // across protocol revisions.
-const PersistenceProtocolRevision = "observatory.persistence.v1"
+const PersistenceProtocolRevision = "observatory.persistence.v2"
 
 const persistenceScope = "selected-persistence-surfaces"
 
@@ -247,28 +247,49 @@ func persistenceSurfaceCatalog() []PersistenceSurface {
 	return catalog
 }
 
+// inventoryResidue is one exercise-lane before/after transition for a monitored
+// path. The mode and content-digest transition are retained privately so
+// baseline noise can be subtracted by a lane-independent identity; the digests
+// are never published.
 type inventoryResidue struct {
-	Subject string
-	Change  string // added | modified | removed
+	Subject    string
+	Change     string // added | modified | removed
+	beforeMode string
+	beforeSHA  string
+	afterMode  string
+	afterSHA   string
 }
 
 type inventoryDiff struct {
-	Paired   bool
+	Paired bool
+	// Residues is the full set of exercise-lane residues (not baseline
+	// subtracted). Syscall correlation uses the full set so a target-attributed
+	// write to a path the runtime also rewrites is still confirmed.
 	Residues []inventoryResidue
+	// baselineNoise holds lane-independent transition keys observed in the
+	// baseline lane. It is used only to suppress inventory-only findings for
+	// genuinely equivalent runtime noise.
+	baselineNoise map[string]struct{}
 }
 
 // analyzePersistence correlates baseline-subtracted trace observations with a
 // before/after lane inventory diff. Trace observations distinguish attempted
 // (denied) from succeeded persistence operations; the inventory diff confirms
 // which succeeded operations left a residual on-disk change. Inventory-only
-// residues (surface changes with no matching traced syscall) are also reported.
+// residues (surface changes with no matching traced syscall) are also reported
+// unless they are equivalent to baseline runtime noise.
 func analyzePersistence(observations []Observation, diff inventoryDiff) PersistenceEvidence {
-	residueByKey := map[string]inventoryResidue{}
+	// Index the full exercise residue set for syscall correlation. This is
+	// deliberately not baseline-subtracted: target attribution already comes from
+	// the syscall observation's own baseline subtraction, so a succeeded
+	// exercise-delta write must still be able to confirm its residue even when the
+	// runtime rewrites the same path in both lanes.
+	exerciseResidueByCorr := map[string]inventoryResidue{}
 	for _, residue := range diff.Residues {
 		if _, ok := classifyPersistenceSurface(residue.Subject); !ok {
 			continue
 		}
-		residueByKey[residueKey(residue.Subject, residue.Change)] = residue
+		exerciseResidueByCorr[residue.Subject+"\x00"+residueClass(residue.Change)] = residue
 	}
 	consumed := map[string]bool{}
 
@@ -285,15 +306,14 @@ func analyzePersistence(observations []Observation, diff inventoryDiff) Persiste
 		if !ok {
 			continue
 		}
-		class := persistenceOperationClass[operation]
-		key := observation.Subject + "\x00" + class
+		corr := observation.Subject + "\x00" + persistenceOperationClass[operation]
 		evidenceKind := "syscall"
 		residual := "unavailable"
 		if observation.Outcome == "succeeded" {
-			if _, matched := residueByKey[key]; matched {
+			if _, matched := exerciseResidueByCorr[corr]; matched {
 				evidenceKind = "syscall+inventory"
 				residual = "confirmed"
-				consumed[key] = true
+				consumed[corr] = true
 			} else if diff.Paired && isInventoryScopedSubject(observation.Subject) {
 				residual = "not-observed"
 			}
@@ -314,11 +334,21 @@ func analyzePersistence(observations []Observation, diff inventoryDiff) Persiste
 		})
 	}
 
-	for key, residue := range residueByKey {
-		if consumed[key] {
+	// Inventory-only findings: exercise residues with no correlated succeeded
+	// syscall. Genuinely equivalent baseline noise (same path, change kind, and
+	// mode transition) is subtracted here so runtime rewrites do not surface; a
+	// residue whose transition differs from baseline is still reported.
+	for _, residue := range diff.Residues {
+		surface, ok := classifyPersistenceSurface(residue.Subject)
+		if !ok {
 			continue
 		}
-		surface, _ := classifyPersistenceSurface(residue.Subject)
+		if consumed[residue.Subject+"\x00"+residueClass(residue.Change)] {
+			continue
+		}
+		if _, noise := diff.baselineNoise[inventoryNoiseKey(residue)]; noise {
+			continue
+		}
 		findings = append(findings, PersistenceFinding{
 			Surface:       surface.ID,
 			Category:      surface.Category,
@@ -342,15 +372,12 @@ func analyzePersistence(observations []Observation, diff inventoryDiff) Persiste
 		Findings:        findings,
 		Limitations: []string{
 			"Persistence coverage is a curated selection of agent and conventional user surfaces; it is not an exhaustive host persistence audit.",
-			"Residual confirmation requires a paired before/after lane inventory; without it only traced syscall attempts are reported and residual is unavailable.",
+			"Residual confirmation uses a paired before/after lane inventory that the protocol always emits; a capture with missing, malformed, duplicated, or truncated inventory is rejected as incomplete rather than graded.",
+			"Baseline runtime noise is subtracted by path, change kind, and mode transition; a target-specific change to a shared path is still confirmed through its correlated syscall write. Content digests are retained privately and never published.",
 			"Operations denied by the read-only OS or containment are labeled attempted; only inventory-confirmed changes are labeled residual: confirmed.",
 			"A write to a persistence surface is a behavioral observation, not proof of author intent or a safety verdict.",
 		},
 	}
-}
-
-func residueKey(subject string, change string) string {
-	return subject + "\x00" + residueClass(change)
 }
 
 func residueClass(change string) string {
@@ -375,41 +402,33 @@ func persistenceFindingKey(finding PersistenceFinding) string {
 	return strings.Join([]string{finding.Surface, finding.Subject, finding.Operation, finding.Outcome, finding.Residual, finding.Evidence}, "\x00")
 }
 
-// diffLaneInventories subtracts baseline-lane residual changes from exercise-lane
-// residual changes so that runtime noise (state the OpenClaw runtime itself
-// rewrites in both lanes) does not surface as a target-attributed residue.
+// diffLaneInventories records the full exercise-lane residue set and the
+// baseline-lane noise identities. Baseline subtraction is deferred to
+// analyzePersistence so that a target-attributed syscall write can correlate with
+// the full exercise residue set even for a path the runtime also rewrites in both
+// lanes.
 func diffLaneInventories(baseline laneInventory, exercise laneInventory) inventoryDiff {
 	if !baseline.Present || !exercise.Present {
 		return inventoryDiff{Paired: false}
 	}
-	baselineChanges := laneInventoryChanges(baseline)
-	residues := []inventoryResidue{}
-	for key, residue := range laneInventoryChanges(exercise) {
-		if _, noise := baselineChanges[key]; noise {
-			continue
-		}
-		residues = append(residues, residue)
+	baselineNoise := map[string]struct{}{}
+	for _, residue := range laneResidues(baseline) {
+		baselineNoise[inventoryNoiseKey(residue)] = struct{}{}
 	}
+	residues := laneResidues(exercise)
 	sort.Slice(residues, func(i, j int) bool {
 		if residues[i].Subject != residues[j].Subject {
 			return residues[i].Subject < residues[j].Subject
 		}
 		return residues[i].Change < residues[j].Change
 	})
-	return inventoryDiff{Paired: true, Residues: residues}
+	return inventoryDiff{Paired: true, Residues: residues, baselineNoise: baselineNoise}
 }
 
-// laneInventoryChanges maps a "subject\x00change" key to its residue for one
-// lane. Keying by both subject and change kind lets diffLaneInventories subtract
-// baseline-lane noise without losing the change type.
-func laneInventoryChanges(inventory laneInventory) map[string]inventoryResidue {
-	changes := map[string]inventoryResidue{}
-	record := func(subject string, change string) {
-		if subject == "" {
-			return
-		}
-		changes[subject+"\x00"+change] = inventoryResidue{Subject: subject, Change: change}
-	}
+// laneResidues computes the added/modified/removed transitions for one lane,
+// retaining the private mode and content-digest transition on each residue.
+func laneResidues(inventory laneInventory) []inventoryResidue {
+	residues := []inventoryResidue{}
 	for path, after := range inventory.After {
 		subject := normalizeInventoryPath(path)
 		if subject == "" {
@@ -417,20 +436,38 @@ func laneInventoryChanges(inventory laneInventory) map[string]inventoryResidue {
 		}
 		before, existed := inventory.Before[path]
 		if !existed {
-			record(subject, "added")
+			residues = append(residues, inventoryResidue{Subject: subject, Change: "added", afterMode: after.Mode, afterSHA: after.SHA256})
 			continue
 		}
 		if before.SHA256 != after.SHA256 || before.Mode != after.Mode {
-			record(subject, "modified")
+			residues = append(residues, inventoryResidue{
+				Subject: subject, Change: "modified",
+				beforeMode: before.Mode, beforeSHA: before.SHA256,
+				afterMode: after.Mode, afterSHA: after.SHA256,
+			})
 		}
 	}
-	for path := range inventory.Before {
+	for path, before := range inventory.Before {
 		if _, ok := inventory.After[path]; ok {
 			continue
 		}
-		record(normalizeInventoryPath(path), "removed")
+		subject := normalizeInventoryPath(path)
+		if subject == "" {
+			continue
+		}
+		residues = append(residues, inventoryResidue{Subject: subject, Change: "removed", beforeMode: before.Mode, beforeSHA: before.SHA256})
 	}
-	return changes
+	return residues
+}
+
+// inventoryNoiseKey is a lane-independent identity for baseline-noise
+// subtraction. It uses the path, change kind, and mode transition, which are
+// comparable across lanes. Content digests are lane-specific (seeded config
+// carries per-lane timestamps), so they cannot establish cross-lane equivalence;
+// target-specific content changes to a shared path are instead confirmed through
+// their correlated syscall write.
+func inventoryNoiseKey(residue inventoryResidue) string {
+	return strings.Join([]string{residue.Subject, residue.Change, residue.beforeMode, residue.afterMode}, "\x00")
 }
 
 // normalizeInventoryPath maps a lane-relative inventory path to the same
