@@ -122,23 +122,32 @@ Every canary observation carries a stable `class` (`identity`, `memory`, or
   linked;
 - `execute` — the canary file itself was executed, or its value was passed to an
   exec;
-- `outbound` — the canary value appeared in an outbound socket payload;
-- `tool` — the canary value surfaced in the captured agent tool/output stream.
+- `outbound` — the canary value appeared in an outbound socket send payload, or a
+  controlled sink receipt confirmed delivery;
+- `agent-output` — the canary value surfaced in the OpenClaw agent command stdout
+  / final JSON;
+- `tool` — the canary value appeared in the typed audit/trajectory tool ledger.
 
-`read`, `write`, and `execute` come from path- and descriptor-based syscall
-correlation and are available whenever paired traces exist. `outbound` and `tool`
-are value-correlation stages that only produce a hit when the capture actually
-carries the canary value. Correlation never inspects `argv` or payload bytes for
-a bare path string, so spoofing a canary path in an unrelated argument cannot
-forge an interaction.
+`read`, `write`, `execute`, and `outbound` come from the paired syscall trace.
+The capture retains bounded send-payload and `argv` bytes (`strace -s 4096`), so
+outbound and exec value correlation work from the live trace; the raw trace stays
+root-owned and private, and public subjects/values are always redacted.
+Correlation never inspects `argv` or payload bytes for a bare path string, so
+spoofing a canary path in an unrelated argument cannot forge an interaction.
 
-`coverage.canaryStages` records, per stage, whether the capture protocol can
-positively confirm it. Because the live capture uses `strace -s 0`, network send
-payloads are stripped, so the `outbound` stage is reported as `limited`: a zero
-outbound count is limited coverage, not proof the token was not exfiltrated. A
-`limited` stage only weakens a negative; any nonzero interaction is still a real
-observation. Interaction counters are bounded so an adversarially large capture
-cannot inflate the evidence.
+`agent-output` scans the agent command's own stdout — it is honestly its own
+signal, never a substitute for tool-call evidence. The `tool` stage is reserved
+for the audit/trajectory-backed tool ledger and is populated only from that typed
+seam; tool use is never inferred from final stdout. Controlled outbound sink
+receipts feed the `outbound` stage through their own typed seam.
+
+`coverage.canaryStages` records, per stage, whether the capture can positively
+confirm it. `read`/`write`/`execute`/`outbound` are `observed` when paired traces
+exist; `agent-output` is `observed` when the agent stdout is captured; `tool` is
+`limited` until the typed tool-ledger seam is supplied. A `limited` stage only
+weakens a negative: a zero count is limited coverage, not proof of non-use, while
+any nonzero interaction is a real observation. Interaction counters are bounded so
+an adversarially large capture cannot inflate the evidence.
 
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
@@ -218,10 +227,11 @@ no declared tools require an operator-supplied `exercise.prompt`.
 
 - One bounded task cannot cover every branch.
 - Results depend on model/tool behavior and synthetic inputs.
-- `strace` provides endpoint addresses, not complete DNS or payload attribution.
-- Canary `outbound` and `tool` stages depend on the capture retaining a value
-  channel; under the live `-s 0` protocol a zero count is limited coverage, not
-  proof the token was unused.
+- `strace` provides endpoint addresses, not complete DNS attribution; send
+  payloads are retained only up to the bounded `strace -s` size.
+- The canary `tool` stage stays `limited` until the typed audit/trajectory
+  tool-ledger seam is wired; a zero count on any stage whose channel is present is
+  limited coverage, not proof the token was unused.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
 - Behavioral correlation is not author intent and is never a safety verdict.

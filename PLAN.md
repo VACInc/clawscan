@@ -104,9 +104,11 @@ Top-level sections:
   counts, outcome; file descriptor acquisition is labeled `open-for-*` and is
   never presented as a completed read or write;
 - `canaries`: canary ID/class/surface, baseline/exercise interaction counts, and
-  a per-stage (read/write/execute/outbound/tool) correlation breakdown, never
-  values; `coverage.canaryStages` records whether each stage is positively
-  detectable so absence is read as limited coverage, not proof of non-use;
+  a per-stage (read/write/execute/outbound/agent-output/tool) correlation
+  breakdown, never values; `coverage.canaryStages` records whether each stage is
+  positively detectable — `tool` stays limited until the typed audit/trajectory
+  ledger seam exists — so absence is read as limited coverage, not proof of
+  non-use;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), and concrete limitations.
 

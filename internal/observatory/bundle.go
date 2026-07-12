@@ -278,8 +278,12 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
-		BaselineOutputs:       [][]byte{bundle.BaselineOutput},
-		ExerciseOutputs:       [][]byte{bundle.ExerciseOutput},
+		// The captured agent command stdout feeds the agent-output stage only.
+		// The tool ledger (enhancement 1) and sink-receipt (enhancement 3) seams
+		// are left unwired here, so their stages stay limited until those typed
+		// inputs exist.
+		BaselineAgentOutputs: [][]byte{bundle.BaselineOutput},
+		ExerciseAgentOutputs: [][]byte{bundle.ExerciseOutput},
 	})
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt

@@ -305,7 +305,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v15"
+const CaptureProtocolRevision = "observatory.capture-protocol.v16"
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)

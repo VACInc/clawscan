@@ -13,23 +13,32 @@ const EvidenceSchemaVersion = "observatory.behavior.v1"
 const MaxEvidenceBytes = 64 << 20
 
 // Canary interaction stages are stable, publicly safe labels for how a canary
-// was touched. read/write/execute are derived from path- and descriptor-based
-// syscall correlation and are available whenever paired file/process traces
-// exist. outbound and tool are value-correlation stages: they only surface a
-// hit when the capture actually carries the canary value (a network payload or
-// the agent tool/output stream). Absence of such a value is limited coverage,
+// was touched.
+//
+//   - read/write/execute/outbound are derived from the paired syscall trace.
+//     The capture retains send-payload bytes (privately), so outbound
+//     correlation is available whenever paired traces exist.
+//   - agent-output records the canary value surfacing in the OpenClaw agent
+//     command stdout / final JSON. It is honestly its own signal, not a
+//     tool-call ledger.
+//   - tool is reserved for the audit/trajectory-backed tool ledger and is only
+//     populated from a typed tool-ledger seam. Until that typed input exists,
+//     tool coverage is limited; tool use is never inferred from agent stdout.
+//
+// Absence of a value on a stage whose channel is present is limited coverage,
 // not proof the token went unused.
 const (
-	CanaryStageRead     = "read"
-	CanaryStageWrite    = "write"
-	CanaryStageExecute  = "execute"
-	CanaryStageOutbound = "outbound"
-	CanaryStageTool     = "tool"
+	CanaryStageRead        = "read"
+	CanaryStageWrite       = "write"
+	CanaryStageExecute     = "execute"
+	CanaryStageOutbound    = "outbound"
+	CanaryStageAgentOutput = "agent-output"
+	CanaryStageTool        = "tool"
 )
 
 // canaryStageSequence fixes the canonical order used for deterministic
 // serialization, coverage reporting, and version comparison.
-var canaryStageSequence = []string{CanaryStageRead, CanaryStageWrite, CanaryStageExecute, CanaryStageOutbound, CanaryStageTool}
+var canaryStageSequence = []string{CanaryStageRead, CanaryStageWrite, CanaryStageExecute, CanaryStageOutbound, CanaryStageAgentOutput, CanaryStageTool}
 
 // maxCanaryInteractionCount bounds published interaction counters so an
 // adversarially large capture cannot inflate evidence or its encoded size.

@@ -16,13 +16,24 @@ type AnalysisInput struct {
 	Metadata              CaptureMetadata
 	Canaries              []CanaryDefinition
 	ControlPlaneAddresses []string
-	// BaselineOutputs and ExerciseOutputs are optional captured tool/output
-	// value channels (the agent tool/output stream today). They are scanned for
-	// canary values to derive the tool interaction stage and are never
-	// published. Enhancements that capture a richer structured tool-event stream
-	// can supply it here without changing the evidence schema.
-	BaselineOutputs [][]byte
-	ExerciseOutputs [][]byte
+	// BaselineAgentOutputs and ExerciseAgentOutputs are the OpenClaw agent
+	// command stdout / final JSON. Scanning them for canary values yields the
+	// agent-output stage: the value surfaced in the agent's own output. This is
+	// not a tool-call ledger and never populates the tool stage.
+	BaselineAgentOutputs [][]byte
+	ExerciseAgentOutputs [][]byte
+	// BaselineToolLedger and ExerciseToolLedger are the optional bounded seam for
+	// the audit/trajectory-backed tool ledger (enhancement 1). Only these typed
+	// inputs populate the tool stage; while they are absent, tool coverage is
+	// limited (unavailable) and tool use is never inferred from agent stdout.
+	BaselineToolLedger [][]byte
+	ExerciseToolLedger [][]byte
+	// BaselineSinkReceipts and ExerciseSinkReceipts are the optional bounded seam
+	// for controlled outbound-payload sink receipts (enhancement 3). When
+	// present they augment the trace-derived outbound stage with confirmed sink
+	// deliveries.
+	BaselineSinkReceipts [][]byte
+	ExerciseSinkReceipts [][]byte
 }
 
 type analysisResult struct {
@@ -177,17 +188,24 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	for _, canary := range input.Canaries {
 		baseline := baselineCanaries[canary.ID]
 		exercise := exerciseCanaries[canary.ID]
-		// The tool stage is not tied to a syscall trace line: it counts canary
-		// values surfacing in the captured agent tool/output stream. Scanning is
-		// bounded and only counts are published.
-		baselineTool := clampCanaryCount(countCanaryInStreams(input.BaselineOutputs, canary.Marker))
-		exerciseTool := clampCanaryCount(countCanaryInStreams(input.ExerciseOutputs, canary.Marker))
+		// Stream-derived stages are not tied to a syscall trace line. agent-output
+		// counts canary values in the agent command stdout; tool counts them in the
+		// typed tool ledger; outbound is augmented by controlled sink receipts.
+		// Scanning is bounded and only counts are published.
 		stages := []CanaryStageInteraction{}
 		for _, stage := range canaryStageSequence {
 			baselineStage := clampCanaryCount(baseline.stages[stage])
 			exerciseStage := clampCanaryCount(exercise.stages[stage])
-			if stage == CanaryStageTool {
-				baselineStage, exerciseStage = baselineTool, exerciseTool
+			switch stage {
+			case CanaryStageOutbound:
+				baselineStage = clampCanaryCount(baselineStage + countCanaryInStreams(input.BaselineSinkReceipts, canary.Marker))
+				exerciseStage = clampCanaryCount(exerciseStage + countCanaryInStreams(input.ExerciseSinkReceipts, canary.Marker))
+			case CanaryStageAgentOutput:
+				baselineStage = clampCanaryCount(countCanaryInStreams(input.BaselineAgentOutputs, canary.Marker))
+				exerciseStage = clampCanaryCount(countCanaryInStreams(input.ExerciseAgentOutputs, canary.Marker))
+			case CanaryStageTool:
+				baselineStage = clampCanaryCount(countCanaryInStreams(input.BaselineToolLedger, canary.Marker))
+				exerciseStage = clampCanaryCount(countCanaryInStreams(input.ExerciseToolLedger, canary.Marker))
 			}
 			if baselineStage == 0 && exerciseStage == 0 {
 				continue
@@ -214,21 +232,24 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	sort.Slice(result.Canaries, func(i, j int) bool { return result.Canaries[i].ID < result.Canaries[j].ID })
 
 	pairedTraceReceipts := traceLaneHasCompleteSyscall(input.BaselineTraces) && traceLaneHasCompleteSyscall(input.ExerciseTraces)
+	agentOutputChannel := len(input.BaselineAgentOutputs) > 0 || len(input.ExerciseAgentOutputs) > 0
+	toolLedgerChannel := len(input.BaselineToolLedger) > 0 || len(input.ExerciseToolLedger) > 0
 	result.Coverage = CoverageEvidence{
 		SyscallScope:    "selected-mvp-syscalls",
 		FileSyscalls:    pairedTraceReceipts,
 		ProcessSyscalls: pairedTraceReceipts,
 		NetworkSyscalls: pairedTraceReceipts,
 		BaselinePaired:  pairedTraceReceipts,
-		CanaryStages:    canaryStageCoverage(pairedTraceReceipts),
+		CanaryStages:    canaryStageCoverage(pairedTraceReceipts, agentOutputChannel, toolLedgerChannel),
 		Limitations: []string{
 			"Coverage booleans confirm paired trace receipts for selected MVP syscall families; they do not claim an exhaustive Linux syscall audit.",
 			"Observed behavior is input- and model-dependent; unexercised branches remain invisible.",
-			"System-call tracing records endpoint addresses but does not provide complete DNS-name or payload attribution.",
+			"System-call tracing records endpoint addresses but does not provide complete DNS-name attribution.",
 			"A behavioral delta shows correlation with the exercise lane, not author intent or a safety verdict.",
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
-			"Canary correlation classifies interactions into read, write, execute, outbound, and tool stages; the read stage reflects read-intent file opens, not individual read() syscalls, which are outside the selected scope.",
-			"Outbound and tool are value-correlation stages: the capture strips network payloads, so a zero outbound count is limited coverage, not proof the token was not exfiltrated. Any nonzero stage interaction remains a real observation.",
+			"Canary correlation classifies interactions into read, write, execute, outbound, agent-output, and tool stages; the read stage reflects read-intent file opens, not individual read() syscalls, which are outside the selected scope.",
+			"The capture retains send-payload bytes privately (bounded by the trace file limit) so outbound correlation matches canary values in socket sends; raw payloads are never published and public subjects stay redacted.",
+			"The tool stage is populated only from a typed audit/trajectory tool ledger; while that seam is absent its coverage is limited and tool use is never inferred from agent stdout. A zero count on a stage whose channel is present is limited coverage, not proof of non-use.",
 		},
 	}
 	return result
@@ -243,24 +264,29 @@ func newCanaryLaneCounts() *canaryLaneCounts {
 	return &canaryLaneCounts{stages: map[string]int{}}
 }
 
-// canaryStageCoverage reports, per interaction stage, whether the capture
-// protocol can positively confirm it. The value is a stable function of the
-// protocol and capture completeness, so two runs of the same protocol compare
-// as equal. read/write/execute are confirmed by paired file/process traces;
-// outbound is limited because the -s 0 capture strips send payloads; the agent
-// tool/output stream is always captured, so the tool stage is confirmed.
-func canaryStageCoverage(pairedTraceReceipts bool) []CanaryStageCoverage {
-	traceState := "limited"
-	if pairedTraceReceipts {
-		traceState = "observed"
-	}
+// canaryStageCoverage reports, per interaction stage, whether the capture can
+// positively confirm it. The value is a stable function of the protocol, capture
+// completeness, and which typed input channels are present, so two runs of the
+// same protocol and inputs compare as equal. read/write/execute/outbound are
+// confirmed by paired syscall traces (the capture retains send payloads);
+// agent-output is confirmed when the agent command stdout is captured; tool is
+// confirmed only when the typed tool-ledger seam is supplied.
+func canaryStageCoverage(pairedTraceReceipts bool, agentOutputChannel bool, toolLedgerChannel bool) []CanaryStageCoverage {
 	return []CanaryStageCoverage{
-		{Stage: CanaryStageRead, Coverage: traceState, Source: "file-open-and-descriptor-syscall-trace"},
-		{Stage: CanaryStageWrite, Coverage: traceState, Source: "file-mutation-syscall-trace"},
-		{Stage: CanaryStageExecute, Coverage: traceState, Source: "exec-syscall-trace"},
-		{Stage: CanaryStageOutbound, Coverage: "limited", Source: "socket-send-payload"},
-		{Stage: CanaryStageTool, Coverage: "observed", Source: "agent-tool-output-stream"},
+		{Stage: CanaryStageRead, Coverage: coverageLabel(pairedTraceReceipts), Source: "file-open-and-descriptor-syscall-trace"},
+		{Stage: CanaryStageWrite, Coverage: coverageLabel(pairedTraceReceipts), Source: "file-mutation-syscall-trace"},
+		{Stage: CanaryStageExecute, Coverage: coverageLabel(pairedTraceReceipts), Source: "exec-syscall-trace"},
+		{Stage: CanaryStageOutbound, Coverage: coverageLabel(pairedTraceReceipts), Source: "socket-send-syscall-payload"},
+		{Stage: CanaryStageAgentOutput, Coverage: coverageLabel(agentOutputChannel), Source: "agent-command-stdout"},
+		{Stage: CanaryStageTool, Coverage: coverageLabel(toolLedgerChannel), Source: "audit-tool-ledger"},
 	}
+}
+
+func coverageLabel(available bool) string {
+	if available {
+		return "observed"
+	}
+	return "limited"
 }
 
 func countCanaryInStreams(streams [][]byte, marker string) int {
@@ -996,9 +1022,9 @@ func canaryLineStages(line string, canary CanaryDefinition, metadata CaptureMeta
 }
 
 // canaryValueStages classifies a line whose canary marker value is present by
-// the syscall that carried it. Under the -s 0 capture protocol argv and payload
-// strings are stripped, so this only fires for enriched re-analysis or for
-// values that surface through filenames; the value is never republished.
+// the syscall that carried it. The capture retains argv and send-payload bytes,
+// so a canary value passed to a subprocess or written to a socket is correlated
+// here; the value itself is never republished (public subjects are redacted).
 func canaryValueStages(line string) []string {
 	open := strings.IndexByte(line, '(')
 	if open <= 0 {
