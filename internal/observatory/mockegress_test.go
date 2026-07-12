@@ -1,6 +1,7 @@
 package observatory
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -114,11 +115,74 @@ func TestGuestFirewallPinsControlledSink(t *testing.T) {
 		t.Fatalf("firewall dropped the model allowlist:\n%s", enabled)
 	}
 	disabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, MockEgressConfig{})
-	if strings.Contains(disabled, "controlled-mock-egress-sink") {
+	if strings.Contains(disabled, "controlled-mock-egress-sink") || strings.Contains(disabled, "@AGENT_UID@") {
 		t.Fatalf("disabled sink leaked a rule:\n%s", disabled)
 	}
 	if digestBytes([]byte(enabled)) == digestBytes([]byte(disabled)) {
 		t.Fatal("firewall policy digest does not change when the sink is enabled")
+	}
+}
+
+func TestGuestFirewallEnforcesExactSinkPortForAgentUID(t *testing.T) {
+	sink := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
+	rules := guestFirewallRules("policy", []string{"10.0.0.2:8000"}, sink)
+	allow := `meta skuid @AGENT_UID@ ip daddr 127.0.0.9 tcp dport 9009 accept comment "controlled-mock-egress-sink"`
+	deny := `meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment "controlled-mock-egress-loopback-deny"`
+	loopback := `oifname "lo" accept`
+	model := "ip daddr 10.0.0.2 tcp dport 8000 accept"
+	allowIdx := strings.Index(rules, allow)
+	denyIdx := strings.Index(rules, deny)
+	loopbackIdx := strings.Index(rules, loopback)
+	modelIdx := strings.Index(rules, model)
+	if allowIdx < 0 || denyIdx < 0 || loopbackIdx < 0 || modelIdx < 0 {
+		t.Fatalf("firewall missing a required rule:\n%s", rules)
+	}
+	// The exact-port allow must precede the agent loopback deny, which must precede
+	// the generic loopback accept, so the sink port is the enforcement boundary.
+	if !(allowIdx < denyIdx && denyIdx < loopbackIdx && loopbackIdx < modelIdx) {
+		t.Fatalf("firewall rule ordering is wrong (allow=%d deny=%d lo=%d model=%d):\n%s", allowIdx, denyIdx, loopbackIdx, modelIdx, rules)
+	}
+	if !strings.Contains(rules, "@AGENT_UID@") {
+		t.Fatalf("firewall did not leave the agent-uid marker for in-guest substitution:\n%s", rules)
+	}
+	// Other agent loopback ports are denied: the only agent-scoped accept is the
+	// exact sink host+port, and the catch-all agent loopback drop carries no port.
+	if got := strings.Count(rules, "meta skuid @AGENT_UID@ ip daddr 127.0.0.9 tcp dport"); got != 1 {
+		t.Fatalf("expected exactly one agent sink allow, got %d:\n%s", got, rules)
+	}
+	if strings.Contains(rules, "127.0.0.0/8 drop") && strings.Contains(rules[denyIdx:denyIdx+len(deny)], "dport") {
+		t.Fatalf("agent loopback deny is port-scoped, so other ports would leak:\n%s", rules)
+	}
+	if got := strings.Count(rules, "meta skuid @AGENT_UID@"); got != 2 {
+		t.Fatalf("expected exactly two agent-scoped rules (one allow, one deny), got %d:\n%s", got, rules)
+	}
+}
+
+func TestRemoteRunnerSubstitutesAgentUIDAndExposesSink(t *testing.T) {
+	for _, required := range []string{
+		`MOCK_AGENT_UID=$(id -u "$AGENT_USER")`,
+		`@AGENT_UID@`,
+		"firewall agent-uid marker is missing",
+		`if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then`,
+	} {
+		if !strings.Contains(remoteRunScript, required) {
+			t.Fatalf("remote runner missing agent-uid substitution %q", required)
+		}
+	}
+	for _, required := range []string{
+		"OBSERVATORY_MOCK_EGRESS_URL",
+		"m && m.enabled",
+		`MOCK_ENV=("OBSERVATORY_MOCK_EGRESS_URL=$MOCK_EGRESS_URL")`,
+		`${MOCK_ENV[@]+"${MOCK_ENV[@]}"}`,
+	} {
+		if !strings.Contains(remoteAgentScript, required) {
+			t.Fatalf("remote agent missing synthetic sink endpoint wiring %q", required)
+		}
+	}
+	// The endpoint variable must be gated on the sink being enabled; a disabled run
+	// never introduces it into the otherwise-empty child environment.
+	if !strings.Contains(remoteAgentScript, `[ -n "$MOCK_EGRESS_URL" ] && MOCK_ENV=`) {
+		t.Fatalf("synthetic sink endpoint is not gated on the sink being enabled:\n%s", remoteAgentScript)
 	}
 }
 
@@ -423,7 +487,18 @@ func TestRenderSiteShowsControlledMockEgress(t *testing.T) {
 	}
 }
 
-func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
+type controlledSink struct {
+	host    string
+	port    int
+	url     string
+	collect func() *MockEgressReceipt
+}
+
+// runControlledSink starts the real embedded sink script on loopback and returns
+// its synthetic endpoint plus a collector that terminates it and reads the
+// private receipt. It contacts no external service.
+func runControlledSink(t *testing.T, maxBytesPerRequest int64, maxTotalBytes int64) controlledSink {
+	t.Helper()
 	requireLinuxControlHost(t)
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -445,7 +520,7 @@ func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
 	runtime := map[string]any{
 		"mockEgress": map[string]any{
 			"enabled": true, "host": "127.0.0.1", "port": port,
-			"maxRequests": 4, "maxBytesPerRequest": 8, "maxTotalBytes": 32, "deadlineSeconds": 10,
+			"maxRequests": 8, "maxBytesPerRequest": maxBytesPerRequest, "maxTotalBytes": maxTotalBytes, "deadlineSeconds": 20,
 			"cannedResponseBase64": base64.StdEncoding.EncodeToString([]byte("OK\n")),
 		},
 	}
@@ -459,26 +534,74 @@ func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = command.Process.Kill()
-		_, _ = command.Process.Wait()
-	}()
-	readyPath := receiptPath + ".ready"
-	deadline := time.Now().Add(5 * time.Second)
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = command.Process.Kill()
+			_, _ = command.Process.Wait()
+		}
+	})
+	readyDeadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := os.Stat(readyPath); err == nil {
+		if _, err := os.Stat(receiptPath + ".ready"); err == nil {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("sink did not become ready")
+		if time.Now().After(readyDeadline) {
+			t.Fatal("controlled mock egress sink did not become ready")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	collect := func() *MockEgressReceipt {
+		if !stopped {
+			stopped = true
+			_ = command.Process.Signal(syscall.SIGTERM)
+			if _, err := command.Process.Wait(); err != nil {
+				t.Fatalf("controlled mock egress sink exited with error: %v", err)
+			}
+		}
+		data, err := os.ReadFile(receiptPath)
+		if err != nil {
+			t.Fatalf("read receipt: %v", err)
+		}
+		receipt, err := parseMockEgressReceipt(data)
+		if err != nil {
+			t.Fatalf("parse receipt: %v", err)
+		}
+		return receipt
+	}
+	return controlledSink{host: "127.0.0.1", port: port, url: fmt.Sprintf("http://127.0.0.1:%d/observatory-mock-egress", port), collect: collect}
+}
+
+func assertCanaryExfiltrated(t *testing.T, receipt *MockEgressReceipt, marker string) {
+	t.Helper()
+	if receipt.AcceptedRequests < 1 || !bytes.Contains(receipt.payload, []byte(marker)) {
+		t.Fatalf("sink receipt did not capture the transmitted canary: %#v", receipt)
+	}
+	config := MockEgressConfig{Enabled: true, Address: fmt.Sprintf("%s:%d", receipt.Sink.Host, receipt.Sink.Port)}
+	canaries := []CanaryDefinition{{ID: "cloud-credentials", Surface: "home file", Path: "$HOME/.aws/credentials", Marker: marker}}
+	bundle := CaptureBundle{
+		MockEgressBaseline: mustReceipt(t, receipt.Sink.Host, receipt.Sink.Port, "baseline", 0, nil),
+		MockEgressExercise: receipt,
+	}
+	evidence := buildMockEgressEvidence(config, bundle, canaries)
+	if evidence == nil || len(evidence.CanariesObserved) != 1 || evidence.CanariesObserved[0] != "cloud-credentials" {
+		t.Fatalf("evidence did not correlate the transmitted canary: %#v", evidence)
+	}
+	if evidence.PayloadEncoding != "cleartext" || evidence.DeltaRequests != 1 {
+		t.Fatalf("mock egress evidence = %#v", evidence)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", evidence), marker) {
+		t.Fatalf("canary value leaked into public evidence: %#v", evidence)
+	}
+}
+
+func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
+	sink := runControlledSink(t, 8, 32) // 8-byte per-request cap
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", sink.port))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Write([]byte("0123456789")); err != nil { // exceeds the 8-byte per-request cap
+	if _, err := conn.Write([]byte("0123456789")); err != nil { // exceeds the per-request cap
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -488,27 +611,89 @@ func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
 		t.Fatalf("canned response = %q", response[:n])
 	}
 	_ = conn.Close()
-	if err := command.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := command.Process.Wait(); err != nil {
-		t.Fatalf("sink exited with error: %v", err)
-	}
-	data, err := os.ReadFile(receiptPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt, err := parseMockEgressReceipt(data)
-	if err != nil {
-		t.Fatalf("receipt: %v", err)
-	}
+	receipt := sink.collect()
 	if receipt.AcceptedRequests != 1 || receipt.CapturedBytes != 8 || !receipt.Truncated {
 		t.Fatalf("receipt = %#v", receipt)
 	}
-	if string(receipt.payload) != "01234567" {
-		t.Fatalf("captured payload = %q", receipt.payload)
+	if string(receipt.payload) != "01234567" || receipt.Sink.Port != sink.port {
+		t.Fatalf("captured payload = %q port = %d", receipt.payload, receipt.Sink.Port)
 	}
-	if receipt.Sink.Port != port {
-		t.Fatalf("receipt sink port = %d, want %d", receipt.Sink.Port, port)
+}
+
+func TestProbeSkillFixtureExfiltratesCanaryToControlledSink(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for owned-fixture controlled mock egress correlation")
 	}
+	sink := runControlledSink(t, 1024, 8192)
+	home := t.TempDir()
+	workspace := t.TempDir()
+	marker := "OBS-CANARY-" + strings.Repeat("c", 48)
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".aws", "credentials"), []byte("[default]\naws_access_key_id="+marker+"\nregion=us-east-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := filepath.Abs(filepath.Join("..", "..", "testdata", "fixtures", "probe-skill", "scripts", "probe.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(node, probe)
+	command.Env = []string{"HOME=" + home, "OBSERVATORY_WORKSPACE=" + workspace, "OBSERVATORY_MOCK_EGRESS_URL=" + sink.url, "PATH=" + os.Getenv("PATH")}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("run probe skill fixture: %v: %s", err, output)
+	}
+	assertCanaryExfiltrated(t, sink.collect(), marker)
+}
+
+func TestProbePluginFixtureExfiltratesCanaryToControlledSink(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for owned-fixture controlled mock egress correlation")
+	}
+	sink := runControlledSink(t, 1024, 8192)
+	dir := t.TempDir()
+	// Run the owned fixture standalone against a stubbed plugin SDK so we execute
+	// the real fixture source without the full OpenClaw CLI.
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "testdata", "fixtures", "probe-plugin", "index.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdkDir := filepath.Join(dir, "node_modules", "openclaw", "plugin-sdk")
+	if err := os.MkdirAll(sdkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), fixture, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"type":"module"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node_modules", "openclaw", "package.json"), []byte(`{"name":"openclaw","version":"0.0.0","exports":{"./plugin-sdk/plugin-entry":"./plugin-sdk/plugin-entry.mjs"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sdkDir, "plugin-entry.mjs"), []byte("export function definePluginEntry(entry) { return entry; }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	harness := "import entry from \"./index.js\";\nconst tools = [];\nentry.register({ registerTool: (tool) => tools.push(tool) });\nawait tools[0].execute();\n"
+	if err := os.WriteFile(filepath.Join(dir, "harness.mjs"), []byte(harness), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	workspace := t.TempDir()
+	marker := "OBS-CANARY-" + strings.Repeat("d", 48)
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".aws", "credentials"), []byte("[default]\naws_access_key_id="+marker+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(node, filepath.Join(dir, "harness.mjs"))
+	command.Dir = dir
+	command.Env = []string{"HOME=" + home, "OBSERVATORY_WORKSPACE=" + workspace, "OBSERVATORY_MOCK_EGRESS_URL=" + sink.url, "PATH=" + os.Getenv("PATH")}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("run probe plugin fixture: %v: %s", err, output)
+	}
+	assertCanaryExfiltrated(t, sink.collect(), marker)
 }

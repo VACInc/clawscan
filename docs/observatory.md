@@ -170,11 +170,22 @@ disabled by default; when disabled the scan behaves exactly as before.
 When enabled under `runtime.mockEgress`, Observatory runs a bounded, guest-local
 loopback sink once per lane, outside the untrusted agent cgroup. The sink is
 pinned to an exact IPv4 loopback address and port, so captured bytes never leave
-the VM. The target reaches it only through a distinct per-lane cgroup allowlist
-entry that is kept separate from the exact model control-plane allowlist;
-everything else stays default-deny. The sink applies strict request, per-request
-byte, total byte, and wall-clock caps, and returns an optional deterministic
-canned response.
+the VM. The exact port is a real enforcement boundary: the guest firewall gives
+the dedicated agent UID an allow rule for only the exact sink host and port and
+then drops every other agent loopback destination, both ordered before the
+generic loopback accept. The agent UID marker is substituted with the numeric UID
+inside the guest, and non-agent (control-plane), model, and management traffic are
+untouched. This entry is kept separate from the exact model control-plane
+allowlist; everything else stays default-deny. The sink applies strict request,
+per-request byte, total byte, and wall-clock caps, and returns an optional
+deterministic canned response.
+
+So the exercised target can actually use the sink, an enabled scan exposes a
+clearly synthetic `OBSERVATORY_MOCK_EGRESS_URL` in the otherwise-empty child
+environment (identical in both lanes; only the exercise lane has a target). The
+owned probe skill and probe plugin both send a bounded synthetic payload carrying
+the workspace cloud canary to that endpoint, giving an end-to-end owned-fixture
+proof without routing arbitrary destinations or contacting any real service.
 
 The public evidence gains a `mockEgress` section with the sink port class,
 baseline/exercise/delta request and byte counts, a payload digest, a payload

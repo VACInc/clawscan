@@ -461,6 +461,20 @@ func guestFirewallRules(runID string, endpoints []string, mockEgress MockEgressC
 	rules.WriteString("  chain input {\n    type filter hook input priority -50; policy drop;\n")
 	rules.WriteString("    iifname \"lo\" accept\n    ct state established,related accept\n    ip saddr @MANAGEMENT_IPV4@ tcp dport 22 accept\n    udp sport 67 udp dport 68 accept\n  }\n")
 	rules.WriteString("  chain output {\n    type filter hook output priority -50; policy drop;\n")
+	// Controlled mock egress enforcement, ordered before the generic loopback
+	// accept below: the dedicated agent UID may reach only the exact sink host and
+	// port on loopback, and every other agent loopback destination is dropped. This
+	// keeps the exact sink port—not any-loopback reachability—the boundary, since
+	// the coarser cgroup IPAddressAllow entry can only allow the sink address. The
+	// @AGENT_UID@ marker is substituted with the numeric agent UID inside the guest.
+	// Non-agent (control-plane) loopback, model, and management traffic are
+	// unaffected because these rules match only meta skuid @AGENT_UID@.
+	if mockEgress.Enabled {
+		if host, port, err := mockEgressHostPort(mockEgress.Address); err == nil {
+			fmt.Fprintf(&rules, "    meta skuid @AGENT_UID@ ip daddr %s tcp dport %s accept comment \"controlled-mock-egress-sink\"\n", host, port)
+			rules.WriteString("    meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment \"controlled-mock-egress-loopback-deny\"\n")
+		}
+	}
 	rules.WriteString("    oifname \"lo\" accept\n    ct state established,related accept\n    udp sport 68 udp dport 67 accept\n")
 	for _, endpoint := range endpoints {
 		host, port, err := net.SplitHostPort(endpoint)
@@ -472,15 +486,6 @@ func guestFirewallRules(runID string, endpoints []string, mockEgress MockEgressC
 			family = "ip6"
 		}
 		fmt.Fprintf(&rules, "    %s daddr %s tcp dport %s accept\n", family, strings.Trim(host, "[]"), port)
-	}
-	// Explicit, auditable pin for the loopback controlled sink. Loopback is already
-	// broadly accepted above, so the real per-lane gate is the cgroup allowlist;
-	// this rule binds the exact sink host and port into the policy digest so the
-	// firewall receipt changes whenever the sink configuration does.
-	if mockEgress.Enabled {
-		if host, port, err := mockEgressHostPort(mockEgress.Address); err == nil {
-			fmt.Fprintf(&rules, "    ip daddr %s tcp dport %s accept comment \"controlled-mock-egress-sink\"\n", host, port)
-		}
 	}
 	rules.WriteString("  }\n  chain forward {\n    type filter hook forward priority -50; policy drop;\n  }\n}\n")
 	return rules.String()
