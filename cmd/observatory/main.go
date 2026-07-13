@@ -41,6 +41,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "matrix":
 		return runMatrix(ctx, args[1:], stdout, stderr)
+	case "stage":
+		return runStage(args[1:], stdout, stderr)
 	case "analyze":
 		return runAnalyze(args[1:], stdout, stderr)
 	case "render":
@@ -52,6 +54,43 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	default:
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
+}
+
+func runStage(args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("stage", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	output := flags.String("output", "", "create the safely staged target at this path")
+	metadata := flags.String("metadata", "", "write staged target metadata JSON to this new file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 || strings.TrimSpace(*output) == "" {
+		return errors.New("usage: observatory stage --output path [--metadata file] <target>")
+	}
+	limits := observatory.LimitsConfig{
+		MaxFiles: 5000, MaxFileBytes: 10 << 20, MaxTotalBytes: 100 << 20,
+		MaxBundleBytes: 64 << 20, MaxLaneBytes: 256 << 20,
+		MaxMemoryBytes: 2 << 30, CPUQuotaPct: 200, MaxTasks: 256,
+	}
+	staged, err := observatory.StageTarget(flags.Arg(0), *output, limits)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(*metadata) != "" {
+		file, err := os.OpenFile(*metadata, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		encodeErr := encodeJSON(file, staged.Evidence)
+		closeErr := file.Close()
+		if encodeErr != nil {
+			return encodeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return encodeJSON(stdout, staged.Evidence)
 }
 
 func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
@@ -479,6 +518,7 @@ const helpText = `ClawHub Observatory — paired behavioral evidence for OpenCla
 Usage:
   observatory scan [--config path] [--json] [--grade-output path] [--site dir] [--delta path] [--no-history] <target>
   observatory matrix [--config path] [--dry-run] [--fail-fast] [--output dir] [--json] <target>
+  observatory stage --output path [--metadata file] <target>
   observatory analyze --config path --bundle raw.tar.gz [--json] [--grade-output path] <target>
   observatory grade --input evidence.json [--output grade.json]
   observatory render --input evidence.json --output site [--previous evidence.json | --auto-previous --config path]

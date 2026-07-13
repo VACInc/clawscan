@@ -45,7 +45,8 @@ type Sandbox struct {
 }
 
 type Judge struct {
-	Command string `yaml:"command"`
+	Command   string `yaml:"command"`
+	Execution string `yaml:"execution,omitempty"`
 }
 
 type resolvedProfile struct {
@@ -68,6 +69,8 @@ type cliIntent struct {
 	json                 bool
 	judge                string
 	judgeSet             bool
+	judgeExecution       string
+	judgeExecutionSet    bool
 	sandbox              string
 	sandboxSet           bool
 	sandboxImage         string
@@ -469,6 +472,14 @@ func parseCLIIntent(args []string) (cliIntent, error) {
 			intent.judge = value
 			intent.judgeSet = true
 			i = next
+		case "--judge-execution":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return cliIntent{}, err
+			}
+			intent.judgeExecution = value
+			intent.judgeExecutionSet = true
+			i = next
 		case "--sandbox":
 			value, next, err := readValue(args, i, arg)
 			if err != nil {
@@ -612,14 +623,25 @@ func buildRunnerArgs(intent cliIntent, selected resolvedProfile, profileName str
 	}
 
 	judgeCommand := ""
+	judgeExecution := ""
 	if profile.Judge != nil && shouldUseProfileJudge(intent) {
 		judgeCommand = resolveJudgePaths(profile.Judge.Command, selected.configDir)
+		judgeExecution = profile.Judge.Execution
 	}
 	if intent.judgeSet {
 		judgeCommand = intent.judge
+		judgeExecution = ""
+	}
+	if intent.judgeExecutionSet {
+		judgeExecution = intent.judgeExecution
 	}
 	if judgeCommand != "" {
 		args = append(args, "--judge", judgeCommand)
+		if judgeExecution != "" {
+			args = append(args, "--judge-execution", judgeExecution)
+		}
+	} else if intent.judgeExecutionSet {
+		return nil, nil, errors.New("--judge-execution requires a configured judge or --judge")
 	}
 	if selected.sandbox.Mode != "" {
 		args = append(args, "--sandbox", selected.sandbox.Mode)
@@ -677,6 +699,14 @@ func validateProfile(name string, profile Profile) error {
 			return fmt.Errorf("Duplicate scanner in profile %s: %s", name, scanner)
 		}
 		seen[scanner] = true
+	}
+	if profile.Judge != nil {
+		if strings.TrimSpace(profile.Judge.Command) == "" {
+			return fmt.Errorf("Profile %s judge command cannot be empty", name)
+		}
+		if _, err := runner.NormalizeJudgeExecution(profile.Judge.Execution); err != nil {
+			return fmt.Errorf("Profile %s: %w", name, err)
+		}
 	}
 	return nil
 }

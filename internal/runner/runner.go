@@ -48,9 +48,15 @@ type BenchmarkOptions struct {
 }
 
 type JudgeOptions struct {
-	Command string
-	Files   map[string][]byte
+	Command   string
+	Execution string
+	Files     map[string][]byte
 }
+
+const (
+	JudgeExecutionSandbox = "sandbox"
+	JudgeExecutionHost    = "host"
+)
 
 type EnvRequirement struct {
 	EnvVar string
@@ -175,6 +181,7 @@ type TargetWorkspaceOmission struct {
 
 type JudgeResult struct {
 	Status           string      `json:"status"`
+	Execution        string      `json:"execution"`
 	Command          string      `json:"command,omitempty"`
 	PromptPath       string      `json:"promptPath,omitempty"`
 	OutputSchemaPath string      `json:"outputSchemaPath,omitempty"`
@@ -229,6 +236,8 @@ func ParseArgs(args []string) (Options, error) {
 		start = 1
 	}
 	var judge string
+	var judgeExecution string
+	var judgeExecutionSet bool
 	for i := start; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
@@ -279,6 +288,17 @@ func ParseArgs(args []string) (Options, error) {
 			}
 			judge = value
 			i = next
+		case "--judge-execution":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return Options{}, err
+			}
+			judgeExecution, err = NormalizeJudgeExecution(value)
+			if err != nil {
+				return Options{}, err
+			}
+			judgeExecutionSet = true
+			i = next
 		case "--sandbox":
 			value, next, err := readValue(args, i, arg)
 			if err != nil {
@@ -320,10 +340,29 @@ func ParseArgs(args []string) (Options, error) {
 			return Options{}, fmt.Errorf("Scanner result provided for unrequested scanner: %s", scanner)
 		}
 	}
+	if judgeExecutionSet && judge == "" {
+		return Options{}, errors.New("--judge-execution requires --judge")
+	}
 	if judge != "" {
-		opts.Judge = &JudgeOptions{Command: judge}
+		if !judgeExecutionSet {
+			judgeExecution = JudgeExecutionSandbox
+		}
+		opts.Judge = &JudgeOptions{Command: judge, Execution: judgeExecution}
 	}
 	return opts, nil
+}
+
+func NormalizeJudgeExecution(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return JudgeExecutionSandbox, nil
+	}
+	switch value {
+	case JudgeExecutionSandbox, JudgeExecutionHost:
+		return value, nil
+	default:
+		return "", fmt.Errorf("Unsupported judge execution mode: %s (valid: sandbox, host)", value)
+	}
 }
 
 func ValidateRequirements(opts Options, env map[string]string) error {
@@ -351,6 +390,13 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 	applyRuntimeEnvDefaults(opts, env)
 	if err := ValidateRequirements(opts, env); err != nil {
 		return Artifact{}, err
+	}
+	if opts.Judge != nil {
+		execution, err := NormalizeJudgeExecution(opts.Judge.Execution)
+		if err != nil {
+			return Artifact{}, err
+		}
+		opts.Judge.Execution = execution
 	}
 	now := ctx.Now
 	if now == nil {
@@ -396,7 +442,11 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 		artifact.Scanners[scanner] = result
 	}
 	if opts.Judge != nil {
-		result, err := RunJudge(*opts.Judge, artifact, commandRunner, 20*time.Minute, env)
+		judgeRunner := commandRunner
+		if opts.Judge.Execution == JudgeExecutionHost {
+			judgeRunner = hostJudgeCommandRunner(opts, ctx, env)
+		}
+		result, err := RunJudge(*opts.Judge, artifact, judgeRunner, 20*time.Minute, env)
 		if err != nil {
 			return Artifact{}, err
 		}
@@ -1055,6 +1105,10 @@ type judgeShellSpec struct {
 }
 
 func RunJudge(opts JudgeOptions, artifact Artifact, commandRunner CommandRunner, timeout time.Duration, env map[string]string) (*JudgeResult, error) {
+	execution, err := NormalizeJudgeExecution(opts.Execution)
+	if err != nil {
+		return nil, err
+	}
 	workspace, err := os.MkdirTemp("", "clawscan-judge-*")
 	if err != nil {
 		return nil, err
@@ -1088,6 +1142,7 @@ func RunJudge(opts JudgeOptions, artifact Artifact, commandRunner CommandRunner,
 	}
 	result := &JudgeResult{
 		Status:           "completed",
+		Execution:        execution,
 		PromptPath:       state.promptSource,
 		OutputSchemaPath: state.schemaSource,
 		OutputPath:       state.outputPath,

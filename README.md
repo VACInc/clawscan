@@ -232,6 +232,15 @@ Supported `--judge` placeholders:
 | `{{ output_schema:<path> }}` | Copy a specific schema file and pass that file path. |
 | `{{ output }}` | File path where the judge should write its final JSON object. |
 
+For a host Codex CLI already authenticated with ChatGPT OAuth, use the built-in
+`clawhub-oauth` profile. Scanners remain in Docker; the host judge is ephemeral,
+can only read its staged workspace, and has network, web, apps, hooks, and
+subagents disabled:
+
+```bash
+VIRUSTOTAL_API_KEY=... clawscan ./my-skill --profile clawhub-oauth
+```
+
 ## Sandbox
 
 ClawScan runs command-backed scanners and judges in
