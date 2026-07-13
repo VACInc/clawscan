@@ -310,7 +310,7 @@ func TestJudgeWaitsForSubmittedVirusTotalResultWithoutReupload(t *testing.T) {
 	client := &recordingHTTPClient{responses: []*http.Response{
 		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
 		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"id":"analysis-id","type":"analysis"}}`))},
-		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
+		{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"QuotaExceededError"}}`))},
 		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"attributes":{"last_analysis_stats":{"malicious":0,"suspicious":0,"undetected":72}}}}`))},
 	}}
 	judge := &recordingCommandRunner{writeOutput: `{"verdict":"benign"}`}
@@ -365,7 +365,7 @@ func TestJudgeIsBlockedWhenVirusTotalPollFails(t *testing.T) {
 	client := &recordingHTTPClient{responses: []*http.Response{
 		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
 		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"id":"analysis-id","type":"analysis"}}`))},
-		{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"QuotaExceededError"}}`))},
+		{StatusCode: http.StatusInternalServerError, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"InternalError"}}`))},
 	}}
 	judge := &recordingCommandRunner{writeOutput: `{"verdict":"benign"}`}
 	opts, err := ParseArgs([]string{
@@ -395,7 +395,7 @@ func TestJudgeIsBlockedWhenVirusTotalPollFails(t *testing.T) {
 	if len(judge.calls) != 0 {
 		t.Fatalf("judge unexpectedly ran: %#v", judge.calls)
 	}
-	if result := artifact.Scanners["virustotal"]; result.Status != "failed" || !strings.Contains(result.Error, "HTTP 429") {
+	if result := artifact.Scanners["virustotal"]; result.Status != "failed" || !strings.Contains(result.Error, "HTTP 500") {
 		t.Fatalf("VirusTotal result = %#v", result)
 	}
 }

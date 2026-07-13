@@ -153,7 +153,10 @@ func (runner ExternalScannerRunner) waitForVirusTotal(target string, current Sca
 				current.Error = ""
 				return current
 			}
-		case statusCode == http.StatusNotFound:
+		case statusCode == http.StatusNotFound || statusCode == http.StatusTooManyRequests:
+			// A file report remains absent while analysis is pending. Public API
+			// quota responses are also transient here: retain the submitted
+			// receipt and retry on the same bounded cadence instead of re-uploading.
 			previous.CheckedAt = time.Now().UnixMilli()
 			pending, marshalErr := json.Marshal(previous)
 			if marshalErr != nil {
