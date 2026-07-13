@@ -66,7 +66,6 @@ type MatrixVariant struct {
 	ID                    string      `yaml:"id"`
 	Model                 ModelConfig `yaml:"model"`
 	ControlPlaneAddresses []string    `yaml:"controlPlaneAddresses"`
-	TimeoutSeconds        int         `yaml:"timeoutSeconds"`
 }
 
 type ExecutorConfig struct {
@@ -360,9 +359,6 @@ func (config Config) VariantConfig(variant MatrixVariant) Config {
 	if len(variant.ControlPlaneAddresses) != 0 {
 		effective.Runtime.ControlPlaneAddresses = append([]string(nil), variant.ControlPlaneAddresses...)
 	}
-	if variant.TimeoutSeconds != 0 {
-		effective.Runtime.TimeoutSeconds = variant.TimeoutSeconds
-	}
 	return effective
 }
 
@@ -379,6 +375,7 @@ func (config Config) validateMatrix() error {
 	}
 	seenID := map[string]bool{}
 	seenDigest := map[string]string{}
+	fixedReceipts := matrixInvariantReceipts(config)
 	for _, variant := range variants {
 		if !matrixVariantIDPattern.MatchString(variant.ID) {
 			return fmt.Errorf("matrix variant id must be a stable label of at most 64 URL-safe characters: %q", variant.ID)
@@ -388,12 +385,12 @@ func (config Config) validateMatrix() error {
 			return fmt.Errorf("matrix variant ids must be unique and unambiguous: %q", variant.ID)
 		}
 		seenID[normalizedID] = true
-		if variant.TimeoutSeconds < 0 {
-			return fmt.Errorf("matrix variant %q timeoutSeconds must not be negative", variant.ID)
-		}
 		effective := config.VariantConfig(variant)
 		if err := effective.Validate(); err != nil {
 			return fmt.Errorf("matrix variant %q: %w", variant.ID, err)
+		}
+		if got := matrixInvariantReceipts(effective); got != fixedReceipts {
+			return fmt.Errorf("matrix variant %q changes configuration outside the documented model and endpoint axes", variant.ID)
 		}
 		digest := captureConfigSHA256(effective)
 		if other, ok := seenDigest[digest]; ok {

@@ -119,11 +119,15 @@ model/runtime variants. The matrix never changes the default: a plain
 `observatory scan` always uses the single `runtime.model`, even when a `matrix`
 block is present. Only the `matrix` subcommand reads the variants.
 
-Define variants as sparse overrides of the base model/runtime; unset fields
-inherit. Between 2 and 8 variants are allowed. Each variant needs a unique,
-stable `id` and a distinct effective configuration — two ids for the same
-effective config, or two variants that resolve to the same capture digest, are
-rejected as ambiguous rather than silently merged.
+Define variants as sparse overrides of the base model and its endpoint
+allowlist; unset fields inherit. The only variant fields are `model` (`provider`,
+`baseUrl`, `id`, `api`, `contextWindow`, and `maxTokens`) and
+`controlPlaneAddresses`. Runtime timeout, OpenClaw command, agent user,
+executor, isolation, exercise prompt, target lineage, and every staging and
+resource limit remain fixed. Between 2 and 8 variants are allowed. Each variant
+needs a unique, stable `id` and a distinct effective configuration — two ids for
+the same effective config, or two variants that resolve to the same capture
+digest, are rejected as ambiguous rather than silently merged.
 
 ```yaml
 matrix:
@@ -136,7 +140,8 @@ matrix:
 ```
 
 Because a matrix multiplies resource use, the resource multiplier is always
-shown before any VM is provisioned, and `--dry-run` prints the plan (multiplier,
+shown before any VM is provisioned, and `--dry-run` securely inspects the local
+target and prints the exact plan (target and fixed-config receipts, multiplier,
 fresh-VM count, worst-case wall clock, and per-variant model/endpoint class and
 capture digest) without provisioning anything:
 
@@ -155,6 +160,12 @@ otherwise the whole matrix runs and per-variant status is reported.
 ./bin/observatory matrix --config ./observatory.yml --output ./matrix ./path/to/target
 ```
 
+`--output` is a no-clobber publication. The destination must not already exist.
+Observatory rejects symbolic links and unsafe path ancestors, writes every file
+with owner-only permissions in a private staging directory, syncs the files and
+directory, then atomically publishes the complete directory and syncs its
+parent. A failed or concurrent writer never truncates an existing file.
+
 The output is `observatory.matrix.v1`: a structured, side-by-side comparison of
 grade-ready behavioral signals. Each variant carries its bound
 `captureConfigSha256`, model receipt (provider, id, endpoint class), firewall
@@ -166,6 +177,15 @@ captures that differ in anything other than the model/runtime axis, and lists
 incomplete or failed variants under `excluded` with a reason category. It never
 labels an incomparable capture as a behavioral difference, and it carries no
 verdict, score, or recommendation.
+
+The comparison also publishes an aggregate fixed-configuration receipt plus
+separate target, executor, isolation, runtime-constant, exercise, and resource
+limit receipts. Every input capture digest is recomputed from its exact
+effective configuration, and its model, prompt, firewall policy, isolation,
+executor, and target-lineage receipts must match before comparison. The current
+evidence schema has no grade or stage-delta receipt, so the matrix does not
+infer either one. Those signals belong at the same receipt-binding boundary
+only after an evidence schema supplies them.
 
 ## Isolation contract
 

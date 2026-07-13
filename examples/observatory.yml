@@ -62,11 +62,12 @@ limits:
 # Optional, opt-in model/runtime comparison matrix. Leave it out for the normal
 # default: exactly one model and one paired scan. When present, only the
 # `observatory matrix` subcommand runs it; a plain `observatory scan` still uses
-# the single `runtime.model` above. Each variant is a sparse override of the base
-# model/runtime; unset fields inherit. Every variant runs as its own fresh-VM
-# paired scan, sequentially. Give each variant a distinct model/runtime override
-# and a unique id; two ids for the same effective config are rejected as
-# ambiguous. Between 2 and 8 variants are allowed. Run
+# the single `runtime.model` above. Each variant may override only the base model
+# fields and `controlPlaneAddresses`; timeout, isolation, prompt, target staging,
+# and resource limits stay fixed. Unset model fields inherit. Every variant runs
+# as its own fresh-VM paired scan, sequentially. Give each variant a distinct
+# model/endpoint override and a unique id; two ids for the same effective config
+# are rejected as ambiguous. Between 2 and 8 variants are allowed. Run
 # `observatory matrix --dry-run <target>` to see the resource multiplier first.
 #matrix:
 #  variants:

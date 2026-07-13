@@ -40,11 +40,16 @@ matrix:
 	return configPath
 }
 
+func matrixCommandTarget() string {
+	return filepath.Join("..", "..", "testdata", "fixtures", "probe-skill")
+}
+
 func TestMatrixCommandDryRunShowsMultiplier(t *testing.T) {
 	configPath := writeMatrixConfig(t)
+	output := filepath.Join(t.TempDir(), "must-not-exist")
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	err := run(context.Background(), []string{"matrix", "--config", configPath, "--dry-run", "./target"}, stdout, stderr)
+	err := run(context.Background(), []string{"matrix", "--config", configPath, "--dry-run", "--output", output, matrixCommandTarget()}, stdout, stderr)
 	if err != nil {
 		t.Fatalf("dry run err = %v (stderr=%s)", err, stderr.String())
 	}
@@ -58,6 +63,27 @@ func TestMatrixCommandDryRunShowsMultiplier(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "matrix plan") || !strings.Contains(stderr.String(), "2x") {
 		t.Fatalf("stderr missing plan summary:\n%s", stderr.String())
+	}
+	if _, err := os.Lstat(output); !os.IsNotExist(err) {
+		t.Fatalf("dry run touched output path: %v", err)
+	}
+}
+
+func TestMatrixCommandRejectsUndocumentedTimeoutAxis(t *testing.T) {
+	configPath := writeMatrixConfig(t)
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modified := strings.Replace(string(data), "    - id: model-a\n      model:", "    - id: model-a\n      timeoutSeconds: 30\n      model:", 1)
+	if err := os.WriteFile(configPath, []byte(modified), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	err = run(context.Background(), []string{"matrix", "--config", configPath, "--dry-run", matrixCommandTarget()}, stdout, stderr)
+	if err == nil || !strings.Contains(err.Error(), "timeoutSeconds") || !strings.Contains(err.Error(), "field") {
+		t.Fatalf("err = %v", err)
 	}
 }
 

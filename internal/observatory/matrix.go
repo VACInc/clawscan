@@ -2,6 +2,7 @@ package observatory
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ const (
 // reported as a class, never as raw addresses.
 type MatrixPlan struct {
 	Schema                    string              `json:"schema"`
+	FixedConfigSHA256         string              `json:"fixedConfigSha256"`
+	TargetSHA256              string              `json:"targetSha256"`
 	VariantCount              int                 `json:"variantCount"`
 	ResourceMultiplier        int                 `json:"resourceMultiplier"`
 	FreshVMsProvisioned       int                 `json:"freshVmsProvisioned"`
@@ -41,30 +44,45 @@ type MatrixPlanVariant struct {
 	CaptureConfigSHA256 string `json:"captureConfigSha256"`
 }
 
-// BuildMatrixPlan validates the matrix and describes what running it would cost.
-// It never provisions anything.
-func BuildMatrixPlan(config Config) (MatrixPlan, error) {
+// BuildMatrixPlan validates the matrix, securely inspects the local target, and
+// describes what running it would cost. It never provisions anything. Target
+// inspection is required so target-aware default prompts and capture receipts
+// in a dry-run plan are the exact values a real scan will bind.
+func BuildMatrixPlan(target string, config Config) (MatrixPlan, error) {
 	if len(config.Matrix.Variants) == 0 {
 		return MatrixPlan{}, errors.New("no matrix.variants are defined in the configuration")
 	}
 	if err := config.validateMatrix(); err != nil {
 		return MatrixPlan{}, err
 	}
+	staged, err := InspectTarget(target, config.Limits)
+	if err != nil {
+		return MatrixPlan{}, fmt.Errorf("inspect matrix target for deterministic plan: %w", err)
+	}
+	baseEffective, err := effectiveConfigForTarget(config, staged.Evidence)
+	if err != nil {
+		return MatrixPlan{}, err
+	}
 	plan := MatrixPlan{
 		Schema:              MatrixPlanSchema,
+		FixedConfigSHA256:   matrixInvariantReceipts(baseEffective).FixedConfigSHA256,
+		TargetSHA256:        staged.Evidence.SHA256,
 		VariantCount:        len(config.Matrix.Variants),
 		ResourceMultiplier:  len(config.Matrix.Variants),
 		FreshVMsProvisioned: len(config.Matrix.Variants),
 		Execution:           "sequential",
 	}
 	for _, variant := range config.Matrix.Variants {
-		effective := config.VariantConfig(variant)
+		effective, err := effectiveConfigForTarget(config.VariantConfig(variant), staged.Evidence)
+		if err != nil {
+			return MatrixPlan{}, fmt.Errorf("matrix variant %q: %w", variant.ID, err)
+		}
 		plan.Variants = append(plan.Variants, MatrixPlanVariant{
 			ID:                  variant.ID,
 			ModelProvider:       effective.Runtime.Model.Provider,
 			ModelID:             effective.Runtime.Model.ID,
 			ModelEndpointClass:  modelEndpointClass(effective.Runtime.Model.BaseURL),
-			TimeoutSeconds:      effective.Runtime.TimeoutSeconds,
+			TimeoutSeconds:      config.Runtime.TimeoutSeconds,
 			CaptureConfigSHA256: captureConfigSHA256(effective),
 		})
 		// Mirror the host-side per-scan budget used in Scan so the worst-case
@@ -79,6 +97,7 @@ func (plan MatrixPlan) Summary() string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "matrix plan: %d variants, %s, %d fresh VM(s) — %dx the resources of a single default scan\n",
 		plan.VariantCount, plan.Execution, plan.FreshVMsProvisioned, plan.ResourceMultiplier)
+	fmt.Fprintf(&builder, "target: %s fixed-config: %s\n", plan.TargetSHA256, plan.FixedConfigSHA256)
 	fmt.Fprintf(&builder, "worst-case wall clock: ~%ds (sum of per-variant budgets)\n", plan.WorstCaseWallClockSeconds)
 	for _, variant := range plan.Variants {
 		fmt.Fprintf(&builder, "  - %s: model %s/%s endpoint=%s timeout=%ds %s\n",
@@ -121,7 +140,7 @@ type MatrixResult struct {
 // captures. Incomplete or failed variants are recorded as excluded, never as
 // behavioral differences.
 func RunMatrix(ctx context.Context, target string, config Config, executor CommandExecutor, options MatrixOptions) (MatrixResult, error) {
-	plan, err := BuildMatrixPlan(config)
+	plan, err := BuildMatrixPlan(target, config)
 	if err != nil {
 		return MatrixResult{}, err
 	}
@@ -145,10 +164,16 @@ func RunMatrix(ctx context.Context, target string, config Config, executor Comma
 		run := MatrixRun{ID: variant.ID, RunDirectory: scanResult.RunDirectory}
 		if scanResult.Evidence.SchemaVersion != "" {
 			evidence := scanResult.Evidence
+			boundConfig, bindErr := effectiveConfigForTarget(effective, evidence.Target)
+			if bindErr != nil {
+				scanErr = errors.Join(scanErr, fmt.Errorf("bind matrix capture configuration: %w", bindErr))
+			}
 			run.Evidence = &evidence
 			run.Status = evidence.Run.Status
 			run.CaptureConfigSHA256 = evidence.CaptureConfigSHA256
-			inputs = append(inputs, MatrixComparisonInput{VariantID: variant.ID, Evidence: evidence})
+			if bindErr == nil {
+				inputs = append(inputs, MatrixComparisonInput{VariantID: variant.ID, Evidence: evidence, EffectiveConfig: &boundConfig})
+			}
 		} else {
 			run.Status = "failed"
 			failed = append(failed, MatrixExcludedVariant{ID: variant.ID, Reason: "capture-failed"})
@@ -177,17 +202,21 @@ func RunMatrix(ctx context.Context, target string, config Config, executor Comma
 	return result, nil
 }
 
-// MatrixComparisonInput pairs an operator label with a variant's evidence. The
-// label is optional; offline callers with only evidence files fall back to a
-// stable identity derived from the bound capture-config digest.
+// MatrixComparisonInput pairs an operator label and evidence with the exact
+// effective configuration whose digest the capture records. The configuration
+// is required so comparison can prove that every non-model axis is fixed and
+// that each model, prompt, isolation, firewall, and resource receipt is bound.
 type MatrixComparisonInput struct {
-	VariantID string
-	Evidence  Evidence
+	VariantID       string
+	Evidence        Evidence
+	EffectiveConfig *Config
 }
 
 // MatrixComparison is a structured, side-by-side comparison of grade-ready
 // behavioral signals across model/runtime variants that hold everything except
 // the model/runtime axis constant. It has no verdict, score, or recommendation.
+// Evidence v1 has no grade or stage-delta receipt, so neither is inferred here;
+// a later schema can add them at MatrixComparisonInput's receipt-binding seam.
 type MatrixComparison struct {
 	Schema       string                  `json:"schema"`
 	Target       MatrixTarget            `json:"target"`
@@ -212,12 +241,87 @@ type MatrixTarget struct {
 // MatrixConstants records the fields every compared variant shares. They are the
 // controlled variables that make the model/runtime axis the only difference.
 type MatrixConstants struct {
-	IsolationSubstrate   string `json:"isolationSubstrate"`
-	IsolationNetworkMode string `json:"isolationNetworkMode"`
-	ContainmentProfile   string `json:"containmentProfile"`
-	Verification         string `json:"verification"`
-	OpenClawVersion      string `json:"openclawVersion"`
-	StraceVersion        string `json:"straceVersion"`
+	CaptureProtocolRevision string `json:"captureProtocolRevision"`
+	FixedConfigSHA256       string `json:"fixedConfigSha256"`
+	TargetConfigSHA256      string `json:"targetConfigSha256"`
+	ExecutorConfigSHA256    string `json:"executorConfigSha256"`
+	IsolationConfigSHA256   string `json:"isolationConfigSha256"`
+	RuntimeConstantsSHA256  string `json:"runtimeConstantsSha256"`
+	ExerciseConfigSHA256    string `json:"exerciseConfigSha256"`
+	ResourceLimitsSHA256    string `json:"resourceLimitsSha256"`
+	IsolationSubstrate      string `json:"isolationSubstrate"`
+	IsolationNetworkMode    string `json:"isolationNetworkMode"`
+	ContainmentProfile      string `json:"containmentProfile"`
+	Verification            string `json:"verification"`
+	OpenClawVersion         string `json:"openclawVersion"`
+	StraceVersion           string `json:"straceVersion"`
+}
+
+// matrixConfigReceipts is the receipt-only projection of every capture setting
+// that matrix variants are forbidden to change. It deliberately excludes the
+// documented model and model-endpoint allowlist axes.
+type matrixConfigReceipts struct {
+	CaptureProtocolRevision string
+	FixedConfigSHA256       string
+	TargetConfigSHA256      string
+	ExecutorConfigSHA256    string
+	IsolationConfigSHA256   string
+	RuntimeConstantsSHA256  string
+	ExerciseConfigSHA256    string
+	ResourceLimitsSHA256    string
+}
+
+func matrixInvariantReceipts(config Config) matrixConfigReceipts {
+	target := struct {
+		TargetLineage string `json:"targetLineage"`
+	}{TargetLineage: config.TargetLineage}
+	executor := struct {
+		Kind string `json:"kind"`
+	}{Kind: config.Executor.Kind}
+	runtimeConstants := struct {
+		OpenClawCommand string `json:"openClawCommand"`
+		AgentUser       string `json:"agentUser"`
+		TimeoutSeconds  int    `json:"timeoutSeconds"`
+	}{
+		OpenClawCommand: config.Runtime.OpenClawCommand,
+		AgentUser:       config.Runtime.AgentUser,
+		TimeoutSeconds:  config.Runtime.TimeoutSeconds,
+	}
+	fixed := struct {
+		CaptureProtocolRevision string          `json:"captureProtocolRevision"`
+		Target                  any             `json:"target"`
+		Executor                any             `json:"executor"`
+		Isolation               IsolationConfig `json:"isolation"`
+		RuntimeConstants        any             `json:"runtimeConstants"`
+		Exercise                ExerciseConfig  `json:"exercise"`
+		Limits                  LimitsConfig    `json:"limits"`
+	}{
+		CaptureProtocolRevision: CaptureProtocolRevision,
+		Target:                  target,
+		Executor:                executor,
+		Isolation:               config.Isolation,
+		RuntimeConstants:        runtimeConstants,
+		Exercise:                config.Exercise,
+		Limits:                  config.Limits,
+	}
+	return matrixConfigReceipts{
+		CaptureProtocolRevision: CaptureProtocolRevision,
+		FixedConfigSHA256:       matrixDigest(fixed),
+		TargetConfigSHA256:      matrixDigest(target),
+		ExecutorConfigSHA256:    matrixDigest(executor),
+		IsolationConfigSHA256:   matrixDigest(config.Isolation),
+		RuntimeConstantsSHA256:  matrixDigest(runtimeConstants),
+		ExerciseConfigSHA256:    matrixDigest(config.Exercise),
+		ResourceLimitsSHA256:    matrixDigest(config.Limits),
+	}
+}
+
+func matrixDigest(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return digestBytes(data)
 }
 
 type MatrixVariantSummary struct {
@@ -278,6 +382,7 @@ func CompareMatrix(inputs []MatrixComparisonInput) (MatrixComparison, error) {
 	type variantEvidence struct {
 		id       string
 		evidence Evidence
+		receipts matrixConfigReceipts
 	}
 	seenID := map[string]bool{}
 	var complete []variantEvidence
@@ -295,19 +400,27 @@ func CompareMatrix(inputs []MatrixComparisonInput) (MatrixComparison, error) {
 			return MatrixComparison{}, fmt.Errorf("matrix comparison has a duplicate or ambiguous variant identity: %q", id)
 		}
 		seenID[normalized] = true
+		receipts, err := validateMatrixInputBinding(input)
+		if err != nil {
+			return MatrixComparison{}, fmt.Errorf("matrix comparison variant %q is not receipt-bound: %w", id, err)
+		}
 		if input.Evidence.Run.Status != "completed" {
 			excluded = append(excluded, MatrixExcludedVariant{ID: id, Reason: "incomplete-capture", CaptureConfigSHA256: input.Evidence.CaptureConfigSHA256})
 			continue
 		}
-		complete = append(complete, variantEvidence{id: id, evidence: input.Evidence})
+		complete = append(complete, variantEvidence{id: id, evidence: input.Evidence, receipts: receipts})
 	}
 	if len(complete) < MinMatrixVariants {
 		return MatrixComparison{}, fmt.Errorf("matrix comparison requires at least %d comparable complete captures; %d excluded", MinMatrixVariants, len(excluded))
 	}
 
 	reference := complete[0].evidence
+	referenceReceipts := complete[0].receipts
 	seenDigest := map[string]string{}
 	for _, variant := range complete {
+		if variant.receipts != referenceReceipts {
+			return MatrixComparison{}, fmt.Errorf("matrix comparison requires captures that differ only in model/runtime configuration, but fixed configuration receipts differ for variant %q", variant.id)
+		}
 		if field := matrixInvariantMismatch(reference, variant.evidence); field != "" {
 			return MatrixComparison{}, fmt.Errorf("matrix comparison requires captures that differ only in model/runtime configuration, but %s differs for variant %q", field, variant.id)
 		}
@@ -327,12 +440,20 @@ func CompareMatrix(inputs []MatrixComparisonInput) (MatrixComparison, error) {
 		TurnLimit:    reference.Exercise.TurnLimit,
 		Coverage:     reference.Coverage,
 		HeldConstant: MatrixConstants{
-			IsolationSubstrate:   reference.Run.Isolation.Substrate,
-			IsolationNetworkMode: reference.Run.Isolation.NetworkMode,
-			ContainmentProfile:   reference.Run.Isolation.ContainmentProfile,
-			Verification:         reference.Run.Isolation.Verification,
-			OpenClawVersion:      reference.Run.Runtime.OpenClawVersion,
-			StraceVersion:        reference.Run.Runtime.StraceVersion,
+			CaptureProtocolRevision: referenceReceipts.CaptureProtocolRevision,
+			FixedConfigSHA256:       referenceReceipts.FixedConfigSHA256,
+			TargetConfigSHA256:      referenceReceipts.TargetConfigSHA256,
+			ExecutorConfigSHA256:    referenceReceipts.ExecutorConfigSHA256,
+			IsolationConfigSHA256:   referenceReceipts.IsolationConfigSHA256,
+			RuntimeConstantsSHA256:  referenceReceipts.RuntimeConstantsSHA256,
+			ExerciseConfigSHA256:    referenceReceipts.ExerciseConfigSHA256,
+			ResourceLimitsSHA256:    referenceReceipts.ResourceLimitsSHA256,
+			IsolationSubstrate:      reference.Run.Isolation.Substrate,
+			IsolationNetworkMode:    reference.Run.Isolation.NetworkMode,
+			ContainmentProfile:      reference.Run.Isolation.ContainmentProfile,
+			Verification:            reference.Run.Isolation.Verification,
+			OpenClawVersion:         reference.Run.Runtime.OpenClawVersion,
+			StraceVersion:           reference.Run.Runtime.StraceVersion,
 		},
 		Excluded: excluded,
 		Signals:  []MatrixSignalRow{},
@@ -428,6 +549,46 @@ func matrixVariantIdentity(input MatrixComparisonInput) string {
 	return "config-" + digest
 }
 
+func validateMatrixInputBinding(input MatrixComparisonInput) (matrixConfigReceipts, error) {
+	if input.EffectiveConfig == nil {
+		return matrixConfigReceipts{}, errors.New("effective configuration is required")
+	}
+	config := *input.EffectiveConfig
+	if len(config.Matrix.Variants) != 0 {
+		return matrixConfigReceipts{}, errors.New("effective configuration must not carry a matrix block")
+	}
+	if err := config.Validate(); err != nil {
+		return matrixConfigReceipts{}, fmt.Errorf("effective configuration is invalid: %w", err)
+	}
+	evidence := input.Evidence
+	if expected := captureConfigSHA256(config); evidence.CaptureConfigSHA256 != expected {
+		return matrixConfigReceipts{}, fmt.Errorf("capture configuration digest %q does not match effective configuration %q", evidence.CaptureConfigSHA256, expected)
+	}
+	if evidence.Target.Lineage != config.TargetLineage {
+		return matrixConfigReceipts{}, errors.New("target lineage does not match effective configuration")
+	}
+	if evidence.Run.Executor != config.Executor.Kind {
+		return matrixConfigReceipts{}, errors.New("executor receipt does not match effective configuration")
+	}
+	if evidence.Run.Isolation.Substrate != config.Isolation.Substrate ||
+		evidence.Run.Isolation.NetworkMode != config.Isolation.NetworkMode ||
+		evidence.Run.Isolation.Verification != config.Isolation.Verification {
+		return matrixConfigReceipts{}, errors.New("isolation receipt does not match effective configuration")
+	}
+	if evidence.Run.Isolation.GuestFirewallPolicySHA256 != digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses))) {
+		return matrixConfigReceipts{}, errors.New("guest firewall policy receipt does not match the model endpoint allowlist")
+	}
+	if evidence.Run.Runtime.ModelProvider != config.Runtime.Model.Provider ||
+		evidence.Run.Runtime.ModelID != config.Runtime.Model.ID ||
+		evidence.Run.Runtime.ModelEndpoint != modelEndpointClass(config.Runtime.Model.BaseURL) {
+		return matrixConfigReceipts{}, errors.New("model receipt does not match effective configuration")
+	}
+	if evidence.Exercise.PromptSHA256 != digestBytes([]byte(config.Exercise.Prompt)) || evidence.Exercise.TurnLimit != config.Exercise.TurnLimit {
+		return matrixConfigReceipts{}, errors.New("exercise receipt does not match effective configuration")
+	}
+	return matrixInvariantReceipts(config), nil
+}
+
 func matrixInvariantMismatch(reference Evidence, other Evidence) string {
 	switch {
 	case reference.Target.SHA256 != other.Target.SHA256:
@@ -438,6 +599,8 @@ func matrixInvariantMismatch(reference Evidence, other Evidence) string {
 		return "target id"
 	case reference.Target.Lineage != other.Target.Lineage:
 		return "target lineage"
+	case !reflect.DeepEqual(reference.Target, other.Target):
+		return "target evidence"
 	case reference.Exercise.PromptSHA256 != other.Exercise.PromptSHA256:
 		return "exercise prompt"
 	case reference.Exercise.TurnLimit != other.Exercise.TurnLimit:

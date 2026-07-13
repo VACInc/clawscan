@@ -86,7 +86,7 @@ func runMatrix(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 	flags := flag.NewFlagSet("matrix", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", defaultConfigPath(), "Observatory YAML config")
-	output := flags.String("output", "", "directory for comparison.json and per-variant evidence")
+	output := flags.String("output", "", "new directory for comparison.json and per-variant evidence (must not exist)")
 	jsonOutput := flags.Bool("json", false, "write the comparison JSON to stdout")
 	dryRun := flags.Bool("dry-run", false, "show the resource multiplier and plan without provisioning any VM")
 	failFast := flags.Bool("fail-fast", false, "stop at the first variant that fails instead of running the whole matrix")
@@ -134,37 +134,6 @@ func runMatrix(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 		}
 	}
 	return runErr
-}
-
-func writeMatrixOutput(dir string, result observatory.MatrixResult) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if err := writeJSONFile(filepath.Join(dir, "comparison.json"), result.Comparison); err != nil {
-		return err
-	}
-	for _, run := range result.Runs {
-		if run.Evidence == nil {
-			continue
-		}
-		if err := writeEvidence(filepath.Join(dir, "variant-"+run.ID+".json"), *run.Evidence); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeJSONFile(path string, value any) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	encodeErr := encodeJSON(file, value)
-	closeErr := file.Close()
-	if encodeErr != nil {
-		return encodeErr
-	}
-	return closeErr
 }
 
 func runAnalyze(args []string, stdout io.Writer) error {
