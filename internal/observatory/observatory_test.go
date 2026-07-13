@@ -2069,9 +2069,14 @@ func fixtureEvidence() Evidence {
 			Isolation: IsolationEvidence{Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture", GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), ProxmoxTLSCASHA256: "sha256:" + strings.Repeat("a", 64), Verification: "fixture"},
 			Runtime:   RuntimeEvidence{OpenClawVersion: "OpenClaw fixture", StraceVersion: "strace fixture", ModelProvider: "local", ModelID: "fixture", ModelEndpoint: "private"},
 		},
-		Exercise:       ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
-		Observations:   []Observation{},
-		Canaries:       []CanaryObservation{{ID: "cloud-credentials", Surface: "home file", Class: "credential", Stages: []CanaryStageInteraction{}}},
+		Exercise:     ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
+		Observations: []Observation{},
+		Canaries: []CanaryObservation{
+			{ID: "cloud-credentials", Surface: "home file", Class: "credential", Stages: []CanaryStageInteraction{}},
+			{ID: "openclaw-credentials", Surface: "state file", Class: "credential", Stages: []CanaryStageInteraction{}},
+			{ID: "workspace-identity", Surface: "workspace file", Class: "identity", Stages: []CanaryStageInteraction{}},
+			{ID: "workspace-memory", Surface: "workspace file", Class: "memory", Stages: []CanaryStageInteraction{}},
+		},
 		RedirectProbes: []RedirectProbeObservation{{ID: "workspace-note-egress", Surface: "workspace note", Vector: "network", ReadExercise: 1, ReadDelta: 1, Escalation: "read", Attributed: "read", Exercised: true}},
 		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
 		Coverage: CoverageEvidence{

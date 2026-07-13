@@ -7,7 +7,10 @@ evidence. Both the standalone CLI and the Clawscan `behavior` adapter accept
 skills and native OpenClaw plugins; Clawscan classifies a target directory that
 holds `openclaw.plugin.json` as a plugin and passes it straight to Observatory.
 Skill-only scanners return a clear skipped result for plugin targets.
-The schema intentionally has no verdict, score, or recommendation.
+The `observatory.behavior.v2` schema intentionally has no verdict, score, or
+recommendation. A separate, derived `observatory.grade.v2` projection adds a
+deterministic behavioral grade without changing that; see
+[Behavioral grade](#behavioral-grade).
 Canonical public evidence is capped at 64 MiB; generation and rendering enforce
 the same bound. When rendering from a full multi-scanner Clawscan artifact, the
 outer artifact has a separate 256 MiB input cap and the embedded behavior
@@ -206,6 +209,172 @@ the scan.
 The section never claims exhaustive host persistence detection, carries no
 verdict, and a persistence-surface write is a behavioral observation, not proof
 of intent.
+
+## Behavioral grade
+
+Every scan also returns a deterministic behavioral grade derived from the same
+evidence. The grade is a separate artifact (`observatory.grade.v2`), never a
+field inside `observatory.behavior.v2`: the raw evidence stays pure observation,
+and the grade is a versioned projection you can reproduce from that evidence
+alone.
+
+Example summary:
+
+```
+grade: F (policy observatory.grade-policy.v2, confidence moderate, coverage complete)
+```
+
+Standalone grade outputs are secure, create-only artifacts. Observatory creates
+missing parent directories with owner-only permissions and refuses an existing
+destination, final symlink, hardlink, FIFO, or symlinked ancestor. Choose a new
+path for every export rather than relying on an implicit overwrite. Secure file
+publication is atomic and no-replace. Filesystems without unnamed temporary-file
+support use a random owner-only staging file only inside a non-group/world-
+writable directory. A failed named fallback reports and retains that staging
+file for explicit operator recovery rather than silently deleting data. File
+export currently requires a Linux control host because other platforms lack the
+reviewed descriptor-relative, no-follow ancestor walk; JSON output to stdout
+remains cross-platform and file export fails closed rather than using a weaker
+fallback.
+
+`observatory render` computes the grade, shows it on the dark page (letter,
+per-dimension severities, escalators, and the declared-vs-observed comparison),
+and writes `grade.json` into the output directory.
+
+Because the grade is a pure function of the evidence, it is not baked into the
+Clawscan `behavior` scanner's raw output; that adapter stays evidence-only. Run
+`observatory grade` or `observatory render` on the preserved evidence to obtain
+the grade.
+
+### Grade shape (`observatory.grade.v2`)
+
+- `grade`: `A`–`F` when `graded` is true, or the sentinel `ungraded`;
+- `graded`: false for an incomplete capture or a missing, malformed, truncated,
+  or non-authoritative mandatory channel, which is never assigned a letter;
+- `confidence` and `coverage`: reported separately from the letter — an `A` with
+  `moderate` confidence means "nothing concerning was seen, but coverage or the
+  declaration was thin," never "certainly safe";
+- `dimensions`: per-facet severity, letter, reasons, and evidence references;
+- `escalators`: hard escalators that cap the grade at F on their own;
+- `declaredVsObserved`: the capability comparison;
+- `evidenceRef`: the full canonical evidence digest, normalized typed-signal
+  projection digest, and capture/target/run identity of the exact inputs this
+  grade scored;
+- `coverage.channels`: fixed-order, machine-readable availability,
+  completeness, truncation, authority, and requirement state for every grading
+  channel.
+
+### Access is not leakage
+
+The policy is deliberately calibrated so that **access is not exfiltration**.
+Touching a planted secret, reading a credential path, or reaching an external
+endpoint is concerning *access* evidence, but the base capture has no payload
+attribution — it cannot prove a value left. The hard, F-capping escalators are
+therefore reserved for **confirmed** outcomes:
+
+- **confirmed value propagation** — a synthetic-canary value observed on an
+  authoritative outbound/exec channel, controlled mock-egress receipt, or
+  outbound/execute canary stage;
+- **successful persistence** — typed lifecycle evidence whose outcome is
+  `succeeded` and whose post-exercise residual is `confirmed`;
+- **instruction redirection** — an exercised redirect probe with a positive,
+  attributed `deviated` delta.
+
+A successful `open-for-write` proves only that the process acquired a file
+descriptor with write intent. It does not prove bytes changed or that a change
+survived the exercise, so it is elevated (D) at most and never fires the
+persistence escalator by itself. Likewise, tool-call ledger rows are
+supplemental metadata. They never independently prove propagation, change a
+severity, or fire an escalator.
+
+Everything else caps at elevated (D) or below.
+
+### Policy dimensions and severities
+
+Severity maps to letters: `none`→A, `low`→B, `moderate`→C, `elevated`→D,
+`critical`→F. The overall letter is the worst assessed dimension.
+
+| Dimension | Severity guide |
+| --- | --- |
+| Synthetic canary exposure | access = moderate (C); copy into an observed subject = elevated (D); **confirmed propagation = F** |
+| Sensitive resource access | successful secret access = moderate (C); blocked attempt or undeclared access = elevated (D) |
+| Persistence | non-workspace or persistence-surface write intent without a confirmed residual = elevated (D); **typed confirmed residual persistence = F** |
+| Network egress | private reach = moderate (C); external reach, blocked attempt, or undeclared = elevated (D) |
+| Containment-boundary attempts | any blocked boundary crossing = elevated (D) |
+| Instruction redirection | **typed redirect signal = F**; otherwise not assessed |
+| Declared vs. observed | undeclared sensitive/outbound/persistence = elevated (D); undeclared plain read/write = moderate (C) |
+
+Containment-boundary **attempts** (activity containment dropped) are represented
+and elevate the grade to at least D even though nothing left the VM.
+
+### Typed signal boundary
+
+Independent evidence stages integrate through `GradeEvidenceWithSignals`. Its
+neutral `GradeSignals` boundary consumes validated persistence lifecycle
+findings, redirect probes, controlled mock-egress receipts, canary stages, and
+tool-ledger coverage without coupling the policy to capture implementation
+types. The mapping and authority rules are documented in
+[`observatory-grading-integration.md`](observatory-grading-integration.md).
+
+Typed persistence is F only for `succeeded` plus residual `confirmed`. Redirect
+is F only for an exercised, attributed positive `deviated` delta. Mock egress is
+D for sink traffic and F only when its cleartext receipt attributes a planted
+canary. Canary `read` is C, `write` or `agent-output` is D, and `execute` or
+`outbound` is F. The limited `tool` stage and the tool-call ledger remain
+supplemental and cannot independently fire an escalator.
+
+The instruction-redirection dimension is optional for legacy evidence. Once a
+capture protocol declares the redirect channel mandatory, missing, malformed,
+or incomplete probe evidence makes the entire grade `ungraded`.
+
+### Declared vs. observed
+
+The comparison projects a target's own declared permissions and its observed
+behavior onto one conservative taxonomy: `filesystem-read`, `filesystem-write`,
+`credential-access`, `network`, `process-exec`, `persistence`. Declarations are
+parsed from a plugin manifest (`permissions` or `contracts.permissions`) or skill
+frontmatter (`permissions`).
+
+Honesty rules protect against dishonest certainty in both directions:
+
+- **present + not covered** → `undeclared`: elevates the relevant dimension to D
+  (a present-but-dishonest declaration grades above an honest one) but is never a
+  hard F on its own;
+- **present but broad** (for example `filesystem-read` covering a credential
+  read) → `declared-broad`: no elevation, lowered confidence;
+- **absent** → `indeterminate`: the observed behavior is still graded on its own
+  merits, but no "undeclared" claim is made and confidence drops.
+
+An absent or vague declaration never manufactures an F, and honesty never turns
+access into exfiltration. A declared credential read is concerning evidence (C),
+not a hard failure; only confirmed outward propagation of the value is F.
+
+### Incomplete captures
+
+If the capture is incomplete — a nonzero lane exit, unpaired baseline/exercise
+traces, a missing syscall family, an incomplete four-canary set, or an unusable
+mandatory typed channel — the grade is `ungraded` with
+`graded: false` and a reason string. Any escalator-level signals that were
+observed are still surfaced as provisional, but no letter is assigned, because
+deltas from an unpaired capture are unreliable.
+
+### Schema and migration notes
+
+- Artifact schema `observatory.grade.v2`; policy version
+  `observatory.grade-policy.v2`. Version 2 binds the full evidence digest,
+  exposes per-channel coverage, fails closed on mandatory channel gaps, makes
+  tool-ledger evidence supplemental, and requires typed residual proof for
+  successful persistence. Bump the policy version whenever severities,
+  dimensions, escalators, taxonomy, or aggregation change so grades from
+  different policies stay distinguishable.
+- `observatory.behavior.v2` carries the optional, backward-compatible field
+  `target.declaredCapabilities`. Older evidence without it still validates and
+  still grades (the comparison is `indeterminate`). This is declaration lineage,
+  not a verdict; the evidence schema still has no grade, score, or recommendation
+  field.
+- The grade is reproducible: the same evidence and policy version always produce
+  the same grade. Persist `evidence.json` to re-grade later, including across
+  policy upgrades for comparison.
 
 ## Isolation contract
 

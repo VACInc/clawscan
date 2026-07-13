@@ -36,9 +36,11 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
 	case "analyze":
-		return runAnalyze(args[1:], stdout)
+		return runAnalyze(args[1:], stdout, stderr)
 	case "render":
 		return runRender(args[1:], stdout)
+	case "grade":
+		return runGrade(args[1:], stdout)
 	case "validate-config":
 		return runValidateConfig(args[1:], stdout)
 	default:
@@ -51,12 +53,13 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", defaultConfigPath(), "Observatory YAML config")
 	output := flags.String("output", "", "write evidence JSON to a file")
+	gradeOutput := flags.String("grade-output", "", "write the derived grade JSON to a file")
 	jsonOutput := flags.Bool("json", false, "write evidence JSON to stdout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
-		return errors.New("usage: observatory scan [--config path] [--json] <target>")
+		return errors.New("usage: observatory scan [--config path] [--json] [--grade-output path] <target>")
 	}
 	config, err := observatory.LoadConfig(*configPath)
 	if err != nil {
@@ -64,15 +67,24 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	}
 	result, err := observatory.Scan(ctx, flags.Arg(0), config, nil)
 	hasEvidence := result.Evidence.SchemaVersion != ""
-	if hasEvidence && *output != "" {
-		if err := writeEvidence(*output, result.Evidence); err != nil {
-			return err
-		}
+	evidenceOutput := ""
+	if hasEvidence {
+		evidenceOutput = *output
+	}
+	gradeArtifactOutput := ""
+	if result.Grade.SchemaVersion != "" {
+		gradeArtifactOutput = *gradeOutput
+	}
+	if err := writeArtifactFiles(evidenceOutput, result.Evidence, gradeArtifactOutput, result.Grade); err != nil {
+		return err
 	}
 	if hasEvidence && (*jsonOutput || *output == "") {
 		if err := encodeJSON(stdout, result.Evidence); err != nil {
 			return err
 		}
+	}
+	if result.Grade.SchemaVersion != "" {
+		fmt.Fprintln(stderr, gradeSummaryLine(result.Grade))
 	}
 	if result.RunDirectory != "" {
 		fmt.Fprintf(stderr, "run_directory: %s\n", result.RunDirectory)
@@ -80,18 +92,19 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	return err
 }
 
-func runAnalyze(args []string, stdout io.Writer) error {
+func runAnalyze(args []string, stdout io.Writer, stderr io.Writer) error {
 	flags := flag.NewFlagSet("analyze", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", defaultConfigPath(), "Observatory YAML config")
 	bundle := flags.String("bundle", "", "captured raw.tar.gz")
 	output := flags.String("output", "", "write evidence JSON to a file")
+	gradeOutput := flags.String("grade-output", "", "write the derived grade JSON to a file")
 	jsonOutput := flags.Bool("json", false, "write evidence JSON to stdout")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(*bundle) == "" {
-		return errors.New("usage: observatory analyze --config path --bundle raw.tar.gz [--json] <target>")
+		return errors.New("usage: observatory analyze --config path --bundle raw.tar.gz [--json] [--grade-output path] <target>")
 	}
 	config, err := observatory.LoadConfig(*configPath)
 	if err != nil {
@@ -101,17 +114,44 @@ func runAnalyze(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if *output != "" {
-		if err := writeEvidence(*output, evidence); err != nil {
-			return err
-		}
+	grade := observatory.GradeEvidenceWithSignals(evidence, observatory.GradeSignalsFromEvidence(evidence))
+	if err := observatory.ValidateGrade(grade); err != nil {
+		return err
 	}
+	if err := writeArtifactFiles(*output, evidence, *gradeOutput, grade); err != nil {
+		return err
+	}
+	fmt.Fprintln(stderr, gradeSummaryLine(grade))
 	if *jsonOutput || *output == "" {
 		return encodeJSON(stdout, evidence)
 	}
 	return nil
 }
 
+func runGrade(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("grade", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	input := flags.String("input", "", "Observatory or Clawscan evidence JSON")
+	output := flags.String("output", "", "write the grade JSON to a file instead of stdout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *input == "" {
+		return errors.New("usage: observatory grade --input evidence.json [--output grade.json]")
+	}
+	evidence, err := observatory.LoadEvidence(*input)
+	if err != nil {
+		return err
+	}
+	grade := observatory.GradeEvidenceWithSignals(evidence, observatory.GradeSignalsFromEvidence(evidence))
+	if err := observatory.ValidateGrade(grade); err != nil {
+		return err
+	}
+	if *output != "" {
+		return observatory.WriteGradeFile(*output, grade)
+	}
+	return encodeJSON(stdout, grade)
+}
 func runRender(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("render", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -192,6 +232,41 @@ func writeEvidence(path string, evidence observatory.Evidence) error {
 	return closeErr
 }
 
+func writeArtifactFiles(evidencePath string, evidence observatory.Evidence, gradePath string, grade observatory.Grade) error {
+	if evidencePath != "" && gradePath != "" {
+		evidenceAbsolute, err := filepath.Abs(evidencePath)
+		if err != nil {
+			return fmt.Errorf("resolve evidence output path: %w", err)
+		}
+		gradeAbsolute, err := filepath.Abs(gradePath)
+		if err != nil {
+			return fmt.Errorf("resolve grade output path: %w", err)
+		}
+		if filepath.Clean(evidenceAbsolute) == filepath.Clean(gradeAbsolute) {
+			return errors.New("evidence and grade outputs must be different paths")
+		}
+		if err := observatory.CheckGradeOutputAvailable(gradePath); err != nil {
+			return err
+		}
+	}
+	if evidencePath != "" {
+		if err := writeEvidence(evidencePath, evidence); err != nil {
+			return err
+		}
+	}
+	if gradePath != "" {
+		return observatory.WriteGradeFile(gradePath, grade)
+	}
+	return nil
+}
+
+func gradeSummaryLine(grade observatory.Grade) string {
+	letter := grade.Letter
+	if !grade.Graded {
+		letter = "ungraded"
+	}
+	return fmt.Sprintf("grade: %s (policy %s, confidence %s, coverage %s)", letter, grade.PolicyVersion, grade.Confidence.Level, grade.Coverage.Capture)
+}
 func encodeJSON(writer io.Writer, value any) error {
 	encoder := json.NewEncoder(writer)
 	encoder.SetIndent("", "  ")
@@ -201,11 +276,15 @@ func encodeJSON(writer io.Writer, value any) error {
 const helpText = `ClawHub Observatory — paired behavioral evidence for OpenClaw targets
 
 Usage:
-  observatory scan [--config path] [--json] <target>
-  observatory analyze --config path --bundle raw.tar.gz [--json] <target>
+  observatory scan [--config path] [--json] [--grade-output path] <target>
+  observatory analyze --config path --bundle raw.tar.gz [--json] [--grade-output path] <target>
+  observatory grade --input evidence.json [--output grade.json]
   observatory render --input evidence.json --output site [--previous evidence.json]
   observatory validate-config [--live] <config>
 
-The output is evidence, never a safety verdict. Live scans fail closed until the
-config attests a disposable Proxmox VM and an isolated deny/sinkhole network.
+The behavior evidence is observation, never a safety verdict. A scan also returns
+a deterministic behavioral grade (observatory.grade.v2) derived from that
+evidence; the grade scores observed behavioral risk within the covered exercise,
+not universal safety or author intent. Live scans fail closed until the config
+attests a disposable Proxmox VM and an isolated deny/sinkhole network.
 `

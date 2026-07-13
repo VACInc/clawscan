@@ -174,7 +174,16 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 ## After the MVP
 
 1. After explicit VM-teardown approval, validate the owned probe skill and probe plugin in the real isolated Proxmox lane.
-2. Add declared-capability input and observed-capability diffs for ClawHub RFC #2944.
+2. Declared-capability input, observed-capability diffs, and deterministic
+   behavioral grading are implemented as a derived, versioned projection (`observatory.grade.v2`,
+   policy `observatory.grade-policy.v2`): a deterministic A–F behavioral grade
+   with separate confidence/coverage, an explicit `ungraded` state, dimension
+   reasons, hard escalators, and a conservative declared-vs-observed comparison.
+   The grade is computed from `observatory.behavior.v1` evidence and is never a
+   field inside it, so the evidence stays pure observation. Version 2 binds the
+   full evidence digest, reports typed-channel coverage, fails closed on missing,
+   malformed, or truncated mandatory inputs, and requires confirmed residual
+   evidence before persistence can receive F. See `docs/observatory.md`.
 3. Add version-keyed storage and update diffs.
 4. Add catalog watching, bounded concurrency, retry policy, and private moderation routing.
 5. Publish a small pilot, then propose the adapter upstream with copied real-behavior proof.
