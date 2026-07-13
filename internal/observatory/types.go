@@ -180,8 +180,9 @@ type RuntimeTimelineEvent struct {
 // projected from OpenClaw's metadata-only audit ledger (tool.action started and
 // finished records), which by contract records identity, ordering, terminal
 // state, error code, and timing but never prompts, tool arguments, tool results,
-// command output, or raw error text. It is a genuine record of OpenClaw tool
-// activity, distinct from the RuntimeTimeline of underlying syscalls.
+// command output, or raw error text. It is supplemental OpenClaw tool metadata,
+// distinct from the independently captured RuntimeTimeline of underlying
+// syscalls; lane-owned audit rows are not a tamper-evident trust boundary.
 type ToolCallLedger struct {
 	Source            string               `json:"source"`
 	MaxCallsPerLane   int                  `json:"maxCallsPerLane"`

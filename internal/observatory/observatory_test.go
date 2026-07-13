@@ -1187,7 +1187,9 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 		`/bin/bash "$CONTROL/run-agent.sh"`, `install -m 0600 "$OUT/raw.tar.gz" "$DOWNLOAD_OUT/raw.tar.gz"`,
 		`local session="observatory-$RUN_ID"`,
 		"lane storage must be a bounded tmpfs",
-		"audit --agent observatory --kind tool_action --limit 500 --json",
+		`node "$audit_dir/export-tool-audit.mjs"`,
+		`ReadOnlyPaths=$root`, `ReadWritePaths=$audit_output`, "PrivateNetwork=yes",
+		"MemoryMax=134217728", "RuntimeMaxSec=20s", "LimitFSIZE=8388608",
 		"capture_tool_audit baseline",
 		"capture_tool_audit exercise",
 		`printf 'captured\n' > "$META/$lane-audit-status"`,
@@ -1199,6 +1201,9 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 	}
 	if strings.Contains(remoteRunScript, "timeout --signal=TERM") || !strings.Contains(remoteAgentScript, "ulimit -f") || !strings.Contains(remoteAgentScript, "strace -f -qq -s 0") || !strings.Contains(remoteAgentScript, "-ttt") {
 		t.Fatalf("remote capture bounds are incomplete")
+	}
+	if strings.Contains(remoteRunScript, "openclaw audit") {
+		t.Fatal("remote capture must not invoke OpenClaw to export its audit database")
 	}
 	for _, syscall := range []string{"sendmmsg", "truncate", "ftruncate", "symlink", "symlinkat", "chdir", "fchdir", "clone", "clone3", "fork", "vfork", "unshare"} {
 		if !strings.Contains(remoteAgentScript, syscall) {
@@ -1427,19 +1432,19 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"exercise/trace":             exerciseTrace,
 		"baseline/agent.stdout":      "baseline\n",
 		"exercise/agent.stdout":      "exercise\n",
-		"baseline/audit.json":        `{"events":[]}` + "\n",
+		"baseline/audit.json":        `{"source":"openclaw-state-sqlite","maxCalls":4096,"events":[],"totalCalls":0,"truncated":false}` + "\n",
 		"exercise/audit.json":        fixtureToolAuditJSON(toolName),
 	}
 }
 
-// fixtureToolAuditJSON builds a newest-first AuditListResult with one completed
-// tool call (started+finished), matching how the CLI returns records.
+// fixtureToolAuditJSON builds a direct SQLite export with one completed tool
+// call (started+finished), matching the contained exporter's receipt.
 func fixtureToolAuditJSON(tool string) string {
 	events := []map[string]any{
 		{"eventId": "e2", "sequence": 2, "sourceSequence": 2, "occurredAt": 1000, "kind": "tool_action", "action": "tool.action.finished", "status": "succeeded", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
 		{"eventId": "e1", "sequence": 1, "sourceSequence": 1, "occurredAt": 900, "kind": "tool_action", "action": "tool.action.started", "status": "started", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
 	}
-	encoded, _ := json.Marshal(map[string]any{"events": events})
+	encoded, _ := json.Marshal(map[string]any{"source": toolAuditCaptureSource, "maxCalls": MaxToolCallsPerLane, "events": events, "totalCalls": 1, "truncated": false})
 	return string(encoded) + "\n"
 }
 
@@ -2012,7 +2017,22 @@ func auditLedgerBytes(events ...map[string]any) []byte {
 	if events == nil {
 		events = []map[string]any{}
 	}
-	data, _ := json.Marshal(map[string]any{"events": events})
+	groups := map[string]bool{}
+	for index, event := range events {
+		runID, _ := event["runId"].(string)
+		callID, _ := event["toolCallId"].(string)
+		if callID == "" {
+			callID = fmt.Sprintf("sequence:%v:%d", event["sequence"], index)
+		}
+		groups[runID+"\x00"+callID] = true
+	}
+	return auditLedgerBytesWithCoverage(events, len(groups), len(groups) > MaxToolCallsPerLane)
+}
+
+func auditLedgerBytesWithCoverage(events []map[string]any, total int, truncated bool) []byte {
+	data, _ := json.Marshal(map[string]any{
+		"source": toolAuditCaptureSource, "maxCalls": MaxToolCallsPerLane, "events": events, "totalCalls": total, "truncated": truncated,
+	})
 	return data
 }
 
@@ -2026,7 +2046,7 @@ func toolLaneFromEvents(t *testing.T, events ...map[string]any) ToolCallLane {
 }
 
 func TestBuildToolCallLedgerClassifiesTerminalStatesAndTiming(t *testing.T) {
-	// Records arrive newest-first from the CLI; ordering is by ledger sequence.
+	// Records arrive newest-first from the exporter; ordering is by ledger sequence.
 	lane := toolLaneFromEvents(t,
 		auditFinishedEvent(8, 999, "c4", "fetch", "timed_out", "tool_timed_out"),
 		auditStartedEvent(7, 400, "c4", "fetch"),
@@ -2077,6 +2097,19 @@ func TestBuildToolCallLedgerMarksMissingTerminalIncomplete(t *testing.T) {
 	}
 }
 
+func TestBuildToolCallLedgerScopesCallIDsToRun(t *testing.T) {
+	firstStart := auditStartedEvent(1, 100, "reused", "read")
+	firstFinish := auditFinishedEvent(2, 150, "reused", "read", "succeeded", "")
+	secondStart := auditStartedEvent(3, 200, "reused", "write")
+	secondFinish := auditFinishedEvent(4, 250, "reused", "write", "succeeded", "")
+	secondStart["runId"] = "run-secret-second"
+	secondFinish["runId"] = "run-secret-second"
+	lane := toolLaneFromEvents(t, firstStart, firstFinish, secondStart, secondFinish)
+	if lane.Coverage != "complete" || lane.CallCount != 2 || lane.Calls[0].Tool != "read" || lane.Calls[1].Tool != "write" {
+		t.Fatalf("lane = %#v", lane)
+	}
+}
+
 func TestBuildToolCallLedgerNoToolLaneIsComplete(t *testing.T) {
 	lane := toolLaneFromEvents(t)
 	if lane.Coverage != "complete" || lane.CallCount != 0 || lane.TotalCalls != 0 || lane.Timed {
@@ -2088,7 +2121,7 @@ func TestBuildToolCallLedgerNoToolLaneIsComplete(t *testing.T) {
 }
 
 func TestBuildToolCallLedgerUnavailableLane(t *testing.T) {
-	lane := buildToolCallLane("unavailable", nil)
+	lane := buildToolCallLane("unavailable", toolAuditCapture{})
 	if lane.Coverage != "unavailable" || lane.CallCount != 0 || lane.Timed || lane.DurationMs != nil {
 		t.Fatalf("unavailable lane = %#v", lane)
 	}
@@ -2106,12 +2139,51 @@ func TestBuildToolCallLedgerBoundsCallsPerLane(t *testing.T) {
 			auditStartedEvent(index*2+1, int64(index*2+1), call, "read"),
 			auditFinishedEvent(index*2+2, int64(index*2+2), call, "read", "succeeded", ""))
 	}
-	lane := toolLaneFromEvents(t, events...)
+	parsed, err := parseToolAuditLedger(auditLedgerBytesWithCoverage(events[:MaxToolCallsPerLane*2], total, true))
+	if err != nil {
+		t.Fatalf("parse bounded tool audit ledger: %v", err)
+	}
+	lane := buildToolCallLane("captured", parsed)
 	if lane.CallCount != MaxToolCallsPerLane || lane.TotalCalls != total || !lane.Truncated || lane.Coverage != "incomplete" {
 		t.Fatalf("bounded lane = callCount %d total %d truncated %v coverage %q", lane.CallCount, lane.TotalCalls, lane.Truncated, lane.Coverage)
 	}
 	if lane.Calls[len(lane.Calls)-1].Sequence != MaxToolCallsPerLane {
 		t.Fatalf("final sequence = %d", lane.Calls[len(lane.Calls)-1].Sequence)
+	}
+}
+
+func TestParseToolAuditLedgerRejectsInconsistentOrAmbiguousReceipts(t *testing.T) {
+	started := auditStartedEvent(1, 100, "c1", "read")
+	finished := auditFinishedEvent(2, 150, "c1", "read", "succeeded", "")
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "count mismatch", data: auditLedgerBytesWithCoverage([]map[string]any{started, finished}, 2, false)},
+		{name: "truncation mismatch", data: auditLedgerBytesWithCoverage([]map[string]any{started, finished}, 1, true)},
+		{name: "trailing value", data: append(auditLedgerBytes(started, finished), []byte(` {}`)...)},
+		{name: "duplicate lifecycle", data: auditLedgerBytesWithCoverage([]map[string]any{
+			started,
+			finished,
+			auditFinishedEvent(3, 175, "c1", "read", "succeeded", ""),
+		}, 1, false)},
+	}
+	unknown := map[string]any{}
+	if err := json.Unmarshal(auditLedgerBytes(started, finished), &unknown); err != nil {
+		t.Fatal(err)
+	}
+	unknown["unexpected"] = true
+	unknownData, _ := json.Marshal(unknown)
+	tests = append(tests, struct {
+		name string
+		data []byte
+	}{name: "unknown field", data: unknownData})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseToolAuditLedger(test.data); err == nil {
+				t.Fatal("malformed receipt was accepted")
+			}
+		})
 	}
 }
 
@@ -2133,7 +2205,7 @@ func TestBuildToolCallLedgerNeverPublishesRawIdentifiers(t *testing.T) {
 
 func TestBuildToolCallLedgerNormalizesUnsafeToolNames(t *testing.T) {
 	lane := toolLaneFromEvents(t,
-		auditStartedEvent(1, 100, "c1", "unknown"),
+		auditStartedEvent(1, 100, "c1", "not a safe/name"),
 		auditFinishedEvent(2, 150, "c1", "not a safe/name", "succeeded", ""),
 	)
 	if lane.Calls[0].Tool != "unknown" {
@@ -2189,6 +2261,136 @@ func TestReadCaptureBundleAcceptsUnavailableToolAudit(t *testing.T) {
 	if ledger.Exercise.Coverage != "unavailable" || ledger.Baseline.Coverage != "complete" {
 		t.Fatalf("ledger coverage baseline=%q exercise=%q", ledger.Baseline.Coverage, ledger.Exercise.Coverage)
 	}
+}
+
+func requireNodeSQLite(t *testing.T) string {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	command := exec.Command(node, "--no-warnings", "--input-type=module", "-e", `import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(":memory:"); db.close();`)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("node:sqlite is unavailable: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return node
+}
+
+func writeToolAuditFixtureDatabase(t *testing.T, node string, laneRoot string, calls int, fullSchema bool) string {
+	t.Helper()
+	sqliteDir := filepath.Join(laneRoot, "state", "state")
+	if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(sqliteDir, "openclaw.sqlite")
+	setupPath := filepath.Join(t.TempDir(), "setup-audit.mjs")
+	setup := `import { DatabaseSync } from "node:sqlite";
+const [databasePath, countArg, mode] = process.argv.slice(2);
+const database = new DatabaseSync(databasePath);
+if (mode !== "full") {
+  database.exec("CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY)");
+  database.close();
+  process.exit(0);
+}
+database.exec("CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL UNIQUE, schema_version INTEGER NOT NULL DEFAULT 1, source_sequence INTEGER NOT NULL, occurred_at INTEGER NOT NULL, kind TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, error_code TEXT, actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, agent_id TEXT, session_key TEXT, session_id TEXT, run_id TEXT, tool_call_id TEXT, tool_name TEXT, direction TEXT, channel TEXT, conversation_kind TEXT, message_outcome TEXT, reason_code TEXT, delivery_kind TEXT, failure_stage TEXT, duration_ms INTEGER, result_count INTEGER, account_ref TEXT, conversation_ref TEXT, message_ref TEXT, target_ref TEXT)");
+const insert = database.prepare("INSERT INTO audit_events (sequence,event_id,source_id,schema_version,source_sequence,occurred_at,kind,action,status,error_code,actor_type,actor_id,agent_id,run_id,tool_call_id,tool_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+const count = Number(countArg);
+database.exec("BEGIN");
+for (let index = 0; index < count; index++) {
+  const start = index * 2 + 1;
+  const finish = start + 1;
+  const call = "call-" + index;
+  insert.run(start, "event-" + start, "fixture-" + start, 1, start, 1000 + start, "tool_action", "tool.action.started", "started", null, "agent", "observatory", "observatory", "run-fixture", call, "read");
+  insert.run(finish, "event-" + finish, "fixture-" + finish, 1, finish, 1000 + finish, "tool_action", "tool.action.finished", "succeeded", null, "agent", "observatory", "observatory", "run-fixture", call, "read");
+}
+database.exec("COMMIT");
+database.close();
+`
+	if err := os.WriteFile(setupPath, []byte(setup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mode := "short"
+	if fullSchema {
+		mode = "full"
+	}
+	command := exec.Command(node, "--no-warnings", setupPath, databasePath, fmt.Sprint(calls), mode)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create audit fixture database: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return databasePath
+}
+
+func runToolAuditExporter(t *testing.T, node string, laneRoot string, maxCalls int) ([]byte, error) {
+	t.Helper()
+	exporterPath := filepath.Join(t.TempDir(), "export-tool-audit.mjs")
+	if err := os.WriteFile(exporterPath, []byte(toolAuditExportScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outputDir := filepath.Join(laneRoot, "audit-export")
+	if err := os.MkdirAll(outputDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(outputDir, "audit.json")
+	command := exec.Command(node, "--no-warnings", exporterPath, laneRoot, outputPath, "observatory", fmt.Sprint(maxCalls))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	payload, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func TestToolAuditExporterReadsCanonicalSQLiteWithExactCoverage(t *testing.T) {
+	node := requireNodeSQLite(t)
+	laneRoot := t.TempDir()
+	total := MaxToolCallsPerLane + 1
+	writeToolAuditFixtureDatabase(t, node, laneRoot, total, true)
+	payload, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, err := parseToolAuditLedger(payload)
+	if err != nil {
+		t.Fatalf("parse direct audit export: %v", err)
+	}
+	if capture.TotalCalls != total || !capture.Truncated || len(capture.Events) != MaxToolCallsPerLane*2 {
+		t.Fatalf("capture = total %d truncated %v events %d", capture.TotalCalls, capture.Truncated, len(capture.Events))
+	}
+	lane := buildToolCallLane("captured", capture)
+	if lane.CallCount != MaxToolCallsPerLane || lane.TotalCalls != total || !lane.Truncated || lane.Coverage != "incomplete" {
+		t.Fatalf("lane = %#v", lane)
+	}
+}
+
+func TestToolAuditExporterRejectsMalformedOrSymlinkedDatabase(t *testing.T) {
+	node := requireNodeSQLite(t)
+	t.Run("malformed schema", func(t *testing.T) {
+		laneRoot := t.TempDir()
+		writeToolAuditFixtureDatabase(t, node, laneRoot, 0, false)
+		output, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+		if err == nil || !strings.Contains(err.Error()+string(output), "missing required column") {
+			t.Fatalf("err = %v, output = %s", err, output)
+		}
+	})
+	t.Run("symlinked database", func(t *testing.T) {
+		externalRoot := t.TempDir()
+		externalDatabase := writeToolAuditFixtureDatabase(t, node, externalRoot, 1, true)
+		laneRoot := t.TempDir()
+		sqliteDir := filepath.Join(laneRoot, "state", "state")
+		if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(externalDatabase, filepath.Join(sqliteDir, "openclaw.sqlite")); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+		if err == nil || !strings.Contains(err.Error()+string(output), "non-symlink file") {
+			t.Fatalf("err = %v, output = %s", err, output)
+		}
+	})
 }
 
 func TestBuildEvidenceEmitsPairedToolCallLedger(t *testing.T) {

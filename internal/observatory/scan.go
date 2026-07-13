@@ -305,7 +305,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v16"
+const CaptureProtocolRevision = "observatory.capture-protocol.v17"
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -420,6 +420,9 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(runnerDir, "apply-target-modes.mjs"), []byte(applyTargetModesScript), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(runnerDir, "export-tool-audit.mjs"), []byte(toolAuditExportScript), 0o644); err != nil {
 		return err
 	}
 	targetModes := struct {

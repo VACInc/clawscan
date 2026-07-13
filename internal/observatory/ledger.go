@@ -1,41 +1,59 @@
 package observatory
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
 )
 
-// auditLedgerDocument mirrors OpenClaw's AuditListResult: a bounded newest-first
-// page of metadata-only audit records. Only the fields the observatory needs for
-// correlation and validation are modeled; the raw tool call id, run/session ids,
-// actor, and event id are parsed for internal use and never republished.
+// auditLedgerDocument is the strict receipt emitted by the contained, read-only
+// exporter for OpenClaw's canonical audit_events table. Raw tool call ids, run
+// ids, actor provenance, and event ids are parsed only for validation and
+// correlation, then discarded before public evidence is built.
 type auditLedgerDocument struct {
-	Events []auditEvent `json:"events"`
+	Source     string       `json:"source"`
+	MaxCalls   *int         `json:"maxCalls"`
+	Events     []auditEvent `json:"events"`
+	TotalCalls *int         `json:"totalCalls"`
+	Truncated  *bool        `json:"truncated"`
+}
+
+const (
+	toolAuditCaptureSource = "openclaw-state-sqlite"
+	toolAuditAgentID       = "observatory"
+)
+
+type toolAuditCapture struct {
+	Events     []auditEvent
+	TotalCalls int
+	Truncated  bool
+}
+
+type auditActor struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
 }
 
 type auditEvent struct {
-	EventID        string `json:"eventId"`
-	Sequence       int64  `json:"sequence"`
-	SourceSequence int64  `json:"sourceSequence"`
-	OccurredAt     int64  `json:"occurredAt"`
-	Kind           string `json:"kind"`
-	Action         string `json:"action"`
-	Status         string `json:"status"`
-	ErrorCode      string `json:"errorCode"`
-	AgentID        string `json:"agentId"`
-	RunID          string `json:"runId"`
-	ToolCallID     string `json:"toolCallId"`
-	ToolName       string `json:"toolName"`
-	Redaction      string `json:"redaction"`
-}
-
-var auditActions = map[string]bool{
-	"agent.run.started": true, "agent.run.finished": true,
-	"tool.action.started": true, "tool.action.finished": true,
+	EventID        string     `json:"eventId"`
+	Sequence       int64      `json:"sequence"`
+	SourceSequence int64      `json:"sourceSequence"`
+	OccurredAt     int64      `json:"occurredAt"`
+	Kind           string     `json:"kind"`
+	Action         string     `json:"action"`
+	Status         string     `json:"status"`
+	ErrorCode      string     `json:"errorCode"`
+	Actor          auditActor `json:"actor"`
+	AgentID        string     `json:"agentId"`
+	RunID          string     `json:"runId"`
+	ToolCallID     string     `json:"toolCallId"`
+	ToolName       string     `json:"toolName"`
+	Redaction      string     `json:"redaction"`
 }
 
 // argumentSummariesUnavailableReason is the explicit coverage the MVP publishes
@@ -46,32 +64,95 @@ const argumentSummariesUnavailableReason = "OpenClaw's metadata-only audit ledge
 var toolAuditWhitespace = regexp.MustCompile(`\s+`)
 
 // parseToolAuditLedger fails closed on a claimed-complete but malformed ledger.
-// It requires a JSON AuditListResult whose every record satisfies the metadata
-// contract (redaction marker, closed enums, positive sequences).
-func parseToolAuditLedger(data []byte) ([]auditEvent, error) {
+// It requires the direct export source, exact bound and coverage counts, plus
+// records satisfying the metadata contract (redaction marker, closed enums,
+// unique provenance, and positive sequences).
+func parseToolAuditLedger(data []byte) (toolAuditCapture, error) {
 	var document auditLedgerDocument
-	if err := json.Unmarshal(data, &document); err != nil {
-		return nil, fmt.Errorf("not valid AuditListResult JSON: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return toolAuditCapture{}, fmt.Errorf("not valid direct audit-export JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return toolAuditCapture{}, fmt.Errorf("not valid direct audit-export JSON: %w", err)
+	}
+	if document.Source != toolAuditCaptureSource {
+		return toolAuditCapture{}, errors.New("missing or unsupported audit export source")
+	}
+	if document.MaxCalls == nil || *document.MaxCalls != MaxToolCallsPerLane {
+		return toolAuditCapture{}, errors.New("missing or unsupported audit export call bound")
 	}
 	if document.Events == nil {
-		return nil, errors.New("missing events array")
+		return toolAuditCapture{}, errors.New("missing events array")
 	}
+	if document.TotalCalls == nil || document.Truncated == nil {
+		return toolAuditCapture{}, errors.New("missing audit export coverage counts")
+	}
+	if *document.TotalCalls < 0 {
+		return toolAuditCapture{}, errors.New("invalid total tool-call count")
+	}
+	if len(document.Events) > MaxToolCallsPerLane*2 {
+		return toolAuditCapture{}, errors.New("audit export exceeds the event bound")
+	}
+	eventIDs := make(map[string]bool, len(document.Events))
+	sequences := make(map[int64]bool, len(document.Events))
+	lifecycle := make(map[string]map[string]auditEvent)
 	for _, event := range document.Events {
 		if err := validateAuditEvent(event); err != nil {
-			return nil, err
+			return toolAuditCapture{}, err
+		}
+		if eventIDs[event.EventID] || sequences[event.Sequence] {
+			return toolAuditCapture{}, errors.New("audit export contains duplicate event provenance")
+		}
+		eventIDs[event.EventID] = true
+		sequences[event.Sequence] = true
+		key := event.RunID + "\x00" + event.ToolCallID
+		if event.ToolCallID == "" {
+			key = fmt.Sprintf("%s\x00sequence:%d", event.RunID, event.Sequence)
+		}
+		if lifecycle[key] == nil {
+			lifecycle[key] = map[string]auditEvent{}
+		}
+		if _, exists := lifecycle[key][event.Action]; exists {
+			return toolAuditCapture{}, errors.New("audit export contains duplicate tool lifecycle records")
+		}
+		lifecycle[key][event.Action] = event
+	}
+	for _, records := range lifecycle {
+		started, hasStarted := records["tool.action.started"]
+		finished, hasFinished := records["tool.action.finished"]
+		if hasStarted && hasFinished {
+			if started.Sequence >= finished.Sequence || started.OccurredAt > finished.OccurredAt {
+				return toolAuditCapture{}, errors.New("audit export contains an inverted tool lifecycle")
+			}
+			if started.ToolName != "" && finished.ToolName != "" && started.ToolName != finished.ToolName {
+				return toolAuditCapture{}, errors.New("audit export contains inconsistent tool identity")
+			}
 		}
 	}
-	return document.Events, nil
+	observed := len(lifecycle)
+	expected := *document.TotalCalls
+	if expected > MaxToolCallsPerLane {
+		expected = MaxToolCallsPerLane
+	}
+	if observed != expected || *document.Truncated != (*document.TotalCalls > MaxToolCallsPerLane) {
+		return toolAuditCapture{}, errors.New("audit export coverage counts are inconsistent")
+	}
+	return toolAuditCapture{Events: document.Events, TotalCalls: *document.TotalCalls, Truncated: *document.Truncated}, nil
 }
 
 func validateAuditEvent(event auditEvent) error {
 	if event.Redaction != "metadata_only" {
 		return errors.New("record is not marked metadata_only")
 	}
-	if event.Kind != "agent_run" && event.Kind != "tool_action" {
+	if event.Kind != "tool_action" {
 		return errors.New("record has an unsupported kind")
 	}
-	if !auditActions[event.Action] {
+	if event.Action != "tool.action.started" && event.Action != "tool.action.finished" {
 		return errors.New("record has an unsupported action")
 	}
 	if !toolCallStates[event.Status] {
@@ -83,8 +164,26 @@ func validateAuditEvent(event auditEvent) error {
 	if event.Sequence < 1 || event.SourceSequence < 1 || event.OccurredAt < 0 {
 		return errors.New("record has an invalid sequence or timestamp")
 	}
-	if event.EventID == "" || event.AgentID == "" || event.RunID == "" {
+	if event.EventID == "" || event.AgentID != toolAuditAgentID || event.RunID == "" {
 		return errors.New("record is missing required provenance")
+	}
+	if (event.Actor.Type != "agent" && event.Actor.Type != "system") || event.Actor.ID == "" {
+		return errors.New("record has invalid actor provenance")
+	}
+	if event.Action == "tool.action.started" && (event.Status != "started" || event.ErrorCode != "") {
+		return errors.New("tool start record has an invalid outcome")
+	}
+	if event.Action == "tool.action.finished" && event.Status == "started" {
+		return errors.New("tool finish record has no terminal outcome")
+	}
+	if event.Action == "tool.action.finished" {
+		expectedError := map[string]string{
+			"succeeded": "", "failed": "tool_failed", "cancelled": "tool_cancelled",
+			"timed_out": "tool_timed_out", "blocked": "tool_blocked", "unknown": "tool_outcome_unknown",
+		}[event.Status]
+		if event.ErrorCode != expectedError {
+			return errors.New("tool finish record has an inconsistent error code")
+		}
 	}
 	return nil
 }
@@ -122,19 +221,16 @@ func (group *toolCallGroup) repTime() (int64, bool) {
 	return 0, false
 }
 
-func buildToolCallLane(status string, events []auditEvent) ToolCallLane {
+func buildToolCallLane(status string, capture toolAuditCapture) ToolCallLane {
 	lane := ToolCallLane{Coverage: "unavailable", Calls: []ToolCall{}}
 	if status != "captured" {
 		lane.Reason = "OpenClaw did not record a metadata-only audit ledger for this lane."
 		return lane
 	}
-	ordered := correlateToolCalls(events)
-	total := len(ordered)
+	ordered := correlateToolCalls(capture.Events)
+	total := capture.TotalCalls
 	published := ordered
-	if len(published) > MaxToolCallsPerLane {
-		published = published[:MaxToolCallsPerLane]
-		lane.Truncated = true
-	}
+	lane.Truncated = capture.Truncated
 
 	timed := len(published) > 0
 	reps := make([]int64, len(published))
@@ -216,10 +312,10 @@ func correlateToolCalls(events []auditEvent) []*toolCallGroup {
 		if event.Kind != "tool_action" {
 			continue
 		}
-		key := "id:" + event.ToolCallID
+		key := event.RunID + "\x00id:" + event.ToolCallID
 		if event.ToolCallID == "" {
 			uncorrelated++
-			key = fmt.Sprintf("nocall:%d", uncorrelated)
+			key = fmt.Sprintf("%s\x00nocall:%d", event.RunID, uncorrelated)
 		}
 		group := groups[key]
 		if group == nil {

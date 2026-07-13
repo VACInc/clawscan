@@ -107,13 +107,17 @@ Top-level sections:
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), and concrete limitations;
 - `toolCallLedger`: a paired baseline/exercise ledger of actual OpenClaw tool
-  calls, projected from OpenClaw's metadata-only audit ledger
-  (`tool.action.started`/`finished`). Each lane reports a coverage verdict
+  calls, projected after each lane exits by a contained, read-only query of
+  OpenClaw's canonical `audit_events` SQLite table
+  (`tool.action.started`/`finished`). The exporter has no network, sees lane
+  state read-only, and can write only its bounded receipt. Each lane reports a coverage verdict
   (`complete`/`incomplete`/`unavailable`) and ordered calls with a safe ordinal,
   compact tool name, terminal state, error code, and relative timing. Raw tool
   call ids are never published; argument/result summaries are explicitly
   unavailable because the metadata-only ledger carries no arguments and the
-  redacted trajectory cannot guarantee canary safety;
+  redacted trajectory cannot guarantee canary safety. Because the lane owns its
+  OpenClaw state database and audit rows are not integrity-signed, this ledger
+  is supplemental metadata rather than sole-source grading evidence;
 - `runtimeTimeline`: an ordered, per-lane runtime **syscall** timeline (not tool
   calls) for both lanes, with contiguous sequence numbers, normalized secret-safe
   subjects, completion/denial/error outcomes, path-based canary attribution, and

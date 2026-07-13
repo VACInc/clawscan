@@ -25,8 +25,8 @@ type CaptureBundle struct {
 	ExerciseTraces    []string
 	BaselineOutput    []byte
 	ExerciseOutput    []byte
-	BaselineToolAudit []auditEvent
-	ExerciseToolAudit []auditEvent
+	BaselineToolAudit toolAuditCapture
+	ExerciseToolAudit toolAuditCapture
 }
 
 func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error) {
@@ -134,21 +134,21 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 
 // resolveToolAudit fails closed on a claimed-complete but missing or malformed
 // tool audit ledger; an explicitly unavailable lane carries no records.
-func resolveToolAudit(status string, data []byte, lane string) ([]auditEvent, error) {
+func resolveToolAudit(status string, data []byte, lane string) (toolAuditCapture, error) {
 	switch status {
 	case "unavailable":
-		return nil, nil
+		return toolAuditCapture{}, nil
 	case "captured":
 		if len(data) == 0 {
-			return nil, fmt.Errorf("capture bundle %s lane claims a tool audit ledger but none is present", lane)
+			return toolAuditCapture{}, fmt.Errorf("capture bundle %s lane claims a tool audit ledger but none is present", lane)
 		}
-		events, err := parseToolAuditLedger(data)
+		capture, err := parseToolAuditLedger(data)
 		if err != nil {
-			return nil, fmt.Errorf("capture bundle %s lane tool audit ledger is malformed: %w", lane, err)
+			return toolAuditCapture{}, fmt.Errorf("capture bundle %s lane tool audit ledger is malformed: %w", lane, err)
 		}
-		return events, nil
+		return capture, nil
 	default:
-		return nil, fmt.Errorf("capture bundle %s lane has an invalid tool audit status", lane)
+		return toolAuditCapture{}, fmt.Errorf("capture bundle %s lane has an invalid tool audit status", lane)
 	}
 }
 

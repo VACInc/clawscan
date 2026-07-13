@@ -183,8 +183,9 @@ no declared tools require an operator-supplied `exercise.prompt`.
 
 Every capture carries a `toolCallLedger` section: a paired baseline/exercise
 ledger of actual OpenClaw tool calls, distinct from the syscall timeline below.
-It is projected from OpenClaw's metadata-only audit ledger (`openclaw audit`,
-`tool.action.started`/`finished` records), which by contract records tool
+It is projected directly from OpenClaw's canonical metadata-only
+`audit_events` SQLite table (`tool.action.started`/`finished` records), which by
+contract records tool
 identity, ordering, terminal state, error code, and timing but never prompts,
 tool arguments, tool results, command output, or raw error text.
 
@@ -209,13 +210,37 @@ best-effort redaction cannot guarantee synthetic-canary safety. The observatory
 publishes this explicit coverage rather than presenting syscall subjects as tool
 arguments.
 
-The remote runner captures each lane's audit ledger after the agent unit is
-collected, writing `<lane>/audit.json` and a `meta/<lane>-audit-status` marker
-into the private bundle. A claimed-complete but missing or malformed ledger fails
-the bundle read closed; an unavailable lane publishes explicit unavailable
-coverage. The metadata-only audit ledger is recorded by OpenClaw's Gateway; a
-capture whose agent runtime does not surface it marks the lane unavailable rather
-than fabricating a ledger.
+After the untrusted agent unit has stopped and been collected, the remote runner
+reads the canonical `$OPENCLAW_STATE_DIR/state/openclaw.sqlite` database without
+launching OpenClaw or contacting a Gateway. The exporter runs as the dedicated
+agent user in a second transient unit with a 20-second deadline, 128 MiB memory
+limit, 50 percent CPU quota, 16-task limit, 8 MiB file limit, an empty
+environment, no capabilities, private and denied networking, lane state mounted
+read-only, and only a fresh receipt directory writable. Database, sidecar,
+directory, and output symlinks are rejected. The query is read-only and enables
+SQLite `query_only` mode with trusted schemas disabled.
+
+The strict `<lane>/audit.json` receipt binds the direct-export source, 4096-call
+bound, exact total call count, and truncation flag. Unknown fields, duplicate
+lifecycle records, malformed provenance, unsupported schema versions, and
+inconsistent counts fail closed. A missing canonical database is explicit
+`unavailable` coverage; a present but malformed database aborts capture rather
+than fabricating a ledger. The lane's `meta/<lane>-audit-status` marker binds
+that result into the private bundle.
+
+OpenClaw currently owns durable audit recording in its Gateway runtime.
+Observatory deliberately runs the embedded local agent without a Gateway, so an
+OpenClaw build that does not persist embedded-run audit events produces explicit
+`unavailable` ledger coverage. Observatory does not infer tool calls from
+syscalls or fabricate a ledger. Complete tool-call coverage for that runtime
+requires an upstream-supported embedded recorder or a separately reviewed
+Gateway execution topology.
+
+The state database belongs to the same lane user as the target. OpenClaw's
+audit rows are not integrity-signed, so a captured ledger is supplemental
+behavior metadata, not tamper-evident proof. Deterministic grading must not rely
+on this ledger as its sole source. The root-owned syscall trace remains the
+independent runtime observation boundary.
 
 ## Runtime syscall timeline
 
@@ -258,4 +283,6 @@ comparison reject evidence produced by a different protocol.
 - `strace` provides endpoint addresses, not complete DNS or payload attribution.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
+- Current embedded OpenClaw runs may expose no durable tool audit database; the
+  tool-call ledger then reports explicit `unavailable` coverage.
 - Behavioral correlation is not author intent and is never a safety verdict.
