@@ -1223,13 +1223,24 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 		`/bin/bash "$CONTROL/run-agent.sh"`, `install -m 0600 "$OUT/raw.tar.gz" "$DOWNLOAD_OUT/raw.tar.gz"`,
 		`local session="observatory-$RUN_ID"`,
 		"lane storage must be a bounded tmpfs",
+		`node "$audit_dir/export-tool-audit.mjs"`,
+		`ReadOnlyPaths=$root`, `ReadWritePaths=$audit_output`, "PrivateNetwork=yes",
+		"MemoryMax=134217728", "RuntimeMaxSec=20s", "LimitFSIZE=8388608",
+		"capture_tool_audit baseline",
+		"capture_tool_audit exercise",
+		`printf 'captured\n' > "$META/$lane-audit-status"`,
+		`printf 'unavailable\n' > "$META/$lane-audit-status"`,
+		"recorderObserved", "missing recorder observation",
 	} {
 		if !strings.Contains(remoteRunScript, required) {
 			t.Fatalf("remote runner missing %q", required)
 		}
 	}
-	if strings.Contains(remoteRunScript, "timeout --signal=TERM") || !strings.Contains(remoteAgentScript, "ulimit -f") || !strings.Contains(remoteAgentScript, "strace -f -qq -s 0") {
+	if strings.Contains(remoteRunScript, "timeout --signal=TERM") || !strings.Contains(remoteAgentScript, "ulimit -f") || !strings.Contains(remoteAgentScript, "strace -f -qq -s 0") || !strings.Contains(remoteAgentScript, "-ttt") {
 		t.Fatalf("remote capture bounds are incomplete")
+	}
+	if strings.Contains(remoteRunScript, "openclaw audit") {
+		t.Fatal("remote capture must not invoke OpenClaw to export its audit database")
 	}
 	for _, syscall := range []string{"sendmmsg", "truncate", "ftruncate", "symlink", "symlinkat", "chdir", "fchdir", "clone", "clone3", "fork", "vfork", "unshare"} {
 		if !strings.Contains(remoteAgentScript, syscall) {
@@ -1480,6 +1491,10 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 	redirectJSON, _ := json.Marshal(testRedirectMarkers())
 	stateInventory := "0600\t" + strings.Repeat("1", 64) + "\tstate/openclaw.json\n"
 	bashrcInventory := "0600\t" + strings.Repeat("2", 64) + "\thome/.bashrc\n"
+	toolName := "observatory_probe"
+	if targetKind == "skill" {
+		toolName = "bash"
+	}
 	return map[string]string{
 		"meta/run-id":                runID + "\n",
 		"meta/target-sha256":         targetSHA256 + "\n",
@@ -1501,6 +1516,8 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"meta/openclaw-version":      "OpenClaw fixture\n",
 		"meta/strace-version":        "strace fixture\n",
 		"meta/firewall-sha256":       strings.Repeat("a", 64) + "\n",
+		"meta/baseline-audit-status": "captured\n",
+		"meta/exercise-audit-status": "captured\n",
 		"baseline/trace":             baselineTrace,
 		"exercise/trace":             exerciseTrace,
 		"baseline/agent.stdout":      "baseline\n",
@@ -1509,7 +1526,20 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"baseline/inventory.after":   stateInventory,
 		"exercise/inventory.before":  stateInventory,
 		"exercise/inventory.after":   stateInventory + bashrcInventory,
+		"baseline/audit.json":        `{"source":"openclaw-state-sqlite","recorderObserved":true,"maxCalls":4096,"events":[],"totalCalls":0,"truncated":false}` + "\n",
+		"exercise/audit.json":        fixtureToolAuditJSON(toolName),
 	}
+}
+
+// fixtureToolAuditJSON builds a direct SQLite export with one completed tool
+// call (started+finished), matching the contained exporter's receipt.
+func fixtureToolAuditJSON(tool string) string {
+	events := []map[string]any{
+		{"eventId": "e2", "sequence": 2, "sourceSequence": 2, "occurredAt": 1000, "kind": "tool_action", "action": "tool.action.finished", "status": "succeeded", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
+		{"eventId": "e1", "sequence": 1, "sourceSequence": 1, "occurredAt": 900, "kind": "tool_action", "action": "tool.action.started", "status": "started", "actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory", "runId": "r1", "toolCallId": "call-1", "toolName": tool, "redaction": "metadata_only"},
+	}
+	encoded, _ := json.Marshal(map[string]any{"source": toolAuditCaptureSource, "recorderObserved": true, "maxCalls": MaxToolCallsPerLane, "events": events, "totalCalls": 1, "truncated": false})
+	return string(encoded) + "\n"
 }
 
 func testCanaryMarkers() map[string]string {
@@ -1588,6 +1618,18 @@ func fixtureEvidence() Evidence {
 		RedirectProbes: []RedirectProbeObservation{{ID: "workspace-note-egress", Surface: "workspace note", Vector: "network", ReadExercise: 1, ReadDelta: 1, Escalation: "read", Attributed: "read", Exercised: true}},
 		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
 		Coverage:       CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, RedirectProbeScope: RedirectProbeScope, RedirectProbeCount: 1, RedirectProbesExercised: 1, Limitations: []string{"Fixture limitation."}},
+		ToolCallLedger: ToolCallLedger{
+			Source:            ToolCallLedgerSource,
+			MaxCallsPerLane:   MaxToolCallsPerLane,
+			ArgumentSummaries: ToolArgumentCoverage{Available: false, Reason: "Fixture: argument summaries unavailable."},
+			Baseline:          ToolCallLane{Coverage: "incomplete", Reason: "Fixture: audit persistence is best-effort.", Calls: []ToolCall{}},
+			Exercise:          ToolCallLane{Coverage: "incomplete", Reason: "Fixture: audit persistence is best-effort.", Calls: []ToolCall{}},
+		},
+		RuntimeTimeline: RuntimeTimeline{
+			MaxEventsPerLane: MaxRuntimeTimelineEventsPerLane,
+			Baseline:         RuntimeTimelineLane{Events: []RuntimeTimelineEvent{}},
+			Exercise:         RuntimeTimelineLane{Events: []RuntimeTimelineEvent{}},
+		},
 	}
 }
 
@@ -1815,5 +1857,783 @@ func TestGeneratedPluginConfigDiscoversOwnedFixtureWhenCLIAvailable(t *testing.T
 	}
 	if !bytes.Contains(output, []byte(`"id": "observatory-probe"`)) && !bytes.Contains(output, []byte(`"id":"observatory-probe"`)) {
 		t.Fatalf("fixture plugin missing from inventory: %s", output)
+	}
+}
+
+func runtimeTimelineTestMetadata() CaptureMetadata {
+	return CaptureMetadata{
+		RunID:             "obs_runtimeTimeline",
+		BaselineWorkspace: "/run/baseline/workspace", ExerciseWorkspace: "/run/exercise/workspace",
+		BaselineState: "/run/baseline/state", ExerciseState: "/run/exercise/state",
+		BaselineHome: "/run/baseline/home", ExerciseHome: "/run/exercise/home",
+		TargetKind: "skill", TargetRoot: "/run/exercise/workspace/skills/observed",
+	}
+}
+
+func TestBuildRuntimeTimelineOrdersBothLanesWithTimingOutcomesAndCanaries(t *testing.T) {
+	cloudMarker := testCanaryMarkers()["cloud-credentials"]
+	baseline := "100 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
+	exercise := "200 1000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 1000.500000 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
+		"200 1001.000000 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n" +
+		"200 1001.250000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT|O_TRUNC, 0600) = 5\n" +
+		"200 1002.000000 connect(3<TCP:[1]>, {sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr(\"203.0.113.1\")}, 16) = -1 ECONNREFUSED (Connection refused)\n" +
+		"200 1002.500000 sendto(4, \"" + cloudMarker + "\", 61, 0, {sa_family=AF_INET, sin_port=htons(8000), sin_addr=inet_addr(\"10.0.0.2\")}, 16) = 61\n"
+	runtimeTimeline := BuildRuntimeTimeline(AnalysisInput{
+		BaselineTraces:        []string{baseline},
+		ExerciseTraces:        []string{exercise},
+		Metadata:              runtimeTimelineTestMetadata(),
+		Canaries:              testCanaries(),
+		ControlPlaneAddresses: []string{"10.0.0.2:8000"},
+	})
+	if runtimeTimeline.MaxEventsPerLane != MaxRuntimeTimelineEventsPerLane {
+		t.Fatalf("event bound = %d", runtimeTimeline.MaxEventsPerLane)
+	}
+	// Both lanes are published in full rather than baseline-subtracted.
+	if runtimeTimeline.Baseline.EventCount != 1 || runtimeTimeline.Baseline.Events[0].Subject != "node" || !runtimeTimeline.Baseline.Timed {
+		t.Fatalf("baseline lane = %#v", runtimeTimeline.Baseline)
+	}
+	exerciseLane := runtimeTimeline.Exercise
+	if !exerciseLane.Timed || exerciseLane.DurationMs == nil || *exerciseLane.DurationMs != 2500 {
+		t.Fatalf("exercise timing = %#v (duration %v)", exerciseLane, exerciseLane.DurationMs)
+	}
+	type want struct {
+		kind, operation, subject, outcome, role, canary string
+		offset                                          int64
+	}
+	expected := []want{
+		{"process", "execute", "node", "completed", "", "", 0},
+		{"file", "open-for-read", "$HOME/.aws/credentials", "completed", "", "cloud-credentials", 500},
+		{"file", "open-for-read", "/etc/shadow", "denied", "", "", 1000},
+		{"file", "open-for-write", "$WORKSPACE/probe.json", "completed", "", "", 1250},
+		{"network", "connect", "203.0.113.1:9", "error", "external", "", 2000},
+		{"network", "send", "model-endpoint:8000", "completed", "model-control-plane", "", 2500},
+	}
+	if exerciseLane.EventCount != len(expected) {
+		t.Fatalf("exercise events = %#v", exerciseLane.Events)
+	}
+	for index, event := range exerciseLane.Events {
+		exp := expected[index]
+		if event.Sequence != index+1 || event.Kind != exp.kind || event.Operation != exp.operation ||
+			event.Subject != exp.subject || event.Outcome != exp.outcome || event.Role != exp.role || event.Canary != exp.canary {
+			t.Fatalf("event %d = %#v, want %#v", index, event, exp)
+		}
+		if event.OffsetMs == nil || *event.OffsetMs != exp.offset {
+			t.Fatalf("event %d offset = %v, want %d", index, event.OffsetMs, exp.offset)
+		}
+	}
+	encoded, err := json.Marshal(runtimeTimeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{cloudMarker, "OBS-CANARY", "10.0.0.2"} {
+		if strings.Contains(string(encoded), leaked) {
+			t.Fatalf("runtimeTimeline leaked private value %q: %s", leaked, encoded)
+		}
+	}
+	if err := validateRuntimeTimeline(runtimeTimeline); err != nil {
+		t.Fatalf("validate runtimeTimeline: %v", err)
+	}
+}
+
+func TestBuildRuntimeTimelineWithoutTimestampsOmitsOffsets(t *testing.T) {
+	exercise := "200 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_WRONLY|O_CREAT) = 5\n"
+	runtimeTimeline := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: runtimeTimelineTestMetadata(), Canaries: testCanaries()})
+	lane := runtimeTimeline.Exercise
+	if lane.Timed || lane.DurationMs != nil || lane.EventCount != 2 {
+		t.Fatalf("untimed lane = %#v", lane)
+	}
+	for _, event := range lane.Events {
+		if event.OffsetMs != nil {
+			t.Fatalf("untimed event carried an offset: %#v", event)
+		}
+	}
+	if err := validateRuntimeTimeline(runtimeTimeline); err != nil {
+		t.Fatalf("validate runtimeTimeline: %v", err)
+	}
+}
+
+func TestBuildRuntimeTimelineNormalizesNewlineBearingSubjects(t *testing.T) {
+	exercise := `200 openat(AT_FDCWD, "/tmp/hostile\nname", O_RDONLY) = 3` + "\n"
+	timeline := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: runtimeTimelineTestMetadata()})
+	lane := timeline.Exercise
+	if lane.EventCount != 1 || strings.ContainsAny(lane.Events[0].Subject, "\x00\r\n") || !strings.Contains(lane.Events[0].Subject, "hostile") {
+		t.Fatalf("normalized newline subject = %#v", lane)
+	}
+	if err := validateRuntimeTimeline(timeline); err != nil {
+		t.Fatalf("validate normalized runtimeTimeline: %v", err)
+	}
+}
+
+func TestBuildRuntimeTimelineRejectsNonMonotonicTimestamps(t *testing.T) {
+	// A backwards stamp makes timing untrustworthy for the whole lane, but the
+	// ordered sequence is still preserved.
+	exercise := "200 1005.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"200 1002.000000 openat(AT_FDCWD, \"/run/exercise/workspace/probe.json\", O_RDONLY) = 3\n"
+	lane := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{exercise}, Metadata: runtimeTimelineTestMetadata()}).Exercise
+	if lane.Timed || lane.EventCount != 2 || lane.Events[0].OffsetMs != nil {
+		t.Fatalf("non-monotonic lane = %#v", lane)
+	}
+}
+
+func TestBuildRuntimeTimelineBoundsEventsPerLane(t *testing.T) {
+	var builder strings.Builder
+	total := MaxRuntimeTimelineEventsPerLane + 25
+	for index := 0; index < total; index++ {
+		fmt.Fprintf(&builder, "200 openat(AT_FDCWD, \"/tmp/f%d\", O_RDONLY) = 3\n", index)
+	}
+	lane := BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: runtimeTimelineTestMetadata()}).Exercise
+	if lane.EventCount != MaxRuntimeTimelineEventsPerLane || lane.TotalEvents != total || !lane.Truncated {
+		t.Fatalf("bounded lane = eventCount %d totalEvents %d truncated %v", lane.EventCount, lane.TotalEvents, lane.Truncated)
+	}
+	if lane.Events[0].Sequence != 1 || lane.Events[len(lane.Events)-1].Sequence != MaxRuntimeTimelineEventsPerLane {
+		t.Fatalf("sequence bounds = %d..%d", lane.Events[0].Sequence, lane.Events[len(lane.Events)-1].Sequence)
+	}
+	if err := validateRuntimeTimeline(BuildRuntimeTimeline(AnalysisInput{ExerciseTraces: []string{builder.String()}, Metadata: runtimeTimelineTestMetadata()})); err != nil {
+		t.Fatalf("validate bounded runtimeTimeline: %v", err)
+	}
+}
+
+func TestValidateEvidenceRejectsMalformedRuntimeTimeline(t *testing.T) {
+	offset := func(value int64) *int64 { return &value }
+	tests := []struct {
+		name   string
+		mutate func(*Evidence)
+		want   string
+	}{
+		{"missing bound", func(e *Evidence) { e.RuntimeTimeline.MaxEventsPerLane = 0 }, "per-lane event bound"},
+		{"nil events", func(e *Evidence) { e.RuntimeTimeline.Exercise.Events = nil }, "events are required"},
+		{"count mismatch", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 2
+		}, "event count does not match"},
+		{"non-contiguous sequence", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 2, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
+		}, "sequence is not contiguous"},
+		{"bad outcome", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "succeeded"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
+		}, "outcome is unsupported"},
+		{"truncation mismatch", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.TotalEvents = 5
+		}, "truncation flag is inconsistent"},
+		{"offset on untimed", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed", OffsetMs: offset(3)}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
+		}, "untimed event must not report an offset"},
+		{"missing offset on timed", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Timed = true
+			e.RuntimeTimeline.Exercise.DurationMs = offset(10)
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
+		}, "timed event must report a non-negative offset"},
+		{"unsafe subject", func(e *Evidence) {
+			e.RuntimeTimeline.Exercise.Events = []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$WORKSPACE/x\ninjected", Outcome: "completed"}}
+			e.RuntimeTimeline.Exercise.EventCount = 1
+			e.RuntimeTimeline.Exercise.TotalEvents = 1
+		}, "unsafe characters"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := fixtureEvidence()
+			test.mutate(&evidence)
+			if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+func TestBuildEvidenceEmitsValidatedTimedRuntimeTimelineFromBundle(t *testing.T) {
+	config := validTestConfig(t, t.TempDir())
+	entries := fixtureBundleEntries("obs_runtimeTimeline_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "skill", "")
+	entries["baseline/trace"] = "101 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n"
+	entries["exercise/trace"] = "201 2000.000000 execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" +
+		"201 2000.750000 openat(AT_FDCWD, \"/run/exercise/home/.aws/credentials\", O_RDONLY) = 4\n" +
+		"201 2001.000000 openat(AT_FDCWD, \"/etc/shadow\", O_RDONLY) = -1 EACCES (Permission denied)\n"
+	bundlePath := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(bundlePath, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(bundlePath, config.Limits.MaxBundleBytes)
+	if err != nil {
+		t.Fatalf("read timestamped bundle: %v", err)
+	}
+	evidence := BuildEvidence(fixtureEvidence().Target, config, bundle)
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatalf("validate evidence: %v", err)
+	}
+	exercise := evidence.RuntimeTimeline.Exercise
+	if !exercise.Timed || exercise.EventCount != 3 || exercise.DurationMs == nil || *exercise.DurationMs != 1000 {
+		t.Fatalf("exercise runtimeTimeline = %#v", exercise)
+	}
+	credentials := exercise.Events[1]
+	if credentials.Subject != "$HOME/.aws/credentials" || credentials.Canary != "cloud-credentials" {
+		t.Fatalf("credentials event = %#v", credentials)
+	}
+	if exercise.Events[2].Outcome != "denied" {
+		t.Fatalf("shadow event = %#v", exercise.Events[2])
+	}
+	if evidence.RuntimeTimeline.Baseline.EventCount != 1 {
+		t.Fatalf("baseline runtimeTimeline = %#v", evidence.RuntimeTimeline.Baseline)
+	}
+}
+
+func TestRenderSiteShowsRuntimeTimelineAndToolCallLedger(t *testing.T) {
+	requireLinuxControlHost(t)
+	evidence := fixtureEvidence()
+	evidence.RuntimeTimeline.Exercise = RuntimeTimelineLane{
+		EventCount: 1, TotalEvents: 1, Timed: true, DurationMs: func() *int64 { v := int64(42); return &v }(),
+		Events: []RuntimeTimelineEvent{{Sequence: 1, Kind: "file", Operation: "open-for-read", Subject: "$HOME/.aws/credentials", Outcome: "denied", Canary: "cloud-credentials", OffsetMs: func() *int64 { v := int64(42); return &v }()}},
+	}
+	evidence.ToolCallLedger.Exercise = ToolCallLane{
+		Coverage: "incomplete", Reason: "Fixture: audit persistence is best-effort.", CallCount: 1, TotalCalls: 1, Timed: true, DurationMs: func() *int64 { v := int64(0); return &v }(),
+		Calls: []ToolCall{{Sequence: 1, Tool: "observatory_probe", State: "blocked", ErrorCode: "tool_blocked", DurationMs: func() *int64 { v := int64(7); return &v }(), OffsetMs: func() *int64 { v := int64(0); return &v }()}},
+	}
+	output := t.TempDir()
+	if err := RenderSite(output, evidence, nil); err != nil {
+		t.Fatal(err)
+	}
+	html, err := os.ReadFile(filepath.Join(output, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"Runtime syscall timeline", "$HOME/.aws/credentials", "denied", "42 ms", "canary · cloud-credentials",
+		"OpenClaw tool-call ledger", "observatory_probe", "blocked", "tool_blocked", "unavailable",
+	} {
+		if !strings.Contains(string(html), expected) {
+			t.Fatalf("evidence HTML missing %q", expected)
+		}
+	}
+}
+
+func auditStartedEvent(seq int, at int64, callID string, tool string) map[string]any {
+	return map[string]any{
+		"eventId": fmt.Sprintf("s%d", seq), "sequence": seq, "sourceSequence": seq, "occurredAt": at,
+		"kind": "tool_action", "action": "tool.action.started", "status": "started",
+		"actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory",
+		"runId": "run-secret-3f9a", "toolCallId": callID, "toolName": tool, "redaction": "metadata_only",
+	}
+}
+
+func auditFinishedEvent(seq int, at int64, callID string, tool string, status string, errorCode string) map[string]any {
+	event := map[string]any{
+		"eventId": fmt.Sprintf("f%d", seq), "sequence": seq, "sourceSequence": seq, "occurredAt": at,
+		"kind": "tool_action", "action": "tool.action.finished", "status": status,
+		"actor": map[string]any{"type": "agent", "id": "observatory"}, "agentId": "observatory",
+		"runId": "run-secret-3f9a", "toolCallId": callID, "toolName": tool, "redaction": "metadata_only",
+	}
+	if errorCode != "" {
+		event["errorCode"] = errorCode
+	}
+	return event
+}
+
+func auditLedgerBytes(events ...map[string]any) []byte {
+	if events == nil {
+		events = []map[string]any{}
+	}
+	groups := map[string]bool{}
+	for index, event := range events {
+		runID, _ := event["runId"].(string)
+		callID, _ := event["toolCallId"].(string)
+		if callID == "" {
+			callID = fmt.Sprintf("sequence:%v:%d", event["sequence"], index)
+		}
+		groups[runID+"\x00"+callID] = true
+	}
+	return auditLedgerBytesWithCoverage(events, len(groups), len(groups) > MaxToolCallsPerLane)
+}
+
+func auditLedgerBytesWithCoverage(events []map[string]any, total int, truncated bool) []byte {
+	data, _ := json.Marshal(map[string]any{
+		"source": toolAuditCaptureSource, "recorderObserved": true, "maxCalls": MaxToolCallsPerLane, "events": events, "totalCalls": total, "truncated": truncated,
+	})
+	return data
+}
+
+func toolLaneFromEvents(t *testing.T, events ...map[string]any) ToolCallLane {
+	t.Helper()
+	parsed, err := parseToolAuditLedger(auditLedgerBytes(events...))
+	if err != nil {
+		t.Fatalf("parse tool audit ledger: %v", err)
+	}
+	return buildToolCallLane("captured", parsed)
+}
+
+func TestBuildToolCallLedgerClassifiesTerminalStatesAndTiming(t *testing.T) {
+	// Records arrive newest-first from the exporter; ordering is by ledger sequence.
+	lane := toolLaneFromEvents(t,
+		auditFinishedEvent(8, 999, "c4", "fetch", "timed_out", "tool_timed_out"),
+		auditStartedEvent(7, 400, "c4", "fetch"),
+		auditFinishedEvent(6, 340, "c3", "write", "failed", "tool_failed"),
+		auditStartedEvent(5, 300, "c3", "write"),
+		auditFinishedEvent(4, 260, "c2", "bash", "blocked", "tool_blocked"),
+		auditStartedEvent(3, 200, "c2", "bash"),
+		auditFinishedEvent(2, 150, "c1", "read", "succeeded", ""),
+		auditStartedEvent(1, 100, "c1", "read"),
+	)
+	if lane.Coverage != "incomplete" || lane.CallCount != 4 || lane.TotalCalls != 4 || lane.Truncated || !lane.Timed {
+		t.Fatalf("lane = %#v", lane)
+	}
+	if lane.DurationMs == nil || *lane.DurationMs != 300 {
+		t.Fatalf("duration = %v", lane.DurationMs)
+	}
+	type want struct {
+		tool, state, errorCode string
+		duration, offset       int64
+	}
+	expected := []want{
+		{"read", "succeeded", "", 50, 0},
+		{"bash", "blocked", "tool_blocked", 60, 100},
+		{"write", "failed", "tool_failed", 40, 200},
+		{"fetch", "timed_out", "tool_timed_out", 599, 300},
+	}
+	for index, call := range lane.Calls {
+		exp := expected[index]
+		if call.Sequence != index+1 || call.Tool != exp.tool || call.State != exp.state || call.ErrorCode != exp.errorCode {
+			t.Fatalf("call %d = %#v, want %#v", index, call, exp)
+		}
+		if call.DurationMs == nil || *call.DurationMs != exp.duration || call.OffsetMs == nil || *call.OffsetMs != exp.offset {
+			t.Fatalf("call %d timing = dur %v off %v, want %d/%d", index, call.DurationMs, call.OffsetMs, exp.duration, exp.offset)
+		}
+	}
+}
+
+func TestBuildToolCallLedgerMarksMissingTerminalIncomplete(t *testing.T) {
+	lane := toolLaneFromEvents(t, auditStartedEvent(1, 100, "c1", "read"))
+	if lane.Coverage != "incomplete" || lane.CallCount != 1 || lane.Calls[0].State != "started" {
+		t.Fatalf("lane = %#v", lane)
+	}
+	if lane.Calls[0].DurationMs != nil {
+		t.Fatalf("missing-terminal call reported a duration: %#v", lane.Calls[0])
+	}
+	if !strings.Contains(lane.Reason, "no paired") {
+		t.Fatalf("reason = %q", lane.Reason)
+	}
+}
+
+func TestBuildToolCallLedgerScopesCallIDsToRun(t *testing.T) {
+	firstStart := auditStartedEvent(1, 100, "reused", "read")
+	firstFinish := auditFinishedEvent(2, 150, "reused", "read", "succeeded", "")
+	secondStart := auditStartedEvent(3, 200, "reused", "write")
+	secondFinish := auditFinishedEvent(4, 250, "reused", "write", "succeeded", "")
+	secondStart["runId"] = "run-secret-second"
+	secondFinish["runId"] = "run-secret-second"
+	lane := toolLaneFromEvents(t, firstStart, firstFinish, secondStart, secondFinish)
+	if lane.Coverage != "incomplete" || lane.CallCount != 2 || lane.Calls[0].Tool != "read" || lane.Calls[1].Tool != "write" {
+		t.Fatalf("lane = %#v", lane)
+	}
+}
+
+func TestBuildToolCallLedgerNoToolRowsRemainIncomplete(t *testing.T) {
+	lane := toolLaneFromEvents(t)
+	if lane.Coverage != "incomplete" || lane.CallCount != 0 || lane.TotalCalls != 0 || lane.Timed {
+		t.Fatalf("no-tool lane = %#v", lane)
+	}
+	if !strings.Contains(lane.Reason, "best-effort") || !strings.Contains(lane.Reason, "No tool-call rows") {
+		t.Fatalf("no-tool lane reason = %q", lane.Reason)
+	}
+	if lane.Calls == nil {
+		t.Fatal("calls slice must be non-nil")
+	}
+}
+
+func TestBuildToolCallLedgerUnavailableLane(t *testing.T) {
+	lane := buildToolCallLane("unavailable", toolAuditCapture{})
+	if lane.Coverage != "unavailable" || lane.CallCount != 0 || lane.Timed || lane.DurationMs != nil {
+		t.Fatalf("unavailable lane = %#v", lane)
+	}
+	if lane.Calls == nil || strings.TrimSpace(lane.Reason) == "" {
+		t.Fatalf("unavailable lane = %#v", lane)
+	}
+}
+
+func TestBuildToolCallLedgerBoundsCallsPerLane(t *testing.T) {
+	events := []map[string]any{}
+	total := MaxToolCallsPerLane + 5
+	for index := 0; index < total; index++ {
+		call := fmt.Sprintf("c%d", index)
+		events = append(events,
+			auditStartedEvent(index*2+1, int64(index*2+1), call, "read"),
+			auditFinishedEvent(index*2+2, int64(index*2+2), call, "read", "succeeded", ""))
+	}
+	parsed, err := parseToolAuditLedger(auditLedgerBytesWithCoverage(events[:MaxToolCallsPerLane*2], total, true))
+	if err != nil {
+		t.Fatalf("parse bounded tool audit ledger: %v", err)
+	}
+	lane := buildToolCallLane("captured", parsed)
+	if lane.CallCount != MaxToolCallsPerLane || lane.TotalCalls != total || !lane.Truncated || lane.Coverage != "incomplete" {
+		t.Fatalf("bounded lane = callCount %d total %d truncated %v coverage %q", lane.CallCount, lane.TotalCalls, lane.Truncated, lane.Coverage)
+	}
+	if lane.Calls[len(lane.Calls)-1].Sequence != MaxToolCallsPerLane {
+		t.Fatalf("final sequence = %d", lane.Calls[len(lane.Calls)-1].Sequence)
+	}
+}
+
+func TestParseToolAuditLedgerRejectsInconsistentOrAmbiguousReceipts(t *testing.T) {
+	started := auditStartedEvent(1, 100, "c1", "read")
+	finished := auditFinishedEvent(2, 150, "c1", "read", "succeeded", "")
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "count mismatch", data: auditLedgerBytesWithCoverage([]map[string]any{started, finished}, 2, false)},
+		{name: "truncation mismatch", data: auditLedgerBytesWithCoverage([]map[string]any{started, finished}, 1, true)},
+		{name: "trailing value", data: append(auditLedgerBytes(started, finished), []byte(` {}`)...)},
+		{name: "duplicate lifecycle", data: auditLedgerBytesWithCoverage([]map[string]any{
+			started,
+			finished,
+			auditFinishedEvent(3, 175, "c1", "read", "succeeded", ""),
+		}, 1, false)},
+	}
+	unknown := map[string]any{}
+	if err := json.Unmarshal(auditLedgerBytes(started, finished), &unknown); err != nil {
+		t.Fatal(err)
+	}
+	unknown["unexpected"] = true
+	unknownData, _ := json.Marshal(unknown)
+	tests = append(tests, struct {
+		name string
+		data []byte
+	}{name: "unknown field", data: unknownData})
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseToolAuditLedger(test.data); err == nil {
+				t.Fatal("malformed receipt was accepted")
+			}
+		})
+	}
+}
+
+func TestBuildToolCallLedgerNeverPublishesRawIdentifiers(t *testing.T) {
+	lane := toolLaneFromEvents(t,
+		auditStartedEvent(1, 100, "call-secret-9c1f", "read"),
+		auditFinishedEvent(2, 150, "call-secret-9c1f", "read", "succeeded", ""),
+	)
+	encoded, err := json.Marshal(lane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"call-secret-9c1f", "run-secret-3f9a", "sha256:", "eventId", "toolCallId"} {
+		if strings.Contains(string(encoded), leaked) {
+			t.Fatalf("ledger leaked %q: %s", leaked, encoded)
+		}
+	}
+}
+
+func TestBuildToolCallLedgerNormalizesUnsafeToolNames(t *testing.T) {
+	lane := toolLaneFromEvents(t,
+		auditStartedEvent(1, 100, "c1", "not a safe/name"),
+		auditFinishedEvent(2, 150, "c1", "not a safe/name", "succeeded", ""),
+	)
+	if lane.Calls[0].Tool != "unknown" {
+		t.Fatalf("tool name = %q", lane.Calls[0].Tool)
+	}
+}
+
+func TestReadCaptureBundleFailsClosedOnMalformedOrMissingToolAudit(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+		want   string
+	}{
+		{"invalid json", func(e map[string]string) { e["exercise/audit.json"] = "{not json" }, "exercise lane tool audit ledger is malformed"},
+		{"bad enum", func(e map[string]string) {
+			e["exercise/audit.json"] = `{"events":[{"eventId":"e1","sequence":1,"sourceSequence":1,"occurredAt":1,"kind":"tool_action","action":"tool.action.started","status":"weird","agentId":"observatory","runId":"r","redaction":"metadata_only"}]}`
+		}, "malformed"},
+		{"not redacted", func(e map[string]string) {
+			e["exercise/audit.json"] = `{"events":[{"eventId":"e1","sequence":1,"sourceSequence":1,"occurredAt":1,"kind":"tool_action","action":"tool.action.started","status":"started","agentId":"observatory","runId":"r","redaction":"full"}]}`
+		}, "malformed"},
+		{"missing events array", func(e map[string]string) { e["exercise/audit.json"] = `{}` }, "malformed"},
+		{"claims captured but absent", func(e map[string]string) { delete(e, "exercise/audit.json") }, "claims a tool audit ledger but none is present"},
+		{"invalid status", func(e map[string]string) { e["meta/exercise-audit-status"] = "maybe\n" }, "invalid or missing meta/exercise-audit-status"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries := fixtureBundleEntries("obs_audit", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+			test.mutate(entries)
+			path := filepath.Join(t.TempDir(), "capture.tar.gz")
+			if err := writeTestBundle(path, entries); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadCaptureBundle(path, 1<<20); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+func TestReadCaptureBundleAcceptsUnavailableToolAudit(t *testing.T) {
+	entries := fixtureBundleEntries("obs_audit_unavail", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+	entries["meta/exercise-audit-status"] = "unavailable\n"
+	delete(entries, "exercise/audit.json")
+	path := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(path, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(path, 1<<20)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	ledger := BuildToolCallLedger(bundle)
+	if ledger.Exercise.Coverage != "unavailable" || ledger.Baseline.Coverage != "incomplete" {
+		t.Fatalf("ledger coverage baseline=%q exercise=%q", ledger.Baseline.Coverage, ledger.Exercise.Coverage)
+	}
+}
+
+func requireNodeSQLite(t *testing.T) string {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	command := exec.Command(node, "--no-warnings", "--input-type=module", "-e", `import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(":memory:"); db.close();`)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("node:sqlite is unavailable: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return node
+}
+
+func writeToolAuditFixtureDatabase(t *testing.T, node string, laneRoot string, calls int, fullSchema bool, recorder bool) string {
+	t.Helper()
+	sqliteDir := filepath.Join(laneRoot, "state", "state")
+	if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(sqliteDir, "openclaw.sqlite")
+	setupPath := filepath.Join(t.TempDir(), "setup-audit.mjs")
+	setup := `import { DatabaseSync } from "node:sqlite";
+const [databasePath, countArg, mode, recorderMode] = process.argv.slice(2);
+const database = new DatabaseSync(databasePath);
+if (mode !== "full") {
+  database.exec("CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY)");
+  database.close();
+  process.exit(0);
+}
+database.exec("CREATE TABLE audit_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, source_id TEXT NOT NULL UNIQUE, schema_version INTEGER NOT NULL DEFAULT 1, source_sequence INTEGER NOT NULL, occurred_at INTEGER NOT NULL, kind TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, error_code TEXT, actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, agent_id TEXT, session_key TEXT, session_id TEXT, run_id TEXT, tool_call_id TEXT, tool_name TEXT, direction TEXT, channel TEXT, conversation_kind TEXT, message_outcome TEXT, reason_code TEXT, delivery_kind TEXT, failure_stage TEXT, duration_ms INTEGER, result_count INTEGER, account_ref TEXT, conversation_ref TEXT, message_ref TEXT, target_ref TEXT)");
+const insert = database.prepare("INSERT INTO audit_events (sequence,event_id,source_id,schema_version,source_sequence,occurred_at,kind,action,status,error_code,actor_type,actor_id,agent_id,run_id,tool_call_id,tool_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+const count = Number(countArg);
+database.exec("BEGIN");
+for (let index = 0; index < count; index++) {
+  const start = index * 2 + 1;
+  const finish = start + 1;
+  const call = "call-" + index;
+  insert.run(start, "event-" + start, "fixture-" + start, 1, start, 1000 + start, "tool_action", "tool.action.started", "started", null, "agent", "observatory", "observatory", "run-fixture", call, "read");
+  insert.run(finish, "event-" + finish, "fixture-" + finish, 1, finish, 1000 + finish, "tool_action", "tool.action.finished", "succeeded", null, "agent", "observatory", "observatory", "run-fixture", call, "read");
+}
+if (recorderMode === "recorder") {
+  const start = count * 2 + 1;
+  const finish = start + 1;
+  insert.run(start, "run-event-" + start, "run-fixture-" + start, 1, start, 1000 + start, "agent_run", "agent.run.started", "started", null, "agent", "observatory", "observatory", "run-fixture", null, null);
+  insert.run(finish, "run-event-" + finish, "run-fixture-" + finish, 1, finish, 1000 + finish, "agent_run", "agent.run.finished", "succeeded", null, "agent", "observatory", "observatory", "run-fixture", null, null);
+}
+database.exec("COMMIT");
+database.close();
+`
+	if err := os.WriteFile(setupPath, []byte(setup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mode := "short"
+	if fullSchema {
+		mode = "full"
+	}
+	recorderMode := "none"
+	if recorder {
+		recorderMode = "recorder"
+	}
+	command := exec.Command(node, "--no-warnings", setupPath, databasePath, fmt.Sprint(calls), mode, recorderMode)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create audit fixture database: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return databasePath
+}
+
+func runToolAuditExporter(t *testing.T, node string, laneRoot string, maxCalls int) ([]byte, error) {
+	t.Helper()
+	exporterPath := filepath.Join(t.TempDir(), "export-tool-audit.mjs")
+	if err := os.WriteFile(exporterPath, []byte(toolAuditExportScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outputDir := filepath.Join(laneRoot, "audit-export")
+	if err := os.MkdirAll(outputDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(outputDir, "audit.json")
+	command := exec.Command(node, "--no-warnings", exporterPath, laneRoot, outputPath, "observatory", fmt.Sprint(maxCalls))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return output, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	payload, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func TestToolAuditExporterReadsCanonicalSQLiteWithExactCoverage(t *testing.T) {
+	node := requireNodeSQLite(t)
+	laneRoot := t.TempDir()
+	total := MaxToolCallsPerLane + 1
+	writeToolAuditFixtureDatabase(t, node, laneRoot, total, true, true)
+	payload, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, err := parseToolAuditLedger(payload)
+	if err != nil {
+		t.Fatalf("parse direct audit export: %v", err)
+	}
+	if capture.TotalCalls != total || !capture.Truncated || len(capture.Events) != MaxToolCallsPerLane*2 {
+		t.Fatalf("capture = total %d truncated %v events %d", capture.TotalCalls, capture.Truncated, len(capture.Events))
+	}
+	lane := buildToolCallLane("captured", capture)
+	if lane.CallCount != MaxToolCallsPerLane || lane.TotalCalls != total || !lane.Truncated || lane.Coverage != "incomplete" {
+		t.Fatalf("lane = %#v", lane)
+	}
+}
+
+func TestToolAuditExporterDoesNotClaimCoverageWithoutRecorderLifecycle(t *testing.T) {
+	node := requireNodeSQLite(t)
+	laneRoot := t.TempDir()
+	writeToolAuditFixtureDatabase(t, node, laneRoot, 0, true, false)
+	payload, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document auditLedgerDocument
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.RecorderObserved == nil || *document.RecorderObserved {
+		t.Fatalf("recorderObserved = %#v", document.RecorderObserved)
+	}
+	if _, err := parseToolAuditLedger(payload); err == nil || !strings.Contains(err.Error(), "recorder lifecycle") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestToolAuditExporterRejectsMalformedOrSymlinkedDatabase(t *testing.T) {
+	node := requireNodeSQLite(t)
+	t.Run("malformed schema", func(t *testing.T) {
+		laneRoot := t.TempDir()
+		writeToolAuditFixtureDatabase(t, node, laneRoot, 0, false, false)
+		output, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+		if err == nil || !strings.Contains(err.Error()+string(output), "missing required column") {
+			t.Fatalf("err = %v, output = %s", err, output)
+		}
+	})
+	t.Run("symlinked database", func(t *testing.T) {
+		externalRoot := t.TempDir()
+		externalDatabase := writeToolAuditFixtureDatabase(t, node, externalRoot, 1, true, true)
+		laneRoot := t.TempDir()
+		sqliteDir := filepath.Join(laneRoot, "state", "state")
+		if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(externalDatabase, filepath.Join(sqliteDir, "openclaw.sqlite")); err != nil {
+			t.Fatal(err)
+		}
+		output, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+		if err == nil || !strings.Contains(err.Error()+string(output), "non-symlink file") {
+			t.Fatalf("err = %v, output = %s", err, output)
+		}
+	})
+}
+
+func TestBuildEvidenceEmitsPairedToolCallLedger(t *testing.T) {
+	config := validTestConfig(t, t.TempDir())
+	entries := fixtureBundleEntries("obs_ledger_bundle", "sha256:"+strings.Repeat("a", 64), captureConfigSHA256(config), "plugin", "observatory-probe")
+	bundlePath := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(bundlePath, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(bundlePath, config.Limits.MaxBundleBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := BuildEvidence(fixtureEvidence().Target, config, bundle)
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatalf("validate evidence: %v", err)
+	}
+	ledger := evidence.ToolCallLedger
+	if ledger.Source != ToolCallLedgerSource || ledger.ArgumentSummaries.Available {
+		t.Fatalf("ledger header = %#v", ledger)
+	}
+	if ledger.Baseline.Coverage != "incomplete" || ledger.Baseline.CallCount != 0 {
+		t.Fatalf("baseline ledger = %#v", ledger.Baseline)
+	}
+	if ledger.Exercise.Coverage != "incomplete" || ledger.Exercise.CallCount != 1 || ledger.Exercise.Calls[0].Tool != "observatory_probe" || ledger.Exercise.Calls[0].State != "succeeded" {
+		t.Fatalf("exercise ledger = %#v", ledger.Exercise)
+	}
+}
+
+func TestValidateEvidenceRejectsMalformedToolCallLedger(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Evidence)
+		want   string
+	}{
+		{"bad source", func(e *Evidence) { e.ToolCallLedger.Source = "trajectory" }, "ledger source"},
+		{"bad bound", func(e *Evidence) { e.ToolCallLedger.MaxCallsPerLane = 1 }, "ledger per-lane bound"},
+		{"empty argument reason", func(e *Evidence) { e.ToolCallLedger.ArgumentSummaries.Reason = "" }, "argument-summary coverage"},
+		{"impossible argument coverage", func(e *Evidence) { e.ToolCallLedger.ArgumentSummaries.Available = true }, "argument-summary coverage"},
+		{"bad coverage", func(e *Evidence) { e.ToolCallLedger.Exercise.Coverage = "partial" }, "coverage is unsupported"},
+		{"nil calls", func(e *Evidence) { e.ToolCallLedger.Exercise.Calls = nil }, "calls are required"},
+		{"count mismatch", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 2
+		}, "call count does not match"},
+		{"impossible complete coverage", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "complete"
+		}, "coverage is unsupported"},
+		{"unavailable with calls", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "unavailable"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "unavailable lane must carry no calls"},
+		{"unsafe tool name", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "bad name", State: "succeeded"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "tool name is missing or unsafe"},
+		{"bad state", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "done"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "call state is unsupported"},
+		{"state error mismatch", func(e *Evidence) {
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "failed"}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "state and error code are inconsistent"},
+		{"offset on untimed", func(e *Evidence) {
+			off := int64(5)
+			e.ToolCallLedger.Exercise.Coverage = "incomplete"
+			e.ToolCallLedger.Exercise.Calls = []ToolCall{{Sequence: 1, Tool: "read", State: "succeeded", OffsetMs: &off}}
+			e.ToolCallLedger.Exercise.CallCount = 1
+			e.ToolCallLedger.Exercise.TotalCalls = 1
+		}, "untimed call must not report an offset"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evidence := fixtureEvidence()
+			test.mutate(&evidence)
+			if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v", err)
+			}
+		})
 	}
 }

@@ -359,6 +359,107 @@ stay `false`; enabling it fails config validation rather than multiplying trials
 or models. The network sentinel resolves through a single documented seam so a
 future controlled sink can replace the TEST-NET endpoint without weakening the
 default-deny egress policy, which remains unchanged.
+## OpenClaw tool-call ledger
+
+Every capture carries a `toolCallLedger` section: a paired baseline/exercise
+ledger of actual OpenClaw tool calls, distinct from the syscall timeline below.
+It is projected directly from OpenClaw's canonical metadata-only
+`audit_events` SQLite table (`tool.action.started`/`finished` records), which by
+contract records tool
+identity, ordering, terminal state, error code, and timing but never prompts,
+tool arguments, tool results, command output, or raw error text.
+
+Each lane reports a `coverage` verdict and ordered `calls`. A call carries a safe
+per-lane `sequence` used for correlation, the compact `tool` name, a terminal
+`state` (`succeeded`, `failed`, `cancelled`, `timed_out`, `blocked`, `unknown`,
+or `started` when no terminal record was recorded), an optional audit `errorCode`,
+and relative `durationMs`/`offsetMs` timing. Started and finished records are
+correlated internally by their tool call id; the raw call id and its one-way
+fingerprint are never published, only the safe ordinal is. Coverage is:
+
+- `incomplete` — audit rows were captured, but OpenClaw persists them on a
+  best-effort basis, so even paired records cannot prove complete tool-call
+  coverage. The reason also identifies missing terminal records, zero observed
+  rows, or truncation at the 4096-call per-lane cap;
+- `unavailable` — no audit ledger was recorded for the lane.
+
+Bounded, secret-safe argument/result summaries are reported as **unavailable**
+(`argumentSummaries.available: false`) with an explicit reason: the metadata-only
+audit ledger never carries arguments or results, and the redacted trajectory's
+best-effort redaction cannot guarantee synthetic-canary safety. The observatory
+publishes this explicit coverage rather than presenting syscall subjects as tool
+arguments.
+
+After the untrusted agent unit has stopped and been collected, the remote runner
+reads the canonical `$OPENCLAW_STATE_DIR/state/openclaw.sqlite` database without
+launching OpenClaw or contacting a Gateway. The exporter runs as the dedicated
+agent user in a second transient unit with a 20-second deadline, 128 MiB memory
+limit, 50 percent CPU quota, 16-task limit, 8 MiB file limit, an empty
+environment, no capabilities, private and denied networking, lane state mounted
+read-only, and only a fresh receipt directory writable. Database, sidecar,
+directory, and output symlinks are rejected. The query is read-only and enables
+SQLite `query_only` mode with trusted schemas disabled.
+
+The strict `<lane>/audit.json` receipt binds the direct-export source, an
+agent-run recorder-lifecycle observation, the 4096-call bound, exact total call
+count, and truncation flag. Unknown fields, duplicate
+lifecycle records, malformed provenance, unsupported schema versions, and
+inconsistent counts fail closed. A missing canonical database, or a database
+created by unrelated local-agent state without a complete agent-run recorder
+lifecycle, is explicit `unavailable` coverage. A present but malformed database
+aborts capture rather than fabricating a ledger. The lane's
+`meta/<lane>-audit-status` marker binds that result into the private bundle.
+The lifecycle signal proves only that the recorder emitted some run metadata.
+Because audit writes are best-effort, it never upgrades observed rows, including
+an empty tool-action result, to complete coverage.
+
+OpenClaw currently owns durable audit recording in its Gateway runtime.
+Observatory deliberately runs the embedded local agent without a Gateway, so an
+OpenClaw build that does not persist embedded-run audit events produces explicit
+`unavailable` ledger coverage. Observatory does not infer tool calls from
+syscalls or fabricate a ledger. Complete tool-call coverage requires an upstream
+recorder with an acknowledged, loss-detectable contract; the current best-effort
+ledger cannot provide it.
+
+The state database belongs to the same lane user as the target. OpenClaw's
+audit rows are not integrity-signed, so a captured ledger is supplemental
+behavior metadata, not tamper-evident proof. Deterministic grading must not rely
+on this ledger as its sole source. The root-owned syscall trace remains the
+independent runtime observation boundary.
+
+## Runtime syscall timeline
+
+Alongside the baseline-subtracted `observations` aggregate, every capture carries
+a `runtimeTimeline` section: an ordered, per-lane projection of the underlying
+file/process/network **syscalls** captured by `strace` for both lanes. This is
+the runtime substrate beneath the tool calls, not the OpenClaw tool calls
+themselves — it records syscall subjects, not tool arguments or results. Where
+`observations` answers "what increased in the exercise lane", the timeline
+answers "in what order, and when" so downstream deterministic grading and future
+declared-vs-observed comparison can reason about sequence and timing.
+
+Each lane publishes `events` in capture order with a contiguous `sequence`, the
+event `kind`/`operation`, a normalized secret-safe `subject`, an `outcome` of
+`completed`, `denied` (an `EACCES`/`EPERM` permission failure), or `error`, an
+optional network `role`, and an optional `canary` attribution when a file event
+touches a synthetic canary path. Subjects reuse the exact normalization and
+redaction applied to `observations`: host paths collapse to `$WORKSPACE`,
+`$STATE`, `$HOME`, `$SKILL`/`$PLUGIN`, private and control-plane addresses are
+masked, canary markers are never emitted, and raw command arguments and payloads
+are excluded. The full ordered sequence ships in the JSON projection; the static
+page previews up to 250 events per lane.
+
+Timing is captured with `strace -ttt` and published as `offsetMs`, the
+millisecond offset from each lane's first event, only when the lane carries a
+timestamp on every event and those timestamps never move backwards
+(`timed: true`, with a lane `durationMs`). Absolute wall-clock time is never
+published, and a lane with missing or non-monotonic timestamps omits offsets
+rather than publishing untrustworthy timing. Each lane is bounded at 4096 events;
+a busier lane keeps the earliest-first prefix and sets `truncated: true` with the
+full `totalEvents` count. Malformed, inconsistent, or incompletely timed
+timelines fail closed during evidence validation. Both the ledger and the
+timeline are part of the capture-protocol revision, so re-analysis and version
+comparison reject evidence produced by a different protocol.
 
 ## MVP limitations
 
@@ -378,6 +479,9 @@ default-deny egress policy, which remains unchanged.
   mode transition, so a target change to a shared path is confirmed through its
   correlated syscall rather than by comparing lane-specific content. No reboot
   cycle is performed in the default run.
+- Current embedded OpenClaw runs may expose no durable recorder lifecycle even
+  when unrelated state created the SQLite database; the tool-call ledger then
+  reports explicit `unavailable` coverage.
 - Behavioral correlation is not author intent and is never a safety verdict.
 - Redirect probes cover two fixed workspace surfaces with one bounded trial each;
   a marker that was only read or repeated is not evidence of prompt injection.

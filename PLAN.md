@@ -123,7 +123,28 @@ Top-level sections:
   scope (never an exhaustive Linux-audit claim), the redirect probe scope/count,
   the count of probes actually exercised (`redirectProbesExercised`; a missing
   read lowers coverage rather than implying resistance), the redirect deep-mode
-  flag, and concrete limitations.
+  flag, and concrete limitations;
+- `toolCallLedger`: a paired baseline/exercise ledger of actual OpenClaw tool
+  calls, projected after each lane exits by a contained, read-only query of
+  OpenClaw's canonical `audit_events` SQLite table
+  (`tool.action.started`/`finished`). The exporter has no network, sees lane
+  state read-only, and can write only its bounded receipt. Each lane reports a coverage verdict
+  (`incomplete`/`unavailable`) and ordered calls with a safe ordinal,
+  compact tool name, terminal state, error code, and relative timing. Raw tool
+  call ids are never published; argument/result summaries are explicitly
+  unavailable because the metadata-only ledger carries no arguments and the
+  redacted trajectory cannot guarantee canary safety. Because the lane owns its
+  OpenClaw state database and audit rows are not integrity-signed, this ledger
+  is supplemental metadata rather than sole-source grading evidence. OpenClaw
+  audit persistence is best-effort, so captured rows never claim complete
+  coverage. An empty audit table plus an observed recorder lifecycle means only
+  that zero tool-call rows were observed, not that zero calls occurred;
+- `runtimeTimeline`: an ordered, per-lane runtime **syscall** timeline (not tool
+  calls) for both lanes, with contiguous sequence numbers, normalized secret-safe
+  subjects, completion/denial/error outcomes, path-based canary attribution, and
+  relative `offsetMs` timing published only when the capture provides monotonic
+  per-event timestamps. Each lane is bounded and flags truncation; the timeline
+  never carries raw arguments, canary values, private addresses, or host paths.
 
 The schema deliberately has no verdict, severity, score, or recommendation field.
 Redirect escalation tiers are observed-behavior labels, not a safety verdict.

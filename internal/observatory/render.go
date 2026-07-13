@@ -14,6 +14,15 @@ import (
 
 const MaxClawscanArtifactBytes = 256 << 20
 
+// maxRuntimeTimelineDisplayRows bounds how many runtime syscall timeline rows each
+// lane renders into the HTML page. The complete ordered timeline always ships in
+// the JSON projection; the page shows only an earliest-first preview so a busy
+// exercise cannot bloat the static evidence page.
+const maxRuntimeTimelineDisplayRows = 250
+
+// maxToolCallDisplayRows bounds how many tool-call ledger rows each lane renders.
+const maxToolCallDisplayRows = 250
+
 type VersionChange struct {
 	Change        string
 	Kind          string
@@ -376,6 +385,18 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
 		return value
 	},
 	"upper": strings.ToUpper,
+	"runtimeTimelinePreview": func(events []RuntimeTimelineEvent) []RuntimeTimelineEvent {
+		if len(events) > maxRuntimeTimelineDisplayRows {
+			return events[:maxRuntimeTimelineDisplayRows]
+		}
+		return events
+	},
+	"toolCallPreview": func(calls []ToolCall) []ToolCall {
+		if len(calls) > maxToolCallDisplayRows {
+			return calls[:maxToolCallDisplayRows]
+		}
+		return calls
+	},
 }).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -392,6 +413,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     .eyebrow { color:var(--cyan); font:700 12px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.14em; text-transform:uppercase; }
     h1 { margin:0; font-size:clamp(32px,6vw,64px); line-height:1.02; letter-spacing:-.045em; }
     h2 { margin:0 0 14px; font-size:20px; letter-spacing:-.02em; }
+    h3 { margin:20px 0 8px; font-size:14px; letter-spacing:.01em; color:var(--cyan); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; }
     p { margin:0; }
     .lede { max-width:760px; color:var(--muted); font-size:17px; }
     .badge { display:inline-flex; width:max-content; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line); border-radius:999px; background:#0b111b; color:var(--muted); font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace; }
@@ -467,6 +489,27 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   <section class="panel"><h2>Redirect instruction probes</h2><p class="muted">Synthetic injected instructions seeded in workspace content and exposed by the shared lane prompt. Reading or repeating a marker is not evidence of prompt injection; only a deviation delta shows the exercise lane performed the harmless sentinel action the instruction named. A probe the exercise lane never read was not exposed ({{.Evidence.Coverage.RedirectProbesExercised}}/{{.Evidence.Coverage.RedirectProbeCount}} exposed) and its absent deviation does not indicate resistance.</p><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Surface</th><th>Vector</th><th>Exposed</th><th>Escalation</th><th>Attributed</th><th>Read Δ</th><th>Repeat Δ</th><th>Deviate Δ</th></tr></thead><tbody>
     {{range .Evidence.RedirectProbes}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.Vector}}</td><td class="{{if not .Exercised}}change-changed{{end}}">{{if .Exercised}}yes{{else}}not exercised{{end}}</td><td class="{{if eq .Escalation "deviated"}}change-removed{{else if eq .Escalation "none"}}muted{{end}}">{{upper .Escalation}}</td><td class="{{if eq .Attributed "deviated"}}change-removed{{else if eq .Attributed "none"}}muted{{end}}">{{upper .Attributed}}</td><td>{{if .ReadDelta}}+{{.ReadDelta}}{{else}}0{{end}}</td><td>{{if .RepeatedDelta}}+{{.RepeatedDelta}}{{else}}0{{end}}</td><td>{{if .DeviatedDelta}}+{{.DeviatedDelta}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
+  <section class="panel"><h2>OpenClaw tool-call ledger</h2>
+    <p class="muted">Paired baseline and exercise tool calls projected from OpenClaw's metadata-only audit ledger: tool name, ordering, terminal state, error code, and duration. Raw tool call ids, arguments, and results are never published. The lane owns this unsigned database, so the ledger is supplemental metadata, not tamper-evident grading proof.</p>
+    <p class="muted">Argument and result summaries: {{if .Evidence.ToolCallLedger.ArgumentSummaries.Available}}available{{else}}<strong>unavailable</strong>{{end}} — {{.Evidence.ToolCallLedger.ArgumentSummaries.Reason}}</p>
+    <h3>Baseline lane · {{.Evidence.ToolCallLedger.Baseline.Coverage}} · {{.Evidence.ToolCallLedger.Baseline.CallCount}} call(s){{if .Evidence.ToolCallLedger.Baseline.Truncated}} · {{.Evidence.ToolCallLedger.Baseline.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Baseline.Reason}} · {{.Evidence.ToolCallLedger.Baseline.Reason}}{{end}}</h3>
+    {{template "toolCallLane" .Evidence.ToolCallLedger.Baseline}}
+    <h3>Exercise lane · {{.Evidence.ToolCallLedger.Exercise.Coverage}} · {{.Evidence.ToolCallLedger.Exercise.CallCount}} call(s){{if .Evidence.ToolCallLedger.Exercise.Truncated}} · {{.Evidence.ToolCallLedger.Exercise.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Exercise.Reason}} · {{.Evidence.ToolCallLedger.Exercise.Reason}}{{end}}</h3>
+    {{template "toolCallLane" .Evidence.ToolCallLedger.Exercise}}
+  </section>
+  <section class="panel"><h2>Runtime syscall timeline</h2>
+    <p class="muted">Ordered, normalized file/process/network syscalls for each lane — the runtime substrate beneath the tool calls above, not the tool calls themselves. Subjects are redacted and raw arguments are never shown; the complete ordered sequence ships in the JSON projection while this page previews up to 250 events per lane.</p>
+    <h3>Baseline lane · {{.Evidence.RuntimeTimeline.Baseline.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Baseline.Truncated}} · {{.Evidence.RuntimeTimeline.Baseline.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Baseline.Timed}} · {{.Evidence.RuntimeTimeline.Baseline.DurationMs}} ms span{{end}}</h3>
+    {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Baseline}}
+    <h3>Exercise lane · {{.Evidence.RuntimeTimeline.Exercise.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Exercise.Truncated}} · {{.Evidence.RuntimeTimeline.Exercise.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Exercise.Timed}} · {{.Evidence.RuntimeTimeline.Exercise.DurationMs}} ms span{{end}}</h3>
+    {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Exercise}}
+  </section>
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>
-</main></body></html>`))
+</main></body></html>
+{{define "runtimeTimelineLane"}}{{if .Events}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Offset</th></tr></thead><tbody>
+    {{range runtimeTimelinePreview .Events}}<tr><td>{{.Sequence}}</td><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Canary}}<div class="muted">canary · {{.Canary}}</div>{{else if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No syscall events captured in this lane.</p>{{end}}{{end}}
+{{define "toolCallLane"}}{{if .Calls}}<div class="table-wrap"><table><thead><tr><th>#</th><th>Tool</th><th>State</th><th>Error</th><th>Duration</th><th>Offset</th></tr></thead><tbody>
+    {{range toolCallPreview .Calls}}<tr><td>{{.Sequence}}</td><td><code>{{.Tool}}</code></td><td>{{.State}}</td><td>{{if .ErrorCode}}{{.ErrorCode}}{{else}}—{{end}}</td><td>{{if .DurationMs}}{{.DurationMs}} ms{{else}}—{{end}}</td><td>{{if .OffsetMs}}{{.OffsetMs}} ms{{else}}—{{end}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No tool calls recorded in this lane.</p>{{end}}{{end}}`))

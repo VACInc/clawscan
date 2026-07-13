@@ -295,7 +295,7 @@ MOCK_ENV=()
 # Bash applies this RLIMIT_FSIZE (in 1024-byte blocks) to the trace and both
 # redirected streams, and every descendant inherits it.
 ulimit -f "$CAPTURE_FILE_BLOCKS"
-exec strace -f -qq -s 0 -yy -e signal=none \
+exec strace -f -qq -s 0 -yy -ttt -e signal=none \
   -e trace=open,openat,openat2,creat,link,linkat,symlink,symlinkat,unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,truncate,ftruncate,chdir,fchdir,clone,clone3,fork,vfork,unshare,execve,execveat,connect,sendto,sendmsg,sendmmsg,write,writev \
   -u "$AGENT_USER" -o "$TRACE_DIR/trace" \
   env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -304,6 +304,190 @@ exec strace -f -qq -s 0 -yy -e signal=none \
     "$OPENCLAW_COMMAND" agent --local --agent observatory --session-id "$SESSION" \
       --message-file "$PROMPT" --json \
   > "$TRACE_DIR/agent.stdout" 2> "$TRACE_DIR/agent.stderr"
+`
+
+// toolAuditExportScript reads only OpenClaw's canonical metadata-only audit
+// table. It never launches OpenClaw or a Gateway, and the remote runner executes
+// it after the untrusted lane has stopped inside a second, read-only systemd
+// unit. The OpenClaw schema has no tool argument or result columns, so this
+// exporter deliberately cannot publish or correlate either.
+const toolAuditExportScript = `import fs from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const [laneRootArg, outputArg, agentIdArg, maxCallsArg] = process.argv.slice(2);
+if (!laneRootArg || !outputArg || !agentIdArg || !maxCallsArg) {
+  throw new Error("usage: export-tool-audit.mjs LANE_ROOT OUTPUT AGENT_ID MAX_CALLS");
+}
+const maxCalls = Number(maxCallsArg);
+if (!Number.isSafeInteger(maxCalls) || maxCalls < 1 || maxCalls > 16384) {
+  throw new Error("invalid tool-call export bound");
+}
+if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(agentIdArg)) {
+  throw new Error("invalid audit agent id");
+}
+
+function requireDirectory(candidate, label) {
+  const info = fs.lstatSync(candidate);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(label + " must be a real directory");
+}
+function requireRegular(candidate, label) {
+  const info = fs.lstatSync(candidate);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error(label + " must be a regular non-symlink file");
+}
+function beneath(candidate, root) {
+  return candidate === root || candidate.startsWith(root + path.sep);
+}
+
+const laneRoot = path.resolve(laneRootArg);
+const stateRoot = path.join(laneRoot, "state");
+const sqliteDir = path.join(stateRoot, "state");
+const databasePath = path.join(sqliteDir, "openclaw.sqlite");
+const outputPath = path.resolve(outputArg);
+const outputDir = path.dirname(outputPath);
+requireDirectory(laneRoot, "lane root");
+requireDirectory(stateRoot, "OpenClaw state root");
+requireDirectory(sqliteDir, "OpenClaw SQLite directory");
+requireRegular(databasePath, "OpenClaw SQLite database");
+requireDirectory(outputDir, "audit output directory");
+for (const suffix of ["-wal", "-shm"]) {
+  const sidecar = databasePath + suffix;
+  if (fs.existsSync(sidecar)) requireRegular(sidecar, "OpenClaw SQLite sidecar");
+}
+const realLaneRoot = fs.realpathSync(laneRoot);
+const realDatabase = fs.realpathSync(databasePath);
+const realOutputDir = fs.realpathSync(outputDir);
+if (!beneath(realDatabase, realLaneRoot)) throw new Error("OpenClaw SQLite database escaped the lane root");
+if (!beneath(realOutputDir, realLaneRoot)) throw new Error("audit output escaped the lane root");
+if (fs.existsSync(outputPath)) throw new Error("audit output already exists");
+
+const database = new DatabaseSync(databasePath, { readOnly: true });
+try {
+  database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+  const columns = database.prepare("PRAGMA table_info(audit_events)").all();
+  const names = new Set(columns.map((column) => String(column.name)));
+  const required = [
+    "sequence", "event_id", "source_id", "schema_version", "source_sequence", "occurred_at",
+    "kind", "action", "status", "error_code", "actor_type", "actor_id", "agent_id", "run_id",
+    "tool_call_id", "tool_name",
+  ];
+  for (const name of required) {
+    if (!names.has(name)) throw new Error("audit_events is missing required column " + name);
+  }
+
+  // The state database can exist for unrelated local-agent caches even when no
+  // audit recorder was installed. A complete agent-run lifecycle is the minimum
+  // recorder signal required before an empty tool ledger can mean zero calls.
+  const recorderRow = database.prepare(
+    "SELECT COUNT(*) AS recorder_runs FROM (" +
+      "SELECT run_id FROM audit_events " +
+      "WHERE agent_id = ? AND kind = 'agent_run' AND run_id IS NOT NULL AND trim(run_id) <> '' " +
+      "GROUP BY run_id " +
+      "HAVING SUM(CASE WHEN action = 'agent.run.started' AND status = 'started' THEN 1 ELSE 0 END) > 0 " +
+      "AND SUM(CASE WHEN action = 'agent.run.finished' AND status IN ('succeeded','failed','cancelled','timed_out','blocked') THEN 1 ELSE 0 END) > 0" +
+    ")"
+  ).get(agentIdArg);
+  const recorderRuns = Number(recorderRow?.recorder_runs);
+  if (!Number.isSafeInteger(recorderRuns) || recorderRuns < 0) throw new Error("invalid audit recorder count");
+  const recorderObserved = recorderRuns > 0;
+
+  const callKey = "CASE " +
+    "WHEN tool_call_id IS NULL OR trim(tool_call_id) = '' THEN 'sequence:' || CAST(sequence AS TEXT) " +
+    "ELSE 'id:' || tool_call_id END";
+  const totalRow = database.prepare(
+    "SELECT COUNT(*) AS total_calls FROM (" +
+      "SELECT run_id, " + callKey + " AS call_key " +
+      "FROM audit_events " +
+      "WHERE agent_id = ? AND kind = 'tool_action' " +
+      "GROUP BY run_id, call_key" +
+    ")"
+  ).get(agentIdArg);
+  const totalCalls = Number(totalRow?.total_calls);
+  if (!Number.isSafeInteger(totalCalls) || totalCalls < 0) throw new Error("invalid total tool-call count");
+
+  const maxEvents = maxCalls * 2;
+  const rows = database.prepare(
+    "WITH selected_calls AS (" +
+      "SELECT run_id, " + callKey + " AS call_key, MIN(sequence) AS first_sequence " +
+      "FROM audit_events " +
+      "WHERE agent_id = ? AND kind = 'tool_action' " +
+      "GROUP BY run_id, call_key " +
+      "ORDER BY first_sequence ASC " +
+      "LIMIT ?" +
+    ") " +
+    "SELECT event.event_id, event.sequence, event.schema_version, event.source_sequence, event.occurred_at, event.kind, event.action, event.status, " +
+      "event.error_code, event.actor_type, event.actor_id, event.agent_id, event.run_id, event.tool_call_id, event.tool_name " +
+    "FROM audit_events AS event " +
+    "INNER JOIN selected_calls AS selected " +
+      "ON selected.run_id = event.run_id " +
+      "AND selected.call_key = CASE " +
+        "WHEN event.tool_call_id IS NULL OR trim(event.tool_call_id) = '' THEN 'sequence:' || CAST(event.sequence AS TEXT) " +
+        "ELSE 'id:' || event.tool_call_id END " +
+    "WHERE event.agent_id = ? AND event.kind = 'tool_action' " +
+    "ORDER BY event.sequence DESC " +
+    "LIMIT ?"
+  ).all(agentIdArg, maxCalls, agentIdArg, maxEvents + 1);
+  const eventOverflow = rows.length > maxEvents;
+  if (eventOverflow) throw new Error("a tool call has duplicate lifecycle records");
+
+  function requiredText(value, field, max = 1024) {
+    if (typeof value !== "string" || value.length < 1 || value.length > max || /[\u0000\r\n]/.test(value)) {
+      throw new Error("invalid audit " + field);
+    }
+    return value;
+  }
+  function optionalText(value, field, max = 1024) {
+    if (value === null || value === undefined) return undefined;
+    return requiredText(value, field, max);
+  }
+  function integer(value, field, minimum) {
+    const number = Number(value);
+    if (!Number.isSafeInteger(number) || number < minimum) throw new Error("invalid audit " + field);
+    return number;
+  }
+
+  const events = rows.map((row) => {
+    const schemaVersion = integer(row.schema_version, "schemaVersion", 1);
+    if (schemaVersion !== 1) throw new Error("unsupported audit schemaVersion");
+    const event = {
+      eventId: requiredText(row.event_id, "eventId"),
+      sequence: integer(row.sequence, "sequence", 1),
+      sourceSequence: integer(row.source_sequence, "sourceSequence", 1),
+      occurredAt: integer(row.occurred_at, "occurredAt", 0),
+      kind: requiredText(row.kind, "kind", 32),
+      action: requiredText(row.action, "action", 64),
+      status: requiredText(row.status, "status", 32),
+      actor: {
+        type: requiredText(row.actor_type, "actor.type", 32),
+        id: requiredText(row.actor_id, "actor.id"),
+      },
+      agentId: requiredText(row.agent_id, "agentId", 64),
+      runId: requiredText(row.run_id, "runId"),
+      redaction: "metadata_only",
+    };
+    const errorCode = optionalText(row.error_code, "errorCode", 64);
+    const toolCallId = optionalText(row.tool_call_id, "toolCallId");
+    const toolName = optionalText(row.tool_name, "toolName", 1024);
+    if (errorCode !== undefined) event.errorCode = errorCode;
+    if (toolCallId !== undefined) event.toolCallId = toolCallId;
+    if (toolName !== undefined) event.toolName = toolName;
+    return event;
+  });
+
+  const document = {
+    source: "openclaw-state-sqlite",
+    recorderObserved,
+    maxCalls,
+    events,
+    totalCalls,
+    truncated: totalCalls > maxCalls,
+  };
+  const payload = JSON.stringify(document) + "\n";
+  if (Buffer.byteLength(payload) > 8 * 1024 * 1024) throw new Error("audit export exceeds 8 MiB");
+  fs.writeFileSync(outputPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+} finally {
+  database.close();
+}
 `
 
 const remoteRunScript = `#!/usr/bin/env bash
@@ -320,6 +504,7 @@ TARGET_KIND=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.
 TARGET_ID=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.targetId || "")' "$RUNTIME_JSON")
 OPENCLAW_COMMAND=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.openclawCommand)' "$RUNTIME_JSON")
 AGENT_USER=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.agentUser)' "$RUNTIME_JSON")
+AGENT_ID=observatory
 TIMEOUT_SECONDS=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.timeoutSeconds))' "$RUNTIME_JSON")
 MAX_MEMORY_BYTES=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.maxMemoryBytes))' "$RUNTIME_JSON")
 MAX_LANE_BYTES=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.maxLaneBytes))' "$RUNTIME_JSON")
@@ -378,6 +563,7 @@ as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/fire
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/export-tool-audit.mjs" "$CONTROL/export-tool-audit.mjs"
 as_root install -m 0555 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
 as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
@@ -681,8 +867,109 @@ run_lane_and_capture() {
   fi
 }
 
+# capture_tool_audit directly exports OpenClaw's metadata-only audit_events table
+# after the untrusted lane unit has been collected. It never launches OpenClaw or
+# contacts a Gateway. The exporter runs as the lane user in a second hardened
+# unit: lane state is read-only, only a fresh export directory is writable, and
+# network, capabilities, time, memory, tasks, and output are strictly bounded.
+capture_tool_audit() {
+  local lane=$1
+  local root=$2
+  local other_root="$EXERCISE"
+  [ "$lane" = "exercise" ] && other_root="$BASELINE"
+  local trace_dir="$OUT/$lane"
+  local state="$root/state"
+  local sqlite_dir="$state/state"
+  local database="$sqlite_dir/openclaw.sqlite"
+  local audit_dir="$root/audit-export"
+  local audit_output="$audit_dir/output"
+  local unit="observatory-$RUN_ID-audit-$lane"
+  [ ! -L "$state" ] && [ -d "$state" ] || fail "OpenClaw state root is not a real directory for $lane lane"
+  if [ ! -e "$sqlite_dir" ] && [ ! -L "$sqlite_dir" ]; then
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+    return
+  fi
+  [ ! -L "$sqlite_dir" ] && [ -d "$sqlite_dir" ] || fail "OpenClaw SQLite directory is not a real directory for $lane lane"
+  if [ ! -e "$database" ] && [ ! -L "$database" ]; then
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+    return
+  fi
+  [ ! -L "$database" ] && [ -f "$database" ] || fail "OpenClaw SQLite database is not a regular file for $lane lane"
+  for sidecar in "$database-wal" "$database-shm"; do
+    if [ -e "$sidecar" ] || [ -L "$sidecar" ]; then
+      [ ! -L "$sidecar" ] && [ -f "$sidecar" ] || fail "OpenClaw SQLite sidecar is not a regular file for $lane lane"
+    fi
+  done
+  [ ! -e "$audit_dir" ] && [ ! -L "$audit_dir" ] || fail "audit export path already exists for $lane lane"
+  as_root install -d -m 0711 -o root -g root "$audit_dir"
+  as_root install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$audit_output"
+  as_root install -m 0444 "$CONTROL/export-tool-audit.mjs" "$audit_dir/export-tool-audit.mjs"
+  if ! as_root systemd-run --quiet --wait --collect --unit="$unit" \
+      --property="User=$AGENT_USER" \
+      --property="Group=$AGENT_USER" \
+      --property=KillMode=control-group \
+      --property=SendSIGKILL=yes \
+      --property=TimeoutStopSec=2s \
+      --property=RuntimeMaxSec=20s \
+      --property=MemoryMax=134217728 \
+      --property=MemorySwapMax=0 \
+      --property=CPUQuota=50% \
+      --property=TasksMax=16 \
+      --property=LimitNOFILE=64 \
+      --property=LimitFSIZE=8388608 \
+      --property=NoNewPrivileges=yes \
+      --property=CapabilityBoundingSet= \
+      --property=AmbientCapabilities= \
+      --property=PrivateDevices=yes \
+      --property=PrivateNetwork=yes \
+      --property=PrivateTmp=yes \
+      --property=ProtectClock=yes \
+      --property=ProtectControlGroups=yes \
+      --property=ProtectHome=yes \
+      --property=ProtectHostname=yes \
+      --property=ProtectKernelLogs=yes \
+      --property=ProtectKernelModules=yes \
+      --property=ProtectKernelTunables=yes \
+      --property=ProtectProc=invisible \
+      --property=ProtectSystem=strict \
+      --property=ProcSubset=pid \
+      --property=RestrictAddressFamilies=AF_UNIX \
+      --property=RestrictNamespaces=yes \
+      --property=RestrictRealtime=yes \
+      --property=RestrictSUIDSGID=yes \
+      --property=LockPersonality=yes \
+      --property="InaccessiblePaths=$REPO_ROOT $other_root $root/workspace $root/home $root/tmp $root/var-tmp -$root/target -$root/plugin" \
+      --property="ReadOnlyPaths=$root" \
+      --property="ReadWritePaths=$audit_output" \
+      --property=IPAddressDeny=any \
+      --property=SocketBindDeny=any \
+      --property=StandardOutput=null \
+      --property=StandardError=null \
+      --property=SystemCallArchitectures=native \
+      --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+      --property=SystemCallErrorNumber=EPERM \
+      --property=UMask=0077 \
+      --property="WorkingDirectory=$audit_output" \
+      /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        node "$audit_dir/export-tool-audit.mjs" "$root" "$audit_output/audit.json" "$AGENT_ID" "4096"; then
+    fail "contained OpenClaw tool-audit export failed for $lane lane"
+  fi
+  [ ! -L "$audit_output/audit.json" ] && [ -f "$audit_output/audit.json" ] || fail "contained tool-audit export produced no regular receipt for $lane lane"
+  local recorder_observed
+  recorder_observed=$(node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).recorderObserved;if(typeof value!=="boolean")throw new Error("missing recorder observation");process.stdout.write(value?"1":"0")' "$audit_output/audit.json") \
+    || fail "contained tool-audit export produced an invalid recorder receipt for $lane lane"
+  if [ "$recorder_observed" != "1" ]; then
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+    return
+  fi
+  as_root install -m 0600 "$audit_output/audit.json" "$trace_dir/audit.json"
+  printf 'captured\n' > "$META/$lane-audit-status"
+}
+
 run_lane_and_capture baseline "$BASELINE"
+capture_tool_audit baseline "$BASELINE"
 run_lane_and_capture exercise "$EXERCISE"
+capture_tool_audit exercise "$EXERCISE"
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$META/completed-at"
 
 as_root tar -C "$OUT" -czf "$OUT/raw.tar.gz" meta baseline exercise

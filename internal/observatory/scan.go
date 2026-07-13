@@ -317,7 +317,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // version comparisons cannot mix evidence produced by different protocols. It
 // embeds PersistenceProtocolRevision so a change to the persistence surface
 // catalog or before/after inventory semantics also invalidates stale receipts.
-const CaptureProtocolRevision = "observatory.capture-protocol.v17+" + PersistenceProtocolRevision
+const CaptureProtocolRevision = "observatory.capture-protocol.v18+" + PersistenceProtocolRevision
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -449,6 +449,9 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(runnerDir, "inventory.mjs"), []byte(inventoryScript), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(runnerDir, "export-tool-audit.mjs"), []byte(toolAuditExportScript), 0o644); err != nil {
 		return err
 	}
 	targetModes := struct {

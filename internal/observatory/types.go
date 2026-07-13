@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
 
 const EvidenceSchemaVersion = "observatory.behavior.v1"
 const MaxEvidenceBytes = 64 << 20
+
+const MaxRuntimeTimelineEventsPerLane = 4096
+const MaxToolCallsPerLane = 4096
 
 type Evidence struct {
 	SchemaVersion       string                     `json:"schemaVersion"`
@@ -24,6 +28,8 @@ type Evidence struct {
 	Persistence         PersistenceEvidence        `json:"persistence"`
 	Coverage            CoverageEvidence           `json:"coverage"`
 	MockEgress          *MockEgressEvidence        `json:"mockEgress,omitempty"`
+	ToolCallLedger      ToolCallLedger             `json:"toolCallLedger"`
+	RuntimeTimeline     RuntimeTimeline            `json:"runtimeTimeline"`
 }
 
 type TargetEvidence struct {
@@ -192,27 +198,92 @@ type PersistenceFinding struct {
 	DeltaCount    int    `json:"deltaCount"`
 }
 
+// RuntimeTimeline is the ordered, normalized syscall sequence for both lanes.
+// It is independent from the supplemental OpenClaw tool-call metadata.
+type RuntimeTimeline struct {
+	MaxEventsPerLane int                 `json:"maxEventsPerLane"`
+	Baseline         RuntimeTimelineLane `json:"baseline"`
+	Exercise         RuntimeTimelineLane `json:"exercise"`
+}
+
+type RuntimeTimelineLane struct {
+	EventCount  int                    `json:"eventCount"`
+	TotalEvents int                    `json:"totalEvents"`
+	Truncated   bool                   `json:"truncated"`
+	Timed       bool                   `json:"timed"`
+	DurationMs  *int64                 `json:"durationMs,omitempty"`
+	Events      []RuntimeTimelineEvent `json:"events"`
+}
+
+type RuntimeTimelineEvent struct {
+	Sequence  int    `json:"sequence"`
+	Kind      string `json:"kind"`
+	Operation string `json:"operation"`
+	Subject   string `json:"subject"`
+	Outcome   string `json:"outcome"`
+	Role      string `json:"role,omitempty"`
+	Canary    string `json:"canary,omitempty"`
+	OffsetMs  *int64 `json:"offsetMs,omitempty"`
+}
+
+// ToolCallLedger is supplemental lane-owned OpenClaw metadata. Audit rows are
+// not integrity-signed, so this is not a tamper-evident grading boundary.
+type ToolCallLedger struct {
+	Source            string               `json:"source"`
+	MaxCallsPerLane   int                  `json:"maxCallsPerLane"`
+	ArgumentSummaries ToolArgumentCoverage `json:"argumentSummaries"`
+	Baseline          ToolCallLane         `json:"baseline"`
+	Exercise          ToolCallLane         `json:"exercise"`
+}
+
+type ToolArgumentCoverage struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason"`
+}
+
+type ToolCallLane struct {
+	Coverage   string     `json:"coverage"`
+	Reason     string     `json:"reason,omitempty"`
+	CallCount  int        `json:"callCount"`
+	TotalCalls int        `json:"totalCalls"`
+	Truncated  bool       `json:"truncated"`
+	Timed      bool       `json:"timed"`
+	DurationMs *int64     `json:"durationMs,omitempty"`
+	Calls      []ToolCall `json:"calls"`
+}
+
+type ToolCall struct {
+	Sequence   int    `json:"sequence"`
+	Tool       string `json:"tool"`
+	State      string `json:"state"`
+	ErrorCode  string `json:"errorCode,omitempty"`
+	DurationMs *int64 `json:"durationMs,omitempty"`
+	OffsetMs   *int64 `json:"offsetMs,omitempty"`
+}
+
 type CaptureMetadata struct {
-	RunID             string
-	TargetSHA256      string
-	CaptureConfigSHA  string
-	StartedAt         time.Time
-	CompletedAt       time.Time
-	BaselineExitCode  int
-	ExerciseExitCode  int
-	BaselineWorkspace string
-	ExerciseWorkspace string
-	BaselineState     string
-	ExerciseState     string
-	BaselineHome      string
-	ExerciseHome      string
-	TargetKind        string
-	TargetRoot        string
-	OpenClawVersion   string
-	StraceVersion     string
-	FirewallSHA256    string
-	Canaries          []CanaryDefinition
-	Redirects         []RedirectProbeDefinition
+	RunID               string
+	TargetSHA256        string
+	CaptureConfigSHA    string
+	StartedAt           time.Time
+	CompletedAt         time.Time
+	BaselineExitCode    int
+	ExerciseExitCode    int
+	BaselineWorkspace   string
+	ExerciseWorkspace   string
+	BaselineState       string
+	ExerciseState       string
+	BaselineHome        string
+	ExerciseHome        string
+	TargetKind          string
+	TargetRoot          string
+	OpenClawVersion     string
+	StraceVersion       string
+	FirewallSHA256      string
+	BaselineAuditStatus string
+	ExerciseAuditStatus string
+	Canaries            []CanaryDefinition
+	Redirects           []RedirectProbeDefinition
 }
 
 type CanaryDefinition struct {
@@ -354,6 +425,12 @@ func ValidateEvidence(evidence Evidence) error {
 			return errors.New("evidence redirect probe exposure flag is inconsistent with its exercise-lane read")
 		}
 	}
+	if err := validateRuntimeTimeline(evidence.RuntimeTimeline); err != nil {
+		return err
+	}
+	if err := validateToolCallLedger(evidence.ToolCallLedger); err != nil {
+		return err
+	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {
 		return fmt.Errorf("evidence exceeds maximum encoded size (%d bytes)", MaxEvidenceBytes)
@@ -412,6 +489,180 @@ func validatePersistenceEvidence(persistence PersistenceEvidence) error {
 		}
 		if inventoryBacked && finding.Outcome != "succeeded" {
 			return errors.New("evidence persistence inventory-confirmed finding must record a succeeded outcome")
+		}
+	}
+	return nil
+}
+
+const ToolCallLedgerSource = "openclaw-audit-ledger"
+
+var (
+	toolCallStates = map[string]bool{
+		"started": true, "succeeded": true, "failed": true, "cancelled": true,
+		"timed_out": true, "blocked": true, "unknown": true,
+	}
+	toolCallErrorCodeByState = map[string]string{
+		"started": "", "succeeded": "", "failed": "tool_failed", "cancelled": "tool_cancelled",
+		"timed_out": "tool_timed_out", "blocked": "tool_blocked", "unknown": "tool_outcome_unknown",
+	}
+	toolNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`)
+)
+
+func validateToolCallLedger(ledger ToolCallLedger) error {
+	if ledger.Source != ToolCallLedgerSource {
+		return errors.New("evidence tool-call ledger source is missing or unsupported")
+	}
+	if ledger.MaxCallsPerLane != MaxToolCallsPerLane {
+		return errors.New("evidence tool-call ledger per-lane bound is missing or unsupported")
+	}
+	if ledger.ArgumentSummaries.Available || strings.TrimSpace(ledger.ArgumentSummaries.Reason) == "" || len(ledger.ArgumentSummaries.Reason) > 400 ||
+		strings.ContainsAny(ledger.ArgumentSummaries.Reason, "\x00\r\n") {
+		return errors.New("evidence tool-call ledger argument-summary coverage is incomplete")
+	}
+	if err := validateToolCallLane(ledger.Baseline); err != nil {
+		return fmt.Errorf("evidence baseline tool-call ledger is invalid: %w", err)
+	}
+	if err := validateToolCallLane(ledger.Exercise); err != nil {
+		return fmt.Errorf("evidence exercise tool-call ledger is invalid: %w", err)
+	}
+	return nil
+}
+
+func validateToolCallLane(lane ToolCallLane) error {
+	if lane.Coverage != "incomplete" && lane.Coverage != "unavailable" {
+		return errors.New("coverage is unsupported")
+	}
+	if lane.Calls == nil {
+		return errors.New("calls are required")
+	}
+	if lane.CallCount != len(lane.Calls) {
+		return errors.New("call count does not match its calls")
+	}
+	if lane.CallCount > MaxToolCallsPerLane {
+		return errors.New("call count exceeds the per-lane bound")
+	}
+	if lane.TotalCalls < lane.CallCount {
+		return errors.New("total calls cannot be fewer than published calls")
+	}
+	if lane.Truncated != (lane.TotalCalls > lane.CallCount) {
+		return errors.New("truncation flag is inconsistent with the call counts")
+	}
+	if len(lane.Reason) > 400 || strings.ContainsAny(lane.Reason, "\x00\r\n") {
+		return errors.New("reason contains unsafe characters")
+	}
+	if strings.TrimSpace(lane.Reason) == "" {
+		return errors.New("lane coverage reason is required")
+	}
+	if lane.Coverage == "unavailable" && (lane.CallCount != 0 || lane.Truncated || lane.Timed) {
+		return errors.New("unavailable lane must carry no calls or timing")
+	}
+	if !lane.Timed && lane.DurationMs != nil {
+		return errors.New("untimed lane must not report a duration")
+	}
+	if lane.Timed && (lane.DurationMs == nil || *lane.DurationMs < 0) {
+		return errors.New("timed lane must report a non-negative duration")
+	}
+	lastOffset := int64(-1)
+	for index, call := range lane.Calls {
+		if call.Sequence != index+1 {
+			return errors.New("call sequence is not contiguous")
+		}
+		if !toolNamePattern.MatchString(call.Tool) {
+			return errors.New("call tool name is missing or unsafe")
+		}
+		if !toolCallStates[call.State] {
+			return errors.New("call state is unsupported")
+		}
+		if call.ErrorCode != toolCallErrorCodeByState[call.State] {
+			return errors.New("call state and error code are inconsistent")
+		}
+		if call.DurationMs != nil && *call.DurationMs < 0 {
+			return errors.New("call duration must be non-negative")
+		}
+		if lane.Timed {
+			if call.OffsetMs == nil || *call.OffsetMs < 0 {
+				return errors.New("timed call must report a non-negative offset")
+			}
+			if *call.OffsetMs < lastOffset {
+				return errors.New("timed call offsets must be non-decreasing")
+			}
+			if *call.OffsetMs > *lane.DurationMs {
+				return errors.New("timed call offset exceeds the lane duration")
+			}
+			lastOffset = *call.OffsetMs
+		} else if call.OffsetMs != nil {
+			return errors.New("untimed call must not report an offset")
+		}
+	}
+	return nil
+}
+
+func validateRuntimeTimeline(timeline RuntimeTimeline) error {
+	if timeline.MaxEventsPerLane != MaxRuntimeTimelineEventsPerLane {
+		return errors.New("evidence runtimeTimeline per-lane event bound is missing or unsupported")
+	}
+	if err := validateRuntimeTimelineLane(timeline.Baseline); err != nil {
+		return fmt.Errorf("evidence baseline runtimeTimeline is invalid: %w", err)
+	}
+	if err := validateRuntimeTimelineLane(timeline.Exercise); err != nil {
+		return fmt.Errorf("evidence exercise runtimeTimeline is invalid: %w", err)
+	}
+	return nil
+}
+
+func validateRuntimeTimelineLane(lane RuntimeTimelineLane) error {
+	if lane.Events == nil {
+		return errors.New("events are required")
+	}
+	if lane.EventCount != len(lane.Events) {
+		return errors.New("event count does not match its events")
+	}
+	if lane.EventCount > MaxRuntimeTimelineEventsPerLane {
+		return errors.New("event count exceeds the per-lane bound")
+	}
+	if lane.TotalEvents < lane.EventCount {
+		return errors.New("total events cannot be fewer than published events")
+	}
+	if lane.Truncated != (lane.TotalEvents > lane.EventCount) {
+		return errors.New("truncation flag is inconsistent with the event counts")
+	}
+	if !lane.Timed && lane.DurationMs != nil {
+		return errors.New("untimed lane must not report a duration")
+	}
+	if lane.Timed && (lane.DurationMs == nil || *lane.DurationMs < 0) {
+		return errors.New("timed lane must report a non-negative duration")
+	}
+	lastOffset := int64(-1)
+	for index, event := range lane.Events {
+		if event.Sequence != index+1 {
+			return errors.New("event sequence is not contiguous")
+		}
+		if event.Kind != "file" && event.Kind != "process" && event.Kind != "network" {
+			return errors.New("event kind is unsupported")
+		}
+		if strings.TrimSpace(event.Operation) == "" || strings.TrimSpace(event.Subject) == "" {
+			return errors.New("event operation and subject are required")
+		}
+		if len(event.Subject) > 4096 || strings.ContainsAny(event.Subject, "\x00\r\n") ||
+			strings.ContainsAny(event.Operation+event.Role+event.Canary, "\x00\r\n") {
+			return errors.New("event fields contain unsafe characters")
+		}
+		if event.Outcome != "completed" && event.Outcome != "denied" && event.Outcome != "error" {
+			return errors.New("event outcome is unsupported")
+		}
+		if lane.Timed {
+			if event.OffsetMs == nil || *event.OffsetMs < 0 {
+				return errors.New("timed event must report a non-negative offset")
+			}
+			if *event.OffsetMs < lastOffset {
+				return errors.New("timed event offsets must be non-decreasing")
+			}
+			if *event.OffsetMs > *lane.DurationMs {
+				return errors.New("timed event offset exceeds the lane duration")
+			}
+			lastOffset = *event.OffsetMs
+		} else if event.OffsetMs != nil {
+			return errors.New("untimed event must not report an offset")
 		}
 	}
 	return nil
