@@ -235,7 +235,9 @@ Supported `--judge` placeholders:
 For a host Codex CLI already authenticated with ChatGPT OAuth, use the built-in
 `clawhub-oauth` profile. Scanners remain in Docker; the host judge is ephemeral,
 can only read its staged workspace, and has network, web, apps, hooks, and
-subagents disabled:
+subagents disabled. This profile starts VirusTotal first and, if an upload is
+still pending after the local scanners finish, polls it for up to 10 minutes
+before Codex is allowed to run:
 
 ```bash
 VIRUSTOTAL_API_KEY=... clawscan ./my-skill --profile clawhub-oauth

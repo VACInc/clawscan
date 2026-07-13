@@ -252,6 +252,109 @@ func TestVirusTotalScannerFailsAPIErrorsAndPreservesJSON(t *testing.T) {
 	}
 }
 
+func TestJudgeWaitsForSubmittedVirusTotalResultWithoutReupload(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(target, []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	expectedSHA, err := fileSHA256Hex(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingHTTPClient{responses: []*http.Response{
+		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"id":"analysis-id","type":"analysis"}}`))},
+		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"attributes":{"last_analysis_stats":{"malicious":0,"suspicious":0,"undetected":72}}}}`))},
+	}}
+	judge := &recordingCommandRunner{writeOutput: `{"verdict":"benign"}`}
+	opts, err := ParseArgs([]string{
+		target,
+		"--scanner", "virustotal",
+		"--judge", "judge --output {{ output }}",
+		"--judge-execution", "host",
+		"--judge-wait-for-scanner", "virustotal",
+		"--judge-wait-timeout", "1s",
+		"--judge-wait-interval", "1ns",
+		"--sandbox", "off",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Run(opts, RunContext{
+		Env:                  map[string]string{"VIRUSTOTAL_API_KEY": "test-vt-secret"},
+		VirusTotalHTTPClient: client,
+		HostCommandRunner:    judge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Judge == nil || artifact.Judge.Status != "completed" || len(judge.calls) != 1 {
+		t.Fatalf("judge = %#v calls = %#v", artifact.Judge, judge.calls)
+	}
+	status, err := virusTotalAnalysisStatus(artifact.Scanners["virustotal"].Raw)
+	if err != nil || status != "clean" {
+		t.Fatalf("VirusTotal status = %q, %v", status, err)
+	}
+	if len(client.requests) != 4 {
+		t.Fatalf("requests = %#v", client.requests)
+	}
+	wantMethods := []string{http.MethodGet, http.MethodPost, http.MethodGet, http.MethodGet}
+	for i, request := range client.requests {
+		if request.Method != wantMethods[i] {
+			t.Fatalf("request %d method = %s", i, request.Method)
+		}
+		if request.Method == http.MethodGet && !strings.HasSuffix(request.URL.Path, "/"+expectedSHA) {
+			t.Fatalf("request %d path = %s", i, request.URL.Path)
+		}
+	}
+}
+
+func TestJudgeIsBlockedWhenVirusTotalPollFails(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(target, []byte("# Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client := &recordingHTTPClient{responses: []*http.Response{
+		{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"NotFoundError"}}`))},
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":{"id":"analysis-id","type":"analysis"}}`))},
+		{StatusCode: http.StatusTooManyRequests, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"QuotaExceededError"}}`))},
+	}}
+	judge := &recordingCommandRunner{writeOutput: `{"verdict":"benign"}`}
+	opts, err := ParseArgs([]string{
+		target,
+		"--scanner", "virustotal",
+		"--judge", "judge --output {{ output }}",
+		"--judge-execution", "host",
+		"--judge-wait-for-scanner", "virustotal",
+		"--judge-wait-timeout", "1s",
+		"--judge-wait-interval", "1ns",
+		"--sandbox", "off",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Run(opts, RunContext{
+		Env:                  map[string]string{"VIRUSTOTAL_API_KEY": "test-vt-secret"},
+		VirusTotalHTTPClient: client,
+		HostCommandRunner:    judge,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Judge == nil || artifact.Judge.Status != "blocked" || !strings.Contains(artifact.Judge.Error, "virustotal") {
+		t.Fatalf("judge = %#v", artifact.Judge)
+	}
+	if len(judge.calls) != 0 {
+		t.Fatalf("judge unexpectedly ran: %#v", judge.calls)
+	}
+	if result := artifact.Scanners["virustotal"]; result.Status != "failed" || !strings.Contains(result.Error, "HTTP 429") {
+		t.Fatalf("VirusTotal result = %#v", result)
+	}
+}
+
 type recordingHTTPClient struct {
 	requests  []*http.Request
 	response  *http.Response

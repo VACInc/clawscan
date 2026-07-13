@@ -20,7 +20,9 @@ The built-in `clawhub-oauth` profile uses this split safely: scanners remain in
 Docker, while an ephemeral Codex judge runs on the host with read-only access
 only to its staged workspace and no network. ClawScan removes scanner/API
 secrets from that judge's environment and never mounts the Codex auth file into
-Docker.
+Docker. VirusTotal starts first and is checked again after local scanning; a
+pending report is polled on a bounded interval and must resolve before Codex
+runs.
 
 Supported `--judge` placeholders:
 

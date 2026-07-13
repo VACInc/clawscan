@@ -20,6 +20,8 @@ relay_listen="${OBSERVATORY_RELAY_LISTEN:?set OBSERVATORY_RELAY_LISTEN to the li
 key_command="${OBSERVATORY_MINIMAX_API_KEY_COMMAND:?set OBSERVATORY_MINIMAX_API_KEY_COMMAND to an executable path}"
 relay_script="${OBSERVATORY_MINIMAX_RELAY_SCRIPT:-$repo_root/infra/proxmox/minimax-secret-relay.mjs}"
 
+[[ -n "${VIRUSTOTAL_API_KEY:-}" ]] || die "set VIRUSTOTAL_API_KEY for the early VirusTotal pass"
+command -v codex >/dev/null 2>&1 || die "Codex CLI is required for the OAuth ClawHub judge"
 [[ -r "$config" && -d "$target" ]] || die "config and target must exist"
 [[ -x "$observatory_bin" && -x "$clawscan_bin" && -x "$crabbox_command" && -x "$key_command" ]] || \
   die "Observatory, ClawScan, Crabbox wrapper, and key command must be executable"
@@ -33,9 +35,16 @@ relay_script="${OBSERVATORY_MINIMAX_RELAY_SCRIPT:-$repo_root/infra/proxmox/minim
 
 umask 077
 mkdir "$output_root"
-mkdir "$output_root/gate-stage" "$output_root/security-gate" "$output_root/empty-ca-directory"
+mkdir \
+  "$output_root/gate-stage" \
+  "$output_root/security-gate" \
+  "$output_root/virustotal" \
+  "$output_root/clawhub-review" \
+  "$output_root/empty-ca-directory"
 stage="$output_root/gate-stage"
 security_dir="$output_root/security-gate"
+virustotal_dir="$output_root/virustotal"
+review_dir="$output_root/clawhub-review"
 result="$output_root/result.json"
 
 write_failure() {
@@ -54,6 +63,25 @@ write_failure() {
   --output "$stage/target" \
   --metadata "$stage/target-metadata.json" \
   "$target" >/dev/null
+
+# Submit VirusTotal before slower local work. This pass never runs a judge; it
+# records either a terminal hash result or the upload receipt used by the later
+# bounded poll.
+virustotal_status=0
+"$clawscan_bin" "$stage/target" \
+  --scanner virustotal \
+  --sandbox off \
+  --output "$virustotal_dir/initial.json" \
+  > "$virustotal_dir/clawscan.stdout" \
+  2> "$virustotal_dir/clawscan.stderr" || virustotal_status=$?
+virustotal_state="$(jq -er '.scanners.virustotal.raw.status | strings' "$virustotal_dir/initial.json" 2>/dev/null)" || virustotal_state=failed
+if [[ "$virustotal_status" -ne 0 ]] ||
+   [[ ! "$virustotal_state" =~ ^(pending|clean|suspicious|malicious)$ ]]; then
+  write_failure "virustotal" "VirusTotal submission or lookup failed"
+  echo "$result"
+  exit 43
+fi
+
 install -D -m 0700 "$clawscan_bin" "$stage/bin/clawscan"
 install -D -m 0700 "$repo_root/infra/proxmox/run-security-gate.sh" "$stage/infra/proxmox/run-security-gate.sh"
 install -D -m 0700 "$repo_root/infra/proxmox/run-security-gate-crabbox.sh" "$stage/infra/proxmox/run-security-gate-crabbox.sh"
@@ -112,8 +140,36 @@ if [[ "$host_gate_status" -ne 0 || "$runner_gate_exit" -ne 0 ]] || \
   exit 42
 fi
 
+# Reuse the exact local evidence accepted by the gate. The OAuth profile
+# refreshes VirusTotal immediately before Codex, without duplicate upload or
+# redundant local scans.
+jq -e '.scanners.virustotal.raw' "$virustotal_dir/initial.json" > "$review_dir/virustotal.json"
+jq -e '.scanners.skillspector.raw' "$security_dir/free-scan.json" > "$review_dir/skillspector.json"
+jq -e '.scanners["clawscan-static"].raw' "$security_dir/free-scan.json" > "$review_dir/clawscan-static.json"
+
+review_status=0
+"$clawscan_bin" "$stage/target" \
+  --profile clawhub-oauth \
+  --scanner-result "virustotal=$review_dir/virustotal.json" \
+  --scanner-result "skillspector=$review_dir/skillspector.json" \
+  --scanner-result "clawscan-static=$review_dir/clawscan-static.json" \
+  --output "$review_dir/artifact.json" \
+  > "$review_dir/clawscan.stdout" \
+  2> "$review_dir/clawscan.stderr" || review_status=$?
+review_judge_status="$(jq -er '.judge.status | strings' "$review_dir/artifact.json" 2>/dev/null)" || review_judge_status=failed
+review_vt_status="$(jq -er '.scanners.virustotal.raw.status | strings' "$review_dir/artifact.json" 2>/dev/null)" || review_vt_status=failed
+review_verdict="$(jq -er '.judge.result.verdict | strings' "$review_dir/artifact.json" 2>/dev/null)" || review_verdict=unknown
+if [[ "$review_status" -ne 0 || "$review_judge_status" != "completed" ]] ||
+   [[ "$review_vt_status" =~ ^(pending|failed)$ ]] ||
+   [[ "$review_verdict" != "benign" ]]; then
+  write_failure "clawhub-review" "ClawHub review did not return a benign completed verdict"
+  echo "$result"
+  exit 44
+fi
+
 # The model credential is requested only after the controller has independently
-# accepted the free/static evidence. It is inherited by only the bounded relay.
+# accepted the free/static evidence and ClawHub review. It is inherited by only
+# the bounded relay.
 api_key="$($key_command)"
 [[ -n "$api_key" && "$api_key" != *$'\n'* && "$api_key" != *$'\r'* ]] || die "MiniMax key command returned invalid output"
 relay_receipt="$output_root/minimax-relay-receipt.json"
@@ -158,13 +214,15 @@ fi
 
 jq -n \
   --slurpfile securityGate "$security_dir/security-gate.json" \
+  --slurpfile clawhubReview "$review_dir/artifact.json" \
   --slurpfile relay "$relay_receipt" \
   --arg evidence "$output_root/behavior-evidence.json" '{
     schemaVersion: "observatory.pipeline.v1",
     status: "passed",
     stage: "completed",
-    reason: "security scan passed and behavior capture completed",
+    reason: "security scan and ClawHub review passed; behavior capture completed",
     securityGate: $securityGate[0],
+    clawhubReview: $clawhubReview[0],
     modelRelay: $relay[0],
     behaviorEvidence: $evidence
   }' > "$result"

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openclaw/clawscan/internal/runner"
 )
@@ -59,6 +60,12 @@ func TestResolveArgsUsesEmbeddedClawHubOAuthProfile(t *testing.T) {
 	}
 	if opts.Judge == nil || opts.Judge.Execution != runner.JudgeExecutionHost {
 		t.Fatalf("judge = %#v", opts.Judge)
+	}
+	if got := strings.Join(opts.Scanners, ","); got != "virustotal,skillspector,clawscan-static" {
+		t.Fatalf("OAuth scanner order = %q", got)
+	}
+	if got := strings.Join(opts.Judge.WaitForScanners, ","); got != "virustotal" || opts.Judge.WaitTimeout != 10*time.Minute || opts.Judge.WaitInterval != 30*time.Second {
+		t.Fatalf("OAuth judge wait = %#v", opts.Judge)
 	}
 	if !strings.Contains(opts.Judge.Command, "--ignore-user-config") || !strings.Contains(opts.Judge.Command, "features.shell_tool=true") {
 		t.Fatalf("OAuth judge is not hardened: %q", opts.Judge.Command)

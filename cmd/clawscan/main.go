@@ -574,6 +574,10 @@ Core flags:
   --json                      Print the full artifact JSON to stdout and skip default file writes unless --output is passed.
   --judge <cmd>               Optional external judge harness command.
   --judge-execution <mode>    Run the judge in the Docker sandbox (default) or on the host.
+  --judge-wait-for-scanner <id>
+                              Require refreshable scanner evidence before the judge. Repeatable; currently VirusTotal only.
+  --judge-wait-timeout <dur>  Maximum total scanner wait, such as 10m.
+  --judge-wait-interval <dur> Scanner polling interval, such as 30s.
   --sandbox <docker|off>      Command sandbox mode. Defaults to docker.
   --sandbox-image <image>     Docker runtime image. Defaults to %s or CLAWSCAN_SANDBOX_IMAGE.
   --sandbox-env <name>        Allow an env var through the Docker sandbox. Repeat for multiple vars.

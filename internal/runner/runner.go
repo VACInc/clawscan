@@ -48,9 +48,12 @@ type BenchmarkOptions struct {
 }
 
 type JudgeOptions struct {
-	Command   string
-	Execution string
-	Files     map[string][]byte
+	Command         string
+	Execution       string
+	Files           map[string][]byte
+	WaitForScanners []string
+	WaitTimeout     time.Duration
+	WaitInterval    time.Duration
 }
 
 const (
@@ -238,6 +241,11 @@ func ParseArgs(args []string) (Options, error) {
 	var judge string
 	var judgeExecution string
 	var judgeExecutionSet bool
+	var judgeWaitForScanners []string
+	var judgeWaitTimeout time.Duration
+	var judgeWaitTimeoutSet bool
+	var judgeWaitInterval time.Duration
+	var judgeWaitIntervalSet bool
 	for i := start; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
@@ -299,6 +307,35 @@ func ParseArgs(args []string) (Options, error) {
 			}
 			judgeExecutionSet = true
 			i = next
+		case "--judge-wait-for-scanner":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return Options{}, err
+			}
+			judgeWaitForScanners = append(judgeWaitForScanners, value)
+			i = next
+		case "--judge-wait-timeout":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return Options{}, err
+			}
+			judgeWaitTimeout, err = time.ParseDuration(value)
+			if err != nil || judgeWaitTimeout <= 0 {
+				return Options{}, errors.New("--judge-wait-timeout must be a positive duration")
+			}
+			judgeWaitTimeoutSet = true
+			i = next
+		case "--judge-wait-interval":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return Options{}, err
+			}
+			judgeWaitInterval, err = time.ParseDuration(value)
+			if err != nil || judgeWaitInterval <= 0 {
+				return Options{}, errors.New("--judge-wait-interval must be a positive duration")
+			}
+			judgeWaitIntervalSet = true
+			i = next
 		case "--sandbox":
 			value, next, err := readValue(args, i, arg)
 			if err != nil {
@@ -340,14 +377,47 @@ func ParseArgs(args []string) (Options, error) {
 			return Options{}, fmt.Errorf("Scanner result provided for unrequested scanner: %s", scanner)
 		}
 	}
-	if judgeExecutionSet && judge == "" {
-		return Options{}, errors.New("--judge-execution requires --judge")
+	if (judgeExecutionSet || len(judgeWaitForScanners) > 0 || judgeWaitTimeoutSet || judgeWaitIntervalSet) && judge == "" {
+		return Options{}, errors.New("judge execution and wait flags require --judge")
 	}
 	if judge != "" {
 		if !judgeExecutionSet {
 			judgeExecution = JudgeExecutionSandbox
 		}
-		opts.Judge = &JudgeOptions{Command: judge, Execution: judgeExecution}
+		if (judgeWaitTimeoutSet || judgeWaitIntervalSet) && len(judgeWaitForScanners) == 0 {
+			return Options{}, errors.New("judge wait timeout/interval requires --judge-wait-for-scanner")
+		}
+		if len(judgeWaitForScanners) > 0 {
+			if !judgeWaitTimeoutSet {
+				judgeWaitTimeout = 10 * time.Minute
+			}
+			if !judgeWaitIntervalSet {
+				judgeWaitInterval = 30 * time.Second
+			}
+			if judgeWaitInterval > judgeWaitTimeout {
+				return Options{}, errors.New("judge wait interval cannot exceed wait timeout")
+			}
+			seenWait := map[string]bool{}
+			for _, scanner := range judgeWaitForScanners {
+				if scanner != "virustotal" {
+					return Options{}, fmt.Errorf("Scanner %s cannot be refreshed before judge execution", scanner)
+				}
+				if !requestedScanners[scanner] {
+					return Options{}, fmt.Errorf("Judge wait references unrequested scanner: %s", scanner)
+				}
+				if seenWait[scanner] {
+					return Options{}, fmt.Errorf("Duplicate judge wait scanner: %s", scanner)
+				}
+				seenWait[scanner] = true
+			}
+		}
+		opts.Judge = &JudgeOptions{
+			Command:         judge,
+			Execution:       judgeExecution,
+			WaitForScanners: judgeWaitForScanners,
+			WaitTimeout:     judgeWaitTimeout,
+			WaitInterval:    judgeWaitInterval,
+		}
 	}
 	return opts, nil
 }
@@ -442,15 +512,24 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 		artifact.Scanners[scanner] = result
 	}
 	if opts.Judge != nil {
-		judgeRunner := commandRunner
-		if opts.Judge.Execution == JudgeExecutionHost {
-			judgeRunner = hostJudgeCommandRunner(opts, ctx, env)
+		blockedReason := waitForJudgeScanners(opts, &artifact, target, scannerRunner)
+		if blockedReason != "" {
+			artifact.Judge = &JudgeResult{
+				Status:    "blocked",
+				Execution: opts.Judge.Execution,
+				Error:     blockedReason,
+			}
+		} else {
+			judgeRunner := commandRunner
+			if opts.Judge.Execution == JudgeExecutionHost {
+				judgeRunner = hostJudgeCommandRunner(opts, ctx, env)
+			}
+			result, err := RunJudge(*opts.Judge, artifact, judgeRunner, 20*time.Minute, env)
+			if err != nil {
+				return Artifact{}, err
+			}
+			artifact.Judge = result
 		}
-		result, err := RunJudge(*opts.Judge, artifact, judgeRunner, 20*time.Minute, env)
-		if err != nil {
-			return Artifact{}, err
-		}
-		artifact.Judge = result
 	}
 	artifact.CompletedAt = now().UTC().Format(time.RFC3339Nano)
 	if opts.OutputPath != "" {
@@ -842,6 +921,65 @@ func scannerResult(opts Options, scanner string, target resolvedTarget, startedA
 		return unsupportedTargetKindResult(scanner, target.kind, startedAt), nil
 	}
 	return scannerRunner.RunScanner(scanner, target.resolvedPath, startedAt)
+}
+
+func waitForJudgeScanners(opts Options, artifact *Artifact, target resolvedTarget, scannerRunner ScannerRunner) string {
+	if opts.Judge == nil || len(opts.Judge.WaitForScanners) == 0 {
+		return ""
+	}
+	for _, scanner := range opts.Judge.WaitForScanners {
+		result, ok := artifact.Scanners[scanner]
+		if !ok {
+			return fmt.Sprintf("Judge blocked: required scanner %s has no result.", scanner)
+		}
+		if result.Status == "failed" || result.Status == "skipped" {
+			return fmt.Sprintf("Judge blocked: required scanner %s finished with status %s.", scanner, result.Status)
+		}
+		status, err := normalizedScannerEvidenceStatus(scanner, result.Raw)
+		if err != nil {
+			result.Status = "failed"
+			result.Error = err.Error()
+			artifact.Scanners[scanner] = result
+			return fmt.Sprintf("Judge blocked: required scanner %s did not provide usable evidence.", scanner)
+		}
+		if status == "pending" {
+			started := time.Now()
+			result = waitForVirusTotalResult(scannerRunner, target.resolvedPath, result, opts.Judge.WaitTimeout, opts.Judge.WaitInterval)
+			result.DurationMs += time.Since(started).Milliseconds()
+			artifact.Scanners[scanner] = result
+			if result.Status != "completed" {
+				return fmt.Sprintf("Judge blocked: required scanner %s did not complete: %s", scanner, result.Error)
+			}
+			status, err = normalizedScannerEvidenceStatus(scanner, result.Raw)
+			if err != nil || status == "pending" {
+				return fmt.Sprintf("Judge blocked: required scanner %s remained pending.", scanner)
+			}
+		}
+	}
+	return ""
+}
+
+type scannerResultWaiter interface {
+	WaitForScanner(name string, target string, current ScannerResult, timeout time.Duration, interval time.Duration) ScannerResult
+}
+
+func waitForVirusTotalResult(scannerRunner ScannerRunner, target string, current ScannerResult, timeout time.Duration, interval time.Duration) ScannerResult {
+	waiter, ok := scannerRunner.(scannerResultWaiter)
+	if !ok {
+		current.Status = "failed"
+		current.Error = "VirusTotal result waiting is unavailable for the configured scanner runner."
+		return current
+	}
+	return waiter.WaitForScanner("virustotal", target, current, timeout, interval)
+}
+
+func normalizedScannerEvidenceStatus(scanner string, raw json.RawMessage) (string, error) {
+	switch scanner {
+	case "virustotal":
+		return virusTotalAnalysisStatus(raw)
+	default:
+		return "", fmt.Errorf("Scanner %s cannot be refreshed before judge execution", scanner)
+	}
 }
 
 var promptPlaceholderPattern = regexp.MustCompile(`\{\{\s*(scanners\.([a-zA-Z0-9_-]+)|target\.files)\s*\}\}`)
@@ -2083,7 +2221,7 @@ func isSecretEnvKey(key string) bool {
 func requirements(opts Options, env map[string]string) []EnvRequirement {
 	var reqs []EnvRequirement
 	for _, scanner := range opts.Scanners {
-		if opts.ScannerResultPaths[scanner] != "" {
+		if opts.ScannerResultPaths[scanner] != "" && !judgeWaitsForScanner(opts.Judge, scanner) {
 			continue
 		}
 		if adapter, ok := DefaultScannerRegistry().Adapter(scanner); ok {
@@ -2091,6 +2229,18 @@ func requirements(opts Options, env map[string]string) []EnvRequirement {
 		}
 	}
 	return dedupe(reqs)
+}
+
+func judgeWaitsForScanner(judge *JudgeOptions, scanner string) bool {
+	if judge == nil {
+		return false
+	}
+	for _, awaited := range judge.WaitForScanners {
+		if awaited == scanner {
+			return true
+		}
+	}
+	return false
 }
 
 func envPresence(opts Options, env map[string]string) map[string]string {

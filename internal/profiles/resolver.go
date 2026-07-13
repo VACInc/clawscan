@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/openclaw/clawscan/internal/runner"
 	"gopkg.in/yaml.v3"
@@ -45,8 +46,11 @@ type Sandbox struct {
 }
 
 type Judge struct {
-	Command   string `yaml:"command"`
-	Execution string `yaml:"execution,omitempty"`
+	Command         string   `yaml:"command"`
+	Execution       string   `yaml:"execution,omitempty"`
+	WaitForScanners []string `yaml:"waitForScanners,omitempty"`
+	WaitTimeout     string   `yaml:"waitTimeout,omitempty"`
+	WaitInterval    string   `yaml:"waitInterval,omitempty"`
 }
 
 type resolvedProfile struct {
@@ -71,6 +75,11 @@ type cliIntent struct {
 	judgeSet             bool
 	judgeExecution       string
 	judgeExecutionSet    bool
+	judgeWaitForScanners []string
+	judgeWaitTimeout     string
+	judgeWaitTimeoutSet  bool
+	judgeWaitInterval    string
+	judgeWaitIntervalSet bool
 	sandbox              string
 	sandboxSet           bool
 	sandboxImage         string
@@ -480,6 +489,29 @@ func parseCLIIntent(args []string) (cliIntent, error) {
 			intent.judgeExecution = value
 			intent.judgeExecutionSet = true
 			i = next
+		case "--judge-wait-for-scanner":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return cliIntent{}, err
+			}
+			intent.judgeWaitForScanners = append(intent.judgeWaitForScanners, value)
+			i = next
+		case "--judge-wait-timeout":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return cliIntent{}, err
+			}
+			intent.judgeWaitTimeout = value
+			intent.judgeWaitTimeoutSet = true
+			i = next
+		case "--judge-wait-interval":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return cliIntent{}, err
+			}
+			intent.judgeWaitInterval = value
+			intent.judgeWaitIntervalSet = true
+			i = next
 		case "--sandbox":
 			value, next, err := readValue(args, i, arg)
 			if err != nil {
@@ -624,24 +656,51 @@ func buildRunnerArgs(intent cliIntent, selected resolvedProfile, profileName str
 
 	judgeCommand := ""
 	judgeExecution := ""
+	var judgeWaitForScanners []string
+	judgeWaitTimeout := ""
+	judgeWaitInterval := ""
 	if profile.Judge != nil && shouldUseProfileJudge(intent) {
 		judgeCommand = resolveJudgePaths(profile.Judge.Command, selected.configDir)
 		judgeExecution = profile.Judge.Execution
+		judgeWaitForScanners = append([]string{}, profile.Judge.WaitForScanners...)
+		judgeWaitTimeout = profile.Judge.WaitTimeout
+		judgeWaitInterval = profile.Judge.WaitInterval
 	}
 	if intent.judgeSet {
 		judgeCommand = intent.judge
 		judgeExecution = ""
+		judgeWaitForScanners = nil
+		judgeWaitTimeout = ""
+		judgeWaitInterval = ""
 	}
 	if intent.judgeExecutionSet {
 		judgeExecution = intent.judgeExecution
+	}
+	if len(intent.judgeWaitForScanners) > 0 {
+		judgeWaitForScanners = append([]string{}, intent.judgeWaitForScanners...)
+	}
+	if intent.judgeWaitTimeoutSet {
+		judgeWaitTimeout = intent.judgeWaitTimeout
+	}
+	if intent.judgeWaitIntervalSet {
+		judgeWaitInterval = intent.judgeWaitInterval
 	}
 	if judgeCommand != "" {
 		args = append(args, "--judge", judgeCommand)
 		if judgeExecution != "" {
 			args = append(args, "--judge-execution", judgeExecution)
 		}
-	} else if intent.judgeExecutionSet {
-		return nil, nil, errors.New("--judge-execution requires a configured judge or --judge")
+		for _, scanner := range judgeWaitForScanners {
+			args = append(args, "--judge-wait-for-scanner", scanner)
+		}
+		if judgeWaitTimeout != "" {
+			args = append(args, "--judge-wait-timeout", judgeWaitTimeout)
+		}
+		if judgeWaitInterval != "" {
+			args = append(args, "--judge-wait-interval", judgeWaitInterval)
+		}
+	} else if intent.judgeExecutionSet || len(intent.judgeWaitForScanners) > 0 || intent.judgeWaitTimeoutSet || intent.judgeWaitIntervalSet {
+		return nil, nil, errors.New("judge execution and wait flags require a configured judge or --judge")
 	}
 	if selected.sandbox.Mode != "" {
 		args = append(args, "--sandbox", selected.sandbox.Mode)
@@ -706,6 +765,39 @@ func validateProfile(name string, profile Profile) error {
 		}
 		if _, err := runner.NormalizeJudgeExecution(profile.Judge.Execution); err != nil {
 			return fmt.Errorf("Profile %s: %w", name, err)
+		}
+		seenWait := map[string]bool{}
+		for _, scanner := range profile.Judge.WaitForScanners {
+			if scanner != "virustotal" {
+				return fmt.Errorf("Profile %s judge wait scanner cannot be refreshed: %s", name, scanner)
+			}
+			if !seen[scanner] {
+				return fmt.Errorf("Profile %s judge wait references unrequested scanner: %s", name, scanner)
+			}
+			if seenWait[scanner] {
+				return fmt.Errorf("Profile %s has duplicate judge wait scanner: %s", name, scanner)
+			}
+			seenWait[scanner] = true
+		}
+		if len(profile.Judge.WaitForScanners) == 0 && (profile.Judge.WaitTimeout != "" || profile.Judge.WaitInterval != "") {
+			return fmt.Errorf("Profile %s judge wait timing requires waitForScanners", name)
+		}
+		var timeout time.Duration
+		if profile.Judge.WaitTimeout != "" {
+			parsed, err := time.ParseDuration(profile.Judge.WaitTimeout)
+			if err != nil || parsed <= 0 || parsed > time.Hour {
+				return fmt.Errorf("Profile %s judge waitTimeout must be a positive duration no greater than 1h", name)
+			}
+			timeout = parsed
+		}
+		if profile.Judge.WaitInterval != "" {
+			parsed, err := time.ParseDuration(profile.Judge.WaitInterval)
+			if err != nil || parsed <= 0 || parsed > 5*time.Minute {
+				return fmt.Errorf("Profile %s judge waitInterval must be a positive duration no greater than 5m", name)
+			}
+			if timeout > 0 && parsed > timeout {
+				return fmt.Errorf("Profile %s judge waitInterval cannot exceed waitTimeout", name)
+			}
 		}
 	}
 	return nil

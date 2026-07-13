@@ -74,7 +74,9 @@ separated token both need the same narrow `SDN.Use` grant for `vmbr2`.
 
 ## Fail-closed security gate
 
-`run-security-gate.sh` is the mandatory first phase. It runs ClawScan Static,
+`run-gated-observatory.sh` first submits the staged target to VirusTotal, then
+runs `run-security-gate.sh` while that external analysis is pending. The local
+gate runs ClawScan Static,
 SkillSpector without an LLM, Cisco's base analyzers, and AgentVerus inside the
 pinned Docker runtime. It removes optional provider credentials before launch
 and applies `evaluate-local-free-scan.jq` to the complete artifact.
@@ -86,11 +88,12 @@ contract, or material finding returns exit `42` with:
 {"status":"failed","stage":"security-scan","reason":"failed due to security scan"}
 ```
 
-The model relay must not be started and the behavior phase must not be
-provisioned unless this gate returns `passed`. Plugins require a clean Static
-result; the three skill-only scanners must return their exact documented plugin
-skip result. The owned smoke proves a benign skill and plugin pass while the
-owned hostile probe is rejected.
+After the local gate passes, the controller reuses its exact Static and
+SkillSpector evidence, polls the original VirusTotal submission without
+re-uploading, and runs the `clawhub-oauth` Codex judge. An unresolved
+VirusTotal report or non-benign/failed judge blocks the behavioral phase. The
+model relay must not be started and the behavior VM must not be provisioned
+until all of those gates pass.
 
 ## MiniMax secret relay
 

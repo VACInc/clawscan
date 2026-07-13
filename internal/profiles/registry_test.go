@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProfileRegistryReturnsSortedIDs(t *testing.T) {
@@ -50,6 +51,15 @@ func TestDefaultProfileRegistryContainsEmbeddedBuiltIns(t *testing.T) {
 	}
 	if oauth.profile.Judge == nil || oauth.profile.Judge.Execution != "host" {
 		t.Fatalf("clawhub-oauth judge = %#v", oauth.profile.Judge)
+	}
+	if got := strings.Join(oauth.profile.Scanners, ","); got != "virustotal,skillspector,clawscan-static" {
+		t.Fatalf("clawhub-oauth scanners = %q", got)
+	}
+	if got := strings.Join(oauth.profile.Judge.WaitForScanners, ","); got != "virustotal" {
+		t.Fatalf("clawhub-oauth wait scanners = %q", got)
+	}
+	if timeout, err := time.ParseDuration(oauth.profile.Judge.WaitTimeout); err != nil || timeout != 10*time.Minute {
+		t.Fatalf("clawhub-oauth wait timeout = %q, %v", oauth.profile.Judge.WaitTimeout, err)
 	}
 }
 

@@ -57,6 +57,129 @@ type virusTotalFileResponse struct {
 	} `json:"data"`
 }
 
+func virusTotalAnalysisStatus(raw json.RawMessage) (string, error) {
+	if !json.Valid(raw) {
+		return "", fmt.Errorf("VirusTotal evidence is not valid JSON")
+	}
+	var analysis virusTotalNormalizedAnalysis
+	if err := json.Unmarshal(raw, &analysis); err != nil {
+		return "", fmt.Errorf("decode VirusTotal evidence: %w", err)
+	}
+	switch analysis.Status {
+	case "clean", "malicious", "suspicious", "pending":
+		return analysis.Status, nil
+	default:
+		return "", fmt.Errorf("VirusTotal evidence has unsupported status %q", analysis.Status)
+	}
+}
+
+func (runner ExternalScannerRunner) WaitForScanner(name string, target string, current ScannerResult, timeout time.Duration, interval time.Duration) ScannerResult {
+	if name != "virustotal" {
+		current.Status = "failed"
+		current.Error = fmt.Sprintf("Scanner %s cannot be refreshed before judge execution", name)
+		return current
+	}
+	return runner.waitForVirusTotal(target, current, timeout, interval)
+}
+
+func (runner ExternalScannerRunner) waitForVirusTotal(target string, current ScannerResult, timeout time.Duration, interval time.Duration) ScannerResult {
+	completedAt := func() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+	fail := func(message string, raw json.RawMessage) ScannerResult {
+		current.Status = "failed"
+		current.CompletedAt = completedAt()
+		current.Error = message
+		if raw != nil {
+			current.Raw = raw
+		}
+		return current
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if interval > timeout {
+		return fail("VirusTotal wait interval exceeds timeout.", nil)
+	}
+	artifact, err := virusTotalArtifact(target)
+	if err != nil {
+		return fail(err.Error(), nil)
+	}
+	var previous virusTotalNormalizedAnalysis
+	if err := json.Unmarshal(current.Raw, &previous); err != nil {
+		return fail(fmt.Sprintf("decode pending VirusTotal evidence: %v", err), nil)
+	}
+	if previous.SHA256 != artifact.SHA256 {
+		return fail("Pending VirusTotal evidence does not match the staged target digest.", nil)
+	}
+	apiKey := strings.TrimSpace(runner.Env["VIRUSTOTAL_API_KEY"])
+	client := runner.VirusTotalHTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	deadline := time.Now().Add(timeout)
+	current.Command = []string{"virustotal", "file-report", artifact.Kind, "sha256:" + artifact.SHA256, "poll"}
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fail(fmt.Sprintf("VirusTotal result wait timed out after %s.", timeout), nil)
+		}
+		requestTimeout := runner.Timeout
+		if requestTimeout <= 0 || requestTimeout > remaining {
+			requestTimeout = remaining
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		raw, statusCode, requestErr := virusTotalFileReport(ctx, client, apiKey, artifact.SHA256)
+		cancel()
+		if requestErr != nil {
+			return fail(fmt.Sprintf("VirusTotal file report poll failed: %v", requestErr), nil)
+		}
+		switch {
+		case statusCode >= 200 && statusCode <= 299:
+			normalized, normalizeErr := normalizeVirusTotalFileReport(raw, artifact.SHA256, time.Now)
+			if normalizeErr != nil {
+				return fail(normalizeErr.Error(), raw)
+			}
+			status, statusErr := virusTotalAnalysisStatus(normalized)
+			if statusErr != nil {
+				return fail(statusErr.Error(), normalized)
+			}
+			current.Raw = normalized
+			current.CompletedAt = completedAt()
+			if status != "pending" {
+				current.Status = "completed"
+				current.Error = ""
+				return current
+			}
+		case statusCode == http.StatusNotFound:
+			previous.CheckedAt = time.Now().UnixMilli()
+			pending, marshalErr := json.Marshal(previous)
+			if marshalErr != nil {
+				return fail(marshalErr.Error(), nil)
+			}
+			current.Raw = pending
+			current.CompletedAt = completedAt()
+		default:
+			message := fmt.Sprintf("VirusTotal API returned HTTP %d while waiting for results.", statusCode)
+			if !json.Valid(raw) {
+				message = fmt.Sprintf("VirusTotal API returned HTTP %d with non-JSON response while waiting for results.", statusCode)
+				raw = nil
+			}
+			return fail(message, raw)
+		}
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			return fail(fmt.Sprintf("VirusTotal result wait timed out after %s.", timeout), nil)
+		}
+		delay := interval
+		if delay > remaining {
+			delay = remaining
+		}
+		time.Sleep(delay)
+	}
+}
+
 type virusTotalStats struct {
 	Malicious  int `json:"malicious"`
 	Suspicious int `json:"suspicious"`

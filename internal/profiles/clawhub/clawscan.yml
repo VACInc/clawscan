@@ -31,14 +31,18 @@ profiles:
         - < {{ prompt:prompt.md }}
   clawhub-oauth:
     scanners:
-      - skillspector
       - virustotal
+      - skillspector
       - clawscan-static
     sandbox:
       env:
         - VIRUSTOTAL_API_KEY
     judge:
       execution: host
+      waitForScanners:
+        - virustotal
+      waitTimeout: 10m
+      waitInterval: 30s
       command: >-
         codex exec --cd {{ workspace }}
         --model gpt-5.5
