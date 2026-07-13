@@ -79,3 +79,8 @@ configuration as trusted code: ClawScan executes its command using the host
 shell. Use it only for a tightly constrained judge such as `clawhub-oauth`.
 `waitForScanners` currently supports `virustotal`; a pending result is polled
 without re-uploading the artifact, and an unresolved result blocks the judge.
+
+VirusTotal is not a private sandbox. A hash miss causes the staged archive to be
+uploaded and it may enter VirusTotal's shared corpus. Operators must confirm
+that upload is permitted for the target and that their API plan/terms cover the
+workflow before enabling this profile.

@@ -6,7 +6,8 @@ baseline runtime activity, and preserves normalized `observatory.behavior.v2`
 evidence. Both the standalone CLI and the Clawscan `behavior` adapter accept
 skills and native OpenClaw plugins; Clawscan classifies a target directory that
 holds `openclaw.plugin.json` as a plugin and passes it straight to Observatory.
-Skill-only scanners return a clear skipped result for plugin targets.
+The ClawHub profile's Static, SkillSpector, and VirusTotal adapters also accept
+plugins; other skill-only scanners return a clear skipped result.
 The `observatory.behavior.v2` schema intentionally has no verdict, score, or
 recommendation. A separate, derived `observatory.grade.v2` projection adds a
 deterministic behavioral grade without changing that; see
@@ -17,6 +18,18 @@ outer artifact has a separate 256 MiB input cap and the embedded behavior
 payload still must satisfy the 64 MiB evidence bound.
 Current tools also read historical `observatory.behavior.v1` evidence, whose
 isolation receipt predates the required Proxmox CA digest.
+
+## Hands-off gated flow
+
+The complete deployment flow is `infra/proxmox/run-gated-observatory.sh` with
+the dedicated runner contract in `infra/proxmox/README.md`. It stages the target
+once, submits VirusTotal first, runs the pinned local/free scanners in a fresh
+Proxmox clone while VirusTotal is pending, and stops on any local gate failure.
+It then reuses that accepted scanner evidence, polls the original VirusTotal
+submission without re-uploading, and requires a completed benign
+`clawhub-oauth` Codex verdict before starting the MiniMax relay or behavioral
+VM. The target never receives VirusTotal, Codex, MiniMax, Proxmox, or Crabbox
+credentials.
 
 ## Build and configure
 
@@ -40,7 +53,7 @@ proxmox:
   apiUrl: https://pve-observatory.example:8006
   node: pve-observatory
   templateId: 9400
-  bridge: vmbr1
+  bridge: vmbr2
   user: crabbox
   workRoot: /work/observatory
   fullClone: true
@@ -551,10 +564,10 @@ sandbox. Live mode requires:
   the exact relay/sink loopback ports for the hostile UID, and the exact model
   IP/port only for the separate control UID; evidence retains both the per-run
   applied-rules hash and a stable canonical-policy digest;
-- an explicit full-clone template, a PVE Linux bridge named `vmbr0` through
-  `vmbr9999`, a `0600` dedicated Crabbox config with `insecureTLS: false`, and
-  a pinned CA bundle; arbitrary Crabbox arguments and ambient overrides are not
-  accepted.
+- an explicit full-clone template, a dedicated PVE Linux quarantine bridge
+  named `vmbr2` through `vmbr9999` (never `vmbr0`/`vmbr1`), a `0600` dedicated
+  Crabbox config with `insecureTLS: false`, and a pinned CA bundle; arbitrary
+  Crabbox arguments and ambient overrides are not accepted.
 
 The generated agent has coding tools but no messaging, scheduling, delegation,
 gateway, media, or elevated tool surface. Raw command arguments, transcripts,

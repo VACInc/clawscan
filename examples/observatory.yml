@@ -25,7 +25,7 @@ isolation:
   verified: false
   verification: pending
   vmTemplateId: 9400
-  networkBridge: vmbr1
+  networkBridge: vmbr2
   freshVm: true
   dedicatedNetwork: true
   defaultDenyEgress: true

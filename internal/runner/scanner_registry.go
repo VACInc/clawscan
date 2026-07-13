@@ -215,7 +215,7 @@ func defaultScannerAdapters() []ScannerAdapter {
 			supportsPlugins: true,
 			info: ScannerInfo{
 				DisplayName:   "ClawHub Observatory Behavior",
-				RepositoryURL: "https://github.com/VACInc/clawhub-observatory",
+				RepositoryURL: "https://github.com/VACInc/clawscan-observatory",
 				Description:   "Paired baseline/exercise runtime evidence for OpenClaw skills and native plugins in a separately isolated disposable environment. Requires --sandbox off because the scanner provisions its own remote boundary.",
 				OptionalEnv:   []string{"CLAWSCAN_BEHAVIOR_BIN"},
 			},

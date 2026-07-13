@@ -95,6 +95,11 @@ VirusTotal report or non-benign/failed judge blocks the behavioral phase. The
 model relay must not be started and the behavior VM must not be provisioned
 until all of those gates pass.
 
+VirusTotal hash misses upload the staged archive and are not a private analysis
+channel. The operator is responsible for target-upload authorization and API
+plan/terms suitability; the pipeline never silently substitutes a private
+guarantee.
+
 ## MiniMax secret relay
 
 The disposable VM never receives the MiniMax key. Observatory's existing

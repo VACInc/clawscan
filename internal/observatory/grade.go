@@ -9,9 +9,10 @@ import (
 )
 
 // GradeSchemaVersion identifies the derived grade projection. The grade is a
-// deterministic function of observatory.behavior.v1 evidence; it is never stored
-// inside that evidence and never claims universal safety or author intent. It
-// grades observed behavioral risk within the covered exercise only.
+// deterministic function of observatory.behavior.v2 evidence, with explicit
+// legacy-v1 read compatibility. It is never stored inside that evidence and
+// never claims universal safety or author intent. It grades observed behavioral
+// risk within the covered exercise only.
 const GradeSchemaVersion = "observatory.grade.v2"
 
 // GradePolicyVersion pins the scoring policy. Bump it whenever severities,

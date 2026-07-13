@@ -1,6 +1,7 @@
 # ClawHub Observatory — MVP Plan
 
-Continuous behavioral evidence for the ClawHub skill ecosystem. Evidence, never verdicts.
+Continuous behavioral evidence for OpenClaw skills and plugins. Raw evidence is
+kept separate from derived grades and gate decisions.
 
 The design incorporates the supplied research synthesis and prior-art analysis.
 
@@ -13,14 +14,20 @@ Build the missing dynamic scanner lane for `openclaw/clawscan`, plus the smalles
 3. `strace` captures successful and attempted file, process, and network activity across the agent process tree.
 4. The analyzer subtracts baseline runtime noise, normalizes private paths/endpoints, correlates synthetic honeytoken interactions across read, write, execute, outbound, and agent-output stages without publishing marker values, and emits `observatory.behavior.v2`. Tool-stage coverage remains explicitly limited because the current metadata ledger has no bounded arguments or results.
 5. A zero-dependency dark static page renders the evidence and an optional previous-version diff.
+6. The hands-off pipeline starts VirusTotal first, runs the pinned local/free
+   gate while it is pending, requires a terminal VirusTotal result before the
+   OAuth Codex judge, and only then provisions the behavioral lane.
 
 The MVP is one owned skill fixture and one owned plugin fixture end to end, not a premature Hub watcher or top-100 batch service. No ClawHub package is executed during development.
 
 ## Positioning guardrails
 
-- Extend Clawscan; do not build another static scanner or competing verdict engine.
-- Report observations such as “opened `$HOME/.aws/credentials`” or “attempted a connection to a public endpoint.” Never label a skill safe, malicious, or approved.
-- Support skills and native OpenClaw plugins as distinct target kinds. The Clawscan adapter remains skill-facing because that is Clawscan's current contract; plugin scans use the Observatory CLI directly.
+- Extend Clawscan; do not build another static scanner.
+- Keep `observatory.behavior.v2` observational. Derived
+  `observatory.grade.v2` and the separate ClawHub judge may classify the
+  evidence, but neither mutates or replaces it.
+- Support skills and native OpenClaw plugins as distinct target kinds across
+  Clawscan's ClawHub profile, the behavior adapter, and the Observatory CLI.
 - Treat live malicious-looking results as private until coordinated through the ClawHub moderation path.
 - Keep raw traces private. The public projection contains normalized observations, counts, hashes, coverage, and limitations—not transcripts, secrets, usernames, private IPs, or raw command arguments.
 - Bound the canonical public evidence projection consistently at 64 MiB; full multi-scanner Clawscan render inputs have a separate 256 MiB outer-artifact cap.
@@ -48,8 +55,11 @@ This is the MVP’s main technical claim and the foundation for declared-vs-obse
 ### Observatory CLI
 
 - `observatory scan --config <path> <target>`: stage a skill or native plugin, execute, analyze, emit JSON.
+- `observatory stage ...`: safely create the bounded target used by the gated pipeline.
+- `observatory matrix ...`: run explicitly configured model/runtime variants in fresh VMs and compare only receipt-compatible captures.
 - `observatory analyze ...`: turn fixture or captured traces into the same evidence schema without provisioning.
 - `observatory render --input <json> --output <dir> [--previous <json>]`: create a self-contained dark evidence page and public JSON.
+- `observatory grade --input <json>`: derive the deterministic, separately versioned behavioral grade.
 
 ### Disposable runtime
 
@@ -87,7 +97,14 @@ Crabbox’s own trust model says it is a developer execution tool, not hostile m
 - bounded runtime and artifact-size limits.
 - per-lane bounded tmpfs storage, preventing target writes from exhausting the guest disk.
 
-Live validation also requires an explicit full-clone template ID, a dedicated PVE `vmbr0` through `vmbr9999` bridge, six affirmative isolation controls, a `0600` Crabbox config pinned to Proxmox/Linux/full-clone with insecure TLS explicitly disabled, a bounded validated PEM CA bundle used as the exclusive trust anchor, and a non-root `/work/...` provisioner root. The exact CA digest is bound into the capture and isolation receipts. User-supplied Crabbox arguments and ambient TLS or `CRABBOX_*` overrides are rejected or stripped.
+Live validation also requires an explicit full-clone template ID, a dedicated
+site-local PVE quarantine bridge (the supplied pipeline refuses `vmbr0` and
+`vmbr1`), six affirmative isolation controls, a `0600` Crabbox config pinned to
+Proxmox/Linux/full-clone with insecure TLS explicitly disabled, a bounded
+validated PEM CA bundle used as the exclusive trust anchor, and a non-root
+`/work/...` provisioner root. The exact CA digest is bound into the capture and
+isolation receipts. User-supplied Crabbox arguments and ambient TLS or
+`CRABBOX_*` overrides are rejected or stripped.
 
 The example config leaves live mode disabled. This build will not run a real VM until those controls are independently verified.
 
@@ -160,6 +177,12 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 - Live scan refuses to start when isolation attestation or required runtime configuration is absent.
 - Renderer produces a self-contained dark page with current evidence and coverage limits; previous-version trace and canary deltas require matching stable lineage, effective-capture digest, runtime/isolation receipts, prompt, and coverage.
 - Owned skill and plugin fixtures both traverse staging, capture parsing, target-digest binding, normalization, evidence generation, and rendering; generated plugin config is accepted by the installed OpenClaw CLI.
+- A normal scan emits the deterministic grade, records bounded local history,
+  and can render or emit a receipt-compatible previous-version delta; matrix
+  mode remains explicit and sequential.
+- The gated runner submits VirusTotal before local work, never re-uploads while
+  polling, blocks Codex on unresolved/failed VirusTotal evidence, and blocks the
+  behavior phase unless both the local gate and ClawHub OAuth review pass.
 - Focused tests, full `go test -count=1 ./...`, `go vet ./...`, CLI smoke tests, docs build, and repository autoreview pass.
 
 ## Explicitly outside the MVP
@@ -168,23 +191,24 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 - public hosting, RSS, moderation alerts, and RFC integration;
 - browser/GUI automation;
 - packet payload publication or full DNS attribution;
-- malware verdicts, risk scores, automatic blocking, or publisher reputation;
-- live Proxmox validation before the isolation boundary is verified.
+- publisher reputation or automatic public moderation actions;
+- treating a behavioral grade or one scanner as proof of universal safety;
+- shipping site-specific Proxmox network configuration as a universal default.
 
-## After the MVP
+## Implemented extensions and next phase
 
-1. After explicit VM-teardown approval, validate the owned probe skill and probe plugin in the real isolated Proxmox lane.
-2. Declared-capability input, observed-capability diffs, and deterministic
+1. Declared-capability input, observed-capability diffs, and deterministic
    behavioral grading are implemented as a derived, versioned projection (`observatory.grade.v2`,
    policy `observatory.grade-policy.v2`): a deterministic A–F behavioral grade
    with separate confidence/coverage, an explicit `ungraded` state, dimension
    reasons, hard escalators, and a conservative declared-vs-observed comparison.
-   The grade is computed from `observatory.behavior.v1` evidence and is never a
-   field inside it, so the evidence stays pure observation. Version 2 binds the
+   The grade is computed from `observatory.behavior.v2` evidence (with explicit
+   legacy-v1 read compatibility) and is never a field inside it, so the evidence
+   stays pure observation. Version 2 binds the
    full evidence digest, reports typed-channel coverage, fails closed on missing,
    malformed, or truncated mandatory inputs, and requires confirmed residual
    evidence before persistence can receive F. See `docs/observatory.md`.
-3. Version-keyed storage and update diffs are delivered as a hands-off local
+2. Version-keyed storage and update diffs are delivered as a hands-off local
    history: `scan` records completed evidence in a bounded, append-only,
    per-identity store and selects the latest strictly comparable predecessor to
    render or emit an evidence-based `observatory.version-delta.v1` document.
@@ -193,6 +217,10 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
    the per-identity cap fails a new record closed instead of pruning, and
    unexpected or corrupt history fails the workflow closed without suppressing
    the valid current evidence. Network catalog-driven version discovery stays
-   out of scope (see item 4).
-4. Add catalog watching, bounded concurrency, retry policy, and private moderation routing.
-5. Publish a small pilot, then propose the adapter upstream with copied real-behavior proof.
+   out of scope (see item 5).
+3. Model/config matrix runs are delivered as opt-in, sequential fresh-VM
+   captures with strict comparability receipts and structured exclusions.
+4. Build and validate the dedicated, secret-free Proxmox runner template, then
+   run the owned probe skill and probe plugin E2E after explicit approval of the
+   exact disposable VM lifecycle.
+5. Later: add catalog watching, bounded concurrency, retry policy, and private moderation routing.
