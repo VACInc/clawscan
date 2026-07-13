@@ -441,6 +441,82 @@ deltas from an unpaired capture are unreliable.
   the same grade. Persist `evidence.json` to re-grade later, including across
   policy upgrades for comparison.
 
+## Model/runtime comparison matrix
+
+The default scan runs exactly one model and one paired capture. An optional,
+opt-in matrix compares how the same target behaves under a bounded list of
+model/runtime variants. The matrix never changes the default: a plain
+`observatory scan` always uses the single `runtime.model`, even when a `matrix`
+block is present. Only the `matrix` subcommand reads the variants.
+
+Define variants as sparse overrides of the base model and its endpoint
+allowlist; unset fields inherit. The only variant fields are `model` (`provider`,
+`baseUrl`, `id`, `api`, `contextWindow`, and `maxTokens`) and
+`controlPlaneAddresses`. Runtime timeout, OpenClaw command, agent user,
+executor, isolation, exercise prompt, target lineage, and every staging and
+resource limit remain fixed. Between 2 and 8 variants are allowed. Each variant
+needs a unique, stable `id` and a distinct effective configuration — two ids for
+the same effective config, or two variants that resolve to the same capture
+digest, are rejected as ambiguous rather than silently merged.
+
+```yaml
+matrix:
+  variants:
+    - id: baseline-model
+      model: { id: local-tool-model }
+    - id: alternate-endpoint
+      model: { id: local-tool-model-b, baseUrl: http://10.0.0.21:8000/v1 }
+      controlPlaneAddresses: [10.0.0.21:8000]
+```
+
+Because a matrix multiplies resource use, the resource multiplier is always
+shown before any VM is provisioned, and `--dry-run` securely inspects the local
+target and prints the exact plan (target and fixed-config receipts, multiplier,
+fresh-VM count, worst-case wall clock, and per-variant model/endpoint class and
+capture digest) without provisioning anything:
+
+```bash
+./bin/observatory matrix --config ./observatory.yml --dry-run ./path/to/target
+```
+
+A real matrix run executes each variant as its own fresh-VM paired scan,
+sequentially (never concurrently), reusing the shared executor, isolation,
+target staging, exercise prompt, and limits so that captures differ only on the
+model/runtime axis. Each variant fully re-validates the live isolation contract
+before it starts. Use `--fail-fast` to stop at the first failing variant;
+otherwise the whole matrix runs and per-variant status is reported.
+
+```bash
+./bin/observatory matrix --config ./observatory.yml --output ./matrix ./path/to/target
+```
+
+`--output` is a no-clobber publication. The destination must not already exist.
+Observatory rejects symbolic links and unsafe path ancestors, writes every file
+with owner-only permissions in a private staging directory, syncs the files and
+directory, then atomically publishes the complete directory and syncs its
+parent. A failed or concurrent writer never truncates an existing file.
+
+The output is `observatory.matrix.v1`: a structured, side-by-side comparison of
+grade-ready behavioral signals. Each variant carries its bound
+`captureConfigSha256`, model receipt (provider, id, endpoint class), firewall
+policy digest, and per-kind signal totals. Each observed behavior appears once
+with its per-variant delta counts and a `uniform` flag. The comparison only
+covers variants whose captures are genuinely comparable — same target digest,
+prompt, coverage, isolation profile, and runtime versions. It refuses to compare
+captures that differ in anything other than the model/runtime axis, and lists
+incomplete or failed variants under `excluded` with a reason category. It never
+labels an incomparable capture as a behavioral difference, and it carries no
+verdict, score, or recommendation.
+
+The comparison also publishes an aggregate fixed-configuration receipt plus
+separate target, executor, isolation, runtime-constant, exercise, and resource
+limit receipts. Every input capture digest is recomputed from its exact
+effective configuration, and its model, prompt, firewall policy, isolation,
+executor, and target-lineage receipts must match before comparison. The current
+matrix schema does not yet bind grade or stage-delta receipts, so the matrix
+does not infer either one. Those signals belong at the same receipt-binding
+boundary only after a matrix schema revision supplies them.
+
 ## Isolation contract
 
 Crabbox provisions and operates the runner; it is not itself a hostile-code

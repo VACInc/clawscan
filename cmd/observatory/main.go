@@ -39,6 +39,8 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	switch args[0] {
 	case "scan":
 		return runScan(ctx, args[1:], stdout, stderr)
+	case "matrix":
+		return runMatrix(ctx, args[1:], stdout, stderr)
 	case "analyze":
 		return runAnalyze(args[1:], stdout, stderr)
 	case "render":
@@ -177,6 +179,60 @@ func renderSiteIfRequested(sitePath string, evidence observatory.Evidence, previ
 	}
 	fmt.Fprintf(stderr, "site: %s\n", filepath.Join(sitePath, "index.html"))
 	return nil
+}
+
+func runMatrix(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("matrix", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", defaultConfigPath(), "Observatory YAML config")
+	output := flags.String("output", "", "new directory for comparison.json and per-variant evidence (must not exist)")
+	jsonOutput := flags.Bool("json", false, "write the comparison JSON to stdout")
+	dryRun := flags.Bool("dry-run", false, "show the resource multiplier and plan without provisioning any VM")
+	failFast := flags.Bool("fail-fast", false, "stop at the first variant that fails instead of running the whole matrix")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: observatory matrix [--config path] [--dry-run] [--fail-fast] [--output dir] [--json] <target>")
+	}
+	config, err := observatory.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	// The matrix is strictly opt-in: it only runs from this subcommand, never
+	// from a plain scan. The plan (with its resource multiplier) is printed to
+	// stderr before any VM is provisioned.
+	options := observatory.MatrixOptions{DryRun: *dryRun, FailFast: *failFast, Progress: stderr}
+	result, runErr := observatory.RunMatrix(ctx, flags.Arg(0), config, nil, options)
+	if *dryRun {
+		if err := encodeJSON(stdout, result.Plan); err != nil {
+			return err
+		}
+		return runErr
+	}
+	for _, run := range result.Runs {
+		if run.RunDirectory != "" {
+			fmt.Fprintf(stderr, "variant %s: %s run_directory: %s\n", run.ID, run.Status, run.RunDirectory)
+		} else {
+			fmt.Fprintf(stderr, "variant %s: %s\n", run.ID, run.Status)
+		}
+		if run.Note != "" {
+			fmt.Fprintf(stderr, "variant %s: note: %s\n", run.ID, run.Note)
+		}
+	}
+	if result.Comparison.Schema != "" {
+		if *output != "" {
+			if err := writeMatrixOutput(*output, result); err != nil {
+				return err
+			}
+		}
+		if *jsonOutput || *output == "" {
+			if err := encodeJSON(stdout, result.Comparison); err != nil {
+				return err
+			}
+		}
+	}
+	return runErr
 }
 
 func runAnalyze(args []string, stdout io.Writer, stderr io.Writer) error {
@@ -422,6 +478,7 @@ const helpText = `ClawHub Observatory — paired behavioral evidence for OpenCla
 
 Usage:
   observatory scan [--config path] [--json] [--grade-output path] [--site dir] [--delta path] [--no-history] <target>
+  observatory matrix [--config path] [--dry-run] [--fail-fast] [--output dir] [--json] <target>
   observatory analyze --config path --bundle raw.tar.gz [--json] [--grade-output path] <target>
   observatory grade --input evidence.json [--output grade.json]
   observatory render --input evidence.json --output site [--previous evidence.json | --auto-previous --config path]
@@ -437,4 +494,9 @@ a deterministic behavioral grade (observatory.grade.v2) derived from that
 evidence; the grade scores observed behavioral risk within the covered exercise,
 not universal safety or author intent. Live scans fail closed until the config
 attests a disposable Proxmox VM and an isolated deny/sinkhole network.
+
+The default scan runs exactly one model and one paired capture. The optional
+matrix subcommand is opt-in: it runs each configured model/runtime variant as its
+own fresh-VM paired scan, sequentially, and emits a structured comparison of the
+comparable captures. --dry-run prints the resource multiplier without provisioning.
 `
