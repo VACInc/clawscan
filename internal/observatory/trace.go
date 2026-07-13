@@ -30,10 +30,12 @@ type AnalysisInput struct {
 	// Sink payloads are cloned from the canonical typed receipts only after the
 	// existing receipt verifier accepts both lanes. Presence stays separate so
 	// a verified empty receipt remains a real covered channel.
-	BaselineSinkPayloads        [][]byte
-	ExerciseSinkPayloads        [][]byte
-	BaselineSinkPayloadsPresent bool
-	ExerciseSinkPayloadsPresent bool
+	BaselineSinkPayloads         [][]byte
+	ExerciseSinkPayloads         [][]byte
+	BaselineSinkPayloadsPresent  bool
+	ExerciseSinkPayloadsPresent  bool
+	BaselineSinkPayloadsComplete bool
+	ExerciseSinkPayloadsComplete bool
 }
 
 type analysisResult struct {
@@ -121,7 +123,9 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	baselineCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
 	exerciseCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
 	agentOutputScanComplete := streamsScannable(input.BaselineAgentOutputs) && streamsScannable(input.ExerciseAgentOutputs)
-	sinkPayloadScanComplete := streamsScannable(input.BaselineSinkPayloads) && streamsScannable(input.ExerciseSinkPayloads)
+	baselineSinkComplete := input.BaselineSinkPayloadsComplete || (!input.BaselineSinkPayloadsPresent && len(input.BaselineSinkPayloads) > 0)
+	exerciseSinkComplete := input.ExerciseSinkPayloadsComplete || (!input.ExerciseSinkPayloadsPresent && len(input.ExerciseSinkPayloads) > 0)
+	sinkPayloadScanComplete := baselineSinkComplete && exerciseSinkComplete && streamsScannable(input.BaselineSinkPayloads) && streamsScannable(input.ExerciseSinkPayloads)
 	for _, canary := range input.Canaries {
 		baselineCanaries[canary.ID] = newCanaryLaneCounts()
 		exerciseCanaries[canary.ID] = newCanaryLaneCounts()
@@ -262,8 +266,14 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	for _, canary := range input.Canaries {
 		baseline := baselineCanaries[canary.ID]
 		exercise := exerciseCanaries[canary.ID]
-		baselineSink := countCanaryInStreams(input.BaselineSinkPayloads, canary.Marker)
-		exerciseSink := countCanaryInStreams(input.ExerciseSinkPayloads, canary.Marker)
+		baselineSink := 0
+		exerciseSink := 0
+		if baselineSinkComplete {
+			baselineSink = countCanaryInStreams(input.BaselineSinkPayloads, canary.Marker)
+		}
+		if exerciseSinkComplete {
+			exerciseSink = countCanaryInStreams(input.ExerciseSinkPayloads, canary.Marker)
+		}
 		baselineAgentOutput := countCanaryInStreams(input.BaselineAgentOutputs, canary.Marker)
 		exerciseAgentOutput := countCanaryInStreams(input.ExerciseAgentOutputs, canary.Marker)
 		stages := []CanaryStageInteraction{}

@@ -222,6 +222,9 @@ func legacyEvidenceProjection(evidence Evidence, sections evidenceSectionPresenc
 	if evidence.MockEgress == nil {
 		delete(projection, "mockEgress")
 	}
+	if evidence.ModelRelay == nil {
+		delete(projection, "modelRelay")
+	}
 	if !sections.ToolCallLedger {
 		delete(projection, "toolCallLedger")
 	}
@@ -655,8 +658,19 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div><dt>Runtime</dt><dd>{{.Evidence.Run.Runtime.OpenClawVersion}}</dd></div>
     <div><dt>Model</dt><dd>{{.Evidence.Run.Runtime.ModelProvider}}/{{.Evidence.Run.Runtime.ModelID}} ({{.Evidence.Run.Runtime.ModelEndpoint}})</dd></div>
     <div><dt>Isolation</dt><dd>{{.Evidence.Run.Isolation.Substrate}} · {{.Evidence.Run.Isolation.NetworkMode}} · {{.Evidence.Run.Isolation.ContainmentProfile}}</dd></div>
-  </dl></section>
-  {{if .Changes}}<section class="panel"><h2>Version delta</h2><div class="table-wrap"><table><thead><tr><th>Change</th><th>Behavior</th><th>Outcome</th><th>Role</th><th>Counts</th></tr></thead><tbody>
+	  </dl></section>
+	  {{with .Evidence.ModelRelay}}<section class="panel"><h2>Bounded model relay</h2><dl class="meta">
+	    <div><dt>Route</dt><dd>{{.Route}}</dd></div>
+	    <div><dt>Policy</dt><dd>{{shortHash .PolicySHA256}}</dd></div>
+	    <div><dt>Lane receipts</dt><dd>{{shortHash .BaselineReceiptSHA256}} → {{shortHash .ExerciseReceiptSHA256}}</dd></div>
+	    <div><dt>Requests</dt><dd>{{.BaselineRequests}} → {{.ExerciseRequests}}</dd></div>
+	    <div><dt>Rejected requests</dt><dd>{{.BaselineRejectedRequests}} → {{.ExerciseRejectedRequests}}</dd></div>
+	    <div><dt>Request bytes</dt><dd>{{.BaselineRequestBytes}} → {{.ExerciseRequestBytes}}</dd></div>
+	    <div><dt>Response bytes</dt><dd>{{.BaselineResponseBytes}} → {{.ExerciseResponseBytes}}</dd></div>
+	    <div><dt>Upstream errors</dt><dd>{{.BaselineUpstreamErrors}} → {{.ExerciseUpstreamErrors}}</dd></div>
+	    <div><dt>Capture state</dt><dd>{{if .Truncated}}truncated{{else}}bounded{{end}}{{if .DeadlineHit}} · deadline reached{{end}}</dd></div>
+	  </dl><p class="muted">The hostile lane reached only this bounded control relay. Model message bodies and the upstream address are not published.</p></section>{{end}}
+	  {{if .Changes}}<section class="panel"><h2>Version delta</h2><div class="table-wrap"><table><thead><tr><th>Change</th><th>Behavior</th><th>Outcome</th><th>Role</th><th>Counts</th></tr></thead><tbody>
     {{range .Changes}}<tr><td class="change-{{.Change}}">{{upper .Change}}</td><td><span class="kind">{{.Kind}}</span> {{.Operation}} <code>{{.Subject}}</code></td><td>{{.Outcome}}</td><td>{{.Role}}</td><td>{{.PreviousDelta}} → {{.CurrentDelta}}</td></tr>{{end}}
   </tbody></table></div></section>{{end}}
   <section class="panel"><h2>Observed exercise deltas</h2>{{if .Evidence.Observations}}<div class="table-wrap"><table><thead><tr><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
@@ -665,8 +679,9 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   {{with .Evidence.MockEgress}}<section class="panel"><h2>Controlled mock egress</h2><dl class="meta">
     <div><dt>Sink</dt><dd>{{.SinkEndpoint}}</dd></div>
     <div><dt>Requests (Δ)</dt><dd>{{.BaselineRequests}} → {{.ExerciseRequests}} (+{{.DeltaRequests}})</dd></div>
-    <div><dt>Bytes captured (Δ)</dt><dd>{{.BaselineBytes}} → {{.ExerciseBytes}} (+{{.DeltaBytes}})</dd></div>
-    <div><dt>Payload</dt><dd>{{.PayloadEncoding}}{{if .Truncated}} · truncated{{end}}{{if .PayloadSHA256}} · {{shortHash .PayloadSHA256}}{{end}}</dd></div>
+	    <div><dt>Bytes captured (Δ)</dt><dd>{{.BaselineBytes}} → {{.ExerciseBytes}} (+{{.DeltaBytes}})</dd></div>
+	    <div><dt>Receipt coverage</dt><dd>{{if .CaptureComplete}}complete{{else}}incomplete{{end}}</dd></div>
+	    <div><dt>Payload</dt><dd>{{.PayloadEncoding}}{{if .Truncated}} · truncated{{end}}{{if .PayloadSHA256}} · {{shortHash .PayloadSHA256}}{{end}}</dd></div>
     <div><dt>Canaries transmitted</dt><dd>{{if .CanariesObserved}}{{range $index, $id := .CanariesObserved}}{{if $index}}, {{end}}<code>{{$id}}</code>{{end}}{{else}}none{{end}}</dd></div>
   </dl><p class="muted">Raw captured bytes stay in the private receipt. Opaque or TLS-encrypted payloads are counted, never decoded.</p></section>{{end}}
   {{if .Sections.Persistence}}<section class="panel"><h2>Persistence and lifecycle</h2>

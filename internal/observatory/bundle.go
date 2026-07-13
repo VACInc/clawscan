@@ -30,6 +30,8 @@ type CaptureBundle struct {
 	ExerciseOutputPresent bool
 	MockEgressBaseline    *MockEgressReceipt
 	MockEgressExercise    *MockEgressReceipt
+	ModelRelayBaseline    *ModelRelayReceipt
+	ModelRelayExercise    *ModelRelayReceipt
 	BaselineInventory     laneInventory
 	ExerciseInventory     laneInventory
 	BaselineToolAudit     toolAuditCapture
@@ -151,6 +153,18 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 				return CaptureBundle{}, err
 			}
 			bundle.MockEgressExercise = receipt
+		case name == "baseline/model-relay.json":
+			receipt, err := parseModelRelayReceipt(data)
+			if err != nil {
+				return CaptureBundle{}, err
+			}
+			bundle.ModelRelayBaseline = receipt
+		case name == "exercise/model-relay.json":
+			receipt, err := parseModelRelayReceipt(data)
+			if err != nil {
+				return CaptureBundle{}, err
+			}
+			bundle.ModelRelayExercise = receipt
 		}
 	}
 	if !traceLaneHasCompleteSyscall(bundle.BaselineTraces) {
@@ -448,6 +462,9 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 	if err := verifyCaptureMockEgress(bundle, config.Runtime.MockEgress); err != nil {
 		return Evidence{}, err
 	}
+	if err := verifyModelRelayReceipts(bundle, config.Runtime); err != nil {
+		return Evidence{}, err
+	}
 	target.Lineage = config.TargetLineage
 	baselineAgentOutputs := [][]byte(nil)
 	exerciseAgentOutputs := [][]byte(nil)
@@ -461,44 +478,57 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 	exerciseSinkPayloads := [][]byte(nil)
 	baselineSinkPayloadsPresent := false
 	exerciseSinkPayloadsPresent := false
+	baselineSinkPayloadsComplete := false
+	exerciseSinkPayloadsComplete := false
 	if bundle.MockEgressBaseline != nil {
-		baselineSinkPayloads = clonePrivatePayloads(bundle.MockEgressBaseline.payload)
 		baselineSinkPayloadsPresent = true
+		baselineSinkPayloadsComplete = mockEgressReceiptComplete(bundle.MockEgressBaseline)
+		if baselineSinkPayloadsComplete {
+			baselineSinkPayloads = clonePrivatePayloads(bundle.MockEgressBaseline.payload)
+		}
 	}
 	if bundle.MockEgressExercise != nil {
-		exerciseSinkPayloads = clonePrivatePayloads(bundle.MockEgressExercise.payload)
 		exerciseSinkPayloadsPresent = true
+		exerciseSinkPayloadsComplete = mockEgressReceiptComplete(bundle.MockEgressExercise)
+		if exerciseSinkPayloadsComplete {
+			exerciseSinkPayloads = clonePrivatePayloads(bundle.MockEgressExercise.payload)
+		}
 	}
 	analysisInput := AnalysisInput{
-		BaselineTraces:        bundle.BaselineTraces,
-		ExerciseTraces:        bundle.ExerciseTraces,
-		BaselineOutput:        bundle.BaselineOutput,
-		ExerciseOutput:        bundle.ExerciseOutput,
-		Metadata:              bundle.Metadata,
-		Canaries:              bundle.Metadata.Canaries,
-		RedirectProbes:        bundle.Metadata.Redirects,
-		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
+		BaselineTraces: bundle.BaselineTraces,
+		ExerciseTraces: bundle.ExerciseTraces,
+		BaselineOutput: bundle.BaselineOutput,
+		ExerciseOutput: bundle.ExerciseOutput,
+		Metadata:       bundle.Metadata,
+		Canaries:       bundle.Metadata.Canaries,
+		RedirectProbes: bundle.Metadata.Redirects,
+		// The hostile trace can contain only the bounded relay address. The real
+		// model endpoint is reachable solely from the separate control unit.
+		ControlPlaneAddresses: []string{modelRelayAddress(config.Runtime.ModelRelay)},
 		MockEgressAddress:     mockEgressClassifiedAddress(config.Runtime.MockEgress),
 		RedirectDeepMode:      config.Redirect.Deep,
 		// Agent stdout feeds agent-output only. Verified controlled-sink
 		// payloads feed outbound only. Tool metadata has no bounded arguments
 		// or results, so it remains explicitly limited and non-authoritative.
-		BaselineAgentOutputs:        baselineAgentOutputs,
-		ExerciseAgentOutputs:        exerciseAgentOutputs,
-		BaselineSinkPayloads:        baselineSinkPayloads,
-		ExerciseSinkPayloads:        exerciseSinkPayloads,
-		BaselineSinkPayloadsPresent: baselineSinkPayloadsPresent,
-		ExerciseSinkPayloadsPresent: exerciseSinkPayloadsPresent,
+		BaselineAgentOutputs:         baselineAgentOutputs,
+		ExerciseAgentOutputs:         exerciseAgentOutputs,
+		BaselineSinkPayloads:         baselineSinkPayloads,
+		ExerciseSinkPayloads:         exerciseSinkPayloads,
+		BaselineSinkPayloadsPresent:  baselineSinkPayloadsPresent,
+		ExerciseSinkPayloadsPresent:  exerciseSinkPayloadsPresent,
+		BaselineSinkPayloadsComplete: baselineSinkPayloadsComplete,
+		ExerciseSinkPayloadsComplete: exerciseSinkPayloadsComplete,
 	}
 	analysis := AnalyzeTraces(analysisInput)
 	mockEgress := buildMockEgressEvidence(config.Runtime.MockEgress, bundle, bundle.Metadata.Canaries)
+	modelRelay := buildModelRelayEvidence(bundle)
 	persistence := analyzePersistence(analysis.Observations, diffLaneInventories(bundle.BaselineInventory, bundle.ExerciseInventory))
 	runtimeTimeline := BuildRuntimeTimeline(analysisInput)
 	toolCallLedger := BuildToolCallLedger(bundle)
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
-	if bundle.Metadata.BaselineExitCode != 0 || bundle.Metadata.ExerciseExitCode != 0 || !analysis.Coverage.BaselinePaired {
+	if bundle.Metadata.BaselineExitCode != 0 || bundle.Metadata.ExerciseExitCode != 0 || !analysis.Coverage.BaselinePaired || !modelRelayCaptureComplete(bundle) {
 		status = "incomplete"
 	}
 	evidence := Evidence{
@@ -515,9 +545,9 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 			Isolation: IsolationEvidence{
 				Substrate:                 config.Isolation.Substrate,
 				NetworkMode:               config.Isolation.NetworkMode,
-				ContainmentProfile:        "proxmox-vm+nftables+systemd-cgroup",
+				ContainmentProfile:        "proxmox-vm+nftables+systemd-cgroup+bounded-model-relay",
 				GuestFirewallSHA256:       "sha256:" + bundle.Metadata.FirewallSHA256,
-				GuestFirewallPolicySHA256: digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.MockEgress))),
+				GuestFirewallPolicySHA256: digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.ModelRelay, config.Runtime.MockEgress))),
 				ProxmoxTLSCASHA256:        tlsCASHA256,
 				Verification:              config.Isolation.Verification,
 			},
@@ -545,6 +575,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 		Persistence:     persistence,
 		Coverage:        analysis.Coverage,
 		MockEgress:      mockEgress,
+		ModelRelay:      modelRelay,
 		ToolCallLedger:  toolCallLedger,
 		RuntimeTimeline: runtimeTimeline,
 	}

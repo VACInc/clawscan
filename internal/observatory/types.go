@@ -42,6 +42,7 @@ type Evidence struct {
 	Persistence         PersistenceEvidence        `json:"persistence"`
 	Coverage            CoverageEvidence           `json:"coverage"`
 	MockEgress          *MockEgressEvidence        `json:"mockEgress,omitempty"`
+	ModelRelay          *ModelRelayEvidence        `json:"modelRelay,omitempty"`
 	ToolCallLedger      ToolCallLedger             `json:"toolCallLedger"`
 	RuntimeTimeline     RuntimeTimeline            `json:"runtimeTimeline"`
 }
@@ -391,6 +392,18 @@ func ValidateEvidence(evidence Evidence) error {
 	if strings.TrimSpace(evidence.Run.Runtime.OpenClawVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.StraceVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelProvider) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelID) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelEndpoint) == "" {
 		return errors.New("evidence runtime receipt is incomplete")
 	}
+	// ModelRelay is mandatory for capture protocol v20 and later through
+	// BuildEvidence's containment profile. Keep it optional for older v2
+	// artifacts, whose profile predates the bounded relay.
+	boundedRelayProfile := strings.Contains(evidence.Run.Isolation.ContainmentProfile, "bounded-model-relay")
+	if boundedRelayProfile && evidence.ModelRelay == nil {
+		return errors.New("evidence bounded model relay receipt is required")
+	}
+	if evidence.ModelRelay != nil {
+		if err := validateModelRelayEvidence(evidence.ModelRelay); err != nil {
+			return err
+		}
+	}
 	if !isSHA256Digest(evidence.Exercise.PromptSHA256) || evidence.Exercise.TurnLimit != 1 {
 		return errors.New("evidence exercise receipt is incomplete")
 	}
@@ -412,7 +425,8 @@ func ValidateEvidence(evidence Evidence) error {
 			return errors.New("evidence canary stage coverage is required")
 		}
 		pairedTraceCoverage := evidence.Coverage.BaselinePaired && evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
-		if err := validateCanaryStageCoverage(evidence.Coverage.CanaryStages, pairedTraceCoverage, evidence.MockEgress != nil); err != nil {
+		pairedSinkCoverage := evidence.MockEgress != nil && (evidence.MockEgress.CaptureComplete || evidence.ModelRelay == nil)
+		if err := validateCanaryStageCoverage(evidence.Coverage.CanaryStages, pairedTraceCoverage, pairedSinkCoverage); err != nil {
 			return err
 		}
 		if evidence.Coverage.BaselinePaired != evidence.Coverage.FileSyscalls ||
@@ -448,8 +462,10 @@ func ValidateEvidence(evidence Evidence) error {
 			return errors.New("evidence redirect probe exposure coverage is inconsistent with its probe list")
 		}
 	}
+	relayCaptureComplete := evidence.ModelRelay == nil || (!evidence.ModelRelay.Truncated && !evidence.ModelRelay.DeadlineHit &&
+		evidence.ModelRelay.BaselineUpstreamErrors == 0 && evidence.ModelRelay.ExerciseUpstreamErrors == 0)
 	completeCapture := evidence.Run.LaneExitCode == (LaneExitCodes{}) && evidence.Coverage.BaselinePaired &&
-		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
+		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls && relayCaptureComplete
 	if (evidence.Run.Status == "completed") != completeCapture {
 		return errors.New("evidence run status is inconsistent with lane exits or capture coverage")
 	}
@@ -493,7 +509,7 @@ func ValidateEvidence(evidence Evidence) error {
 			}
 		}
 	}
-	if err := validateMockEgressEvidence(evidence.MockEgress); err != nil {
+	if err := validateMockEgressEvidence(evidence.MockEgress, boundedRelayProfile || evidence.ModelRelay != nil); err != nil {
 		return err
 	}
 	hasPersistenceEvidence := evidence.Persistence.Scope != "" || evidence.Persistence.InventoryPaired ||

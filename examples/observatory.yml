@@ -44,7 +44,19 @@ runtime:
     api: openai-completions
     contextWindow: 65536
     maxTokens: 4096
+  # Mandatory Observatory-owned relay. The hostile lane can reach this exact
+  # loopback port, never the real model endpoint. Defaults shown explicitly.
+  modelRelay:
+    address: 127.0.0.8:9010
+    maxRequests: 8
+    maxRequestBytes: 8388608
+    maxResponseBytes: 16777216
+    maxTotalBytes: 33554432
+    maxConcurrentRequests: 2
+    # 0 uses the shorter of timeoutSeconds and 120 seconds per request.
+    requestTimeoutSeconds: 0
   # Addresses as seen from the guest. Values never enter public evidence.
+  # Only the separate relay control unit receives this upstream allowlist.
   controlPlaneAddresses: [10.0.0.20:8000]
   # Controlled mock egress upgrades outbound-attempt evidence to payload-aware
   # evidence without permitting real egress. Opt-in and disabled by default. The

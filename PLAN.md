@@ -57,10 +57,10 @@ This is the MVP’s main technical claim and the foundation for declared-vs-obse
 - Live orchestration, descriptor-pinned no-follow target staging, and hardened site rendering require a Linux control host; other control-host platforms fail closed in the MVP.
 - A dedicated unprivileged VM template supplies OpenClaw, Node, `strace`, systemd, and ordinary target dependencies.
 - Each scan gets new OpenClaw state/workspace roots and synthetic credentials only.
-- The generated OpenClaw config uses the lab’s OpenAI-compatible local model endpoint and a narrow coding tool surface with messaging, scheduling, delegation, and external account integrations absent.
+- The generated OpenClaw config uses an Observatory-owned bounded loopback relay for the lab’s OpenAI-compatible local model endpoint and a narrow coding tool surface with messaging, scheduling, delegation, and external account integrations absent.
 - The MVP requires a literal IPv4 model endpoint; IPv6 is rejected until neighbor/router discovery can be admitted without weakening default-deny rules.
 - The exercise is bounded by wall-clock timeout, memory, CPU, process, output-file, and bundle limits and a single representative synthetic task.
-- Before either lane starts, the disposable VM receives a unique nftables default-drop policy allowing established management traffic, new SSH only from the active literal-IPv4 management peer, DHCP, loopback, and the exact model IP/port. Each lane adds a transient systemd cgroup with a hard whole-cgroup kill deadline, read-only host OS, private home/tmp/devices, namespace and privilege restrictions, bind denial, and cgroup IP allowlisting for literal model endpoint addresses only.
+- Before either lane starts, the disposable VM receives a unique nftables default-drop policy allowing established management traffic, new SSH only from the active literal-IPv4 management peer, DHCP, the exact relay/sink loopback ports for the hostile UID, and the exact model IP/port only for the relay control UID. Each lane adds a transient systemd cgroup with a hard whole-cgroup kill deadline, read-only host OS, private home/tmp/devices/IPC, no AF_UNIX sockets, zero swap, bounded file descriptors, namespace and privilege restrictions, bind denial, and cgroup IP allowlisting for relay/sink loopback addresses only.
 - The child environment is rebuilt from an empty environment. The target never inherits Crabbox, host, channel, or operator credentials.
 
 ### Evidence analyzer

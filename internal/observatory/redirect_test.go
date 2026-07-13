@@ -265,6 +265,13 @@ func TestBuildEvidenceReportsRedirectProbesAndCoverage(t *testing.T) {
 `},
 		ExerciseOutput: []byte("done, tag " + noteMarker + "\n"),
 	}
+	relayPolicy, err := buildModelRelayPolicy(config.Runtime.ModelRelay, config.Runtime.Model, config.Runtime.TimeoutSeconds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayDigest := modelRelayPolicySHA256(relayPolicy)
+	bundle.ModelRelayBaseline = &ModelRelayReceipt{Lane: "baseline", PolicySHA256: relayDigest}
+	bundle.ModelRelayExercise = &ModelRelayReceipt{Lane: "exercise", PolicySHA256: relayDigest}
 	target := TargetEvidence{
 		Name: "observed", Kind: "skill", ID: "observed", SHA256: "sha256:" + strings.Repeat("a", 64),
 		FileCount: 1, DirectoryCount: 1, TotalBytes: 10,

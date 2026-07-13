@@ -78,6 +78,29 @@ func TestCanaryAgentOutputNeverBecomesToolEvidence(t *testing.T) {
 	}
 }
 
+func TestIncompleteSinkReceiptCannotProvideCanaryCoverage(t *testing.T) {
+	marker := testCanaryMarkers()["cloud-credentials"]
+	result := AnalyzeTraces(AnalysisInput{
+		BaselineTraces:               []string{`getpid() = 100`},
+		ExerciseTraces:               []string{`getpid() = 101`},
+		Metadata:                     CaptureMetadata{TargetKind: "skill"},
+		Canaries:                     testCanaries(),
+		BaselineSinkPayloads:         clonePrivatePayloads(nil),
+		ExerciseSinkPayloads:         clonePrivatePayloads([]byte(marker)),
+		BaselineSinkPayloadsPresent:  true,
+		ExerciseSinkPayloadsPresent:  true,
+		BaselineSinkPayloadsComplete: true,
+		ExerciseSinkPayloadsComplete: false,
+	})
+	if outbound := findCanaryStageForTest(findCanary(result.Canaries, "cloud-credentials").Stages, CanaryStageOutbound); outbound.Stage != "" {
+		t.Fatalf("incomplete sink payload became canary evidence: %#v", outbound)
+	}
+	coverage := canaryCoverageForTest(result.Coverage.CanaryStages, CanaryStageOutbound)
+	if coverage.Coverage != "observed" || coverage.Source != "socket-send-syscall-payload" {
+		t.Fatalf("incomplete sink did not downgrade to syscall-only coverage: %#v", coverage)
+	}
+}
+
 func TestCanaryMarkerOperandsDoNotOverstateExecuteOrStdoutWrite(t *testing.T) {
 	marker := testCanaryMarkers()["workspace-memory"]
 	result := AnalyzeTraces(AnalysisInput{
@@ -171,6 +194,32 @@ func TestBuildEvidenceUsesOnlyVerifiedCanonicalSinkPayloads(t *testing.T) {
 	}
 	if output := findCanaryStageForTest(findCanary(programmatic.Canaries, "cloud-credentials").Stages, CanaryStageAgentOutput); output.ExerciseInteractions != 1 {
 		t.Fatalf("programmatic output stage = %#v", output)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*MockEgressReceipt)
+	}{
+		{"truncated", func(receipt *MockEgressReceipt) { receipt.Truncated = true }},
+		{"deadline", func(receipt *MockEgressReceipt) { receipt.DeadlineHit = true }},
+		{"rejected", func(receipt *MockEgressReceipt) { receipt.RejectedRequests = 1 }},
+	} {
+		t.Run("incomplete receipt/"+test.name, func(t *testing.T) {
+			partial := bundle
+			receipt := *bundle.MockEgressExercise
+			test.mutate(&receipt)
+			partial.MockEgressExercise = &receipt
+			partialEvidence, err := BuildEvidence(fixtureEvidence().Target, config, partial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coverage := canaryCoverageForTest(partialEvidence.Coverage.CanaryStages, CanaryStageOutbound)
+			if coverage.Source != "socket-send-syscall-payload" || partialEvidence.MockEgress.CaptureComplete || len(partialEvidence.MockEgress.CanariesObserved) != 0 {
+				t.Fatalf("incomplete receipt retained typed-sink coverage: coverage=%#v sink=%#v", coverage, partialEvidence.MockEgress)
+			}
+			if err := ValidateEvidence(partialEvidence); err != nil {
+				t.Fatalf("incomplete receipt evidence failed validation: %v", err)
+			}
+		})
 	}
 	bundle.MockEgressExercise.Lane = "baseline"
 	if _, err := BuildEvidence(fixtureEvidence().Target, config, bundle); err == nil || !strings.Contains(err.Error(), "lane mismatch") {

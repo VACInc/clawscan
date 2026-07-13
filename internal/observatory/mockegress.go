@@ -56,6 +56,7 @@ type MockEgressEvidence struct {
 	ExerciseBytes    int64    `json:"exerciseBytes"`
 	DeltaBytes       int64    `json:"deltaBytes"`
 	Truncated        bool     `json:"truncated"`
+	CaptureComplete  bool     `json:"captureComplete"`
 	PayloadEncoding  string   `json:"payloadEncoding"`
 	PayloadSHA256    string   `json:"payloadSha256,omitempty"`
 	CanariesObserved []string `json:"canariesObserved"`
@@ -78,6 +79,13 @@ type MockEgressReceipt struct {
 	RejectedRequests int    `json:"rejectedRequests"`
 	PayloadBase64    string `json:"payloadBase64"`
 	payload          []byte
+}
+
+// mockEgressReceiptComplete is the single completeness seam used by canary
+// correlation. A bounded payload is not complete if the sink truncated, timed
+// out, or rejected any request.
+func mockEgressReceiptComplete(receipt *MockEgressReceipt) bool {
+	return receipt != nil && !receipt.Truncated && !receipt.DeadlineHit && receipt.RejectedRequests == 0
 }
 
 func mockEgressHostPort(address string) (string, string, error) {
@@ -321,7 +329,8 @@ func buildMockEgressEvidence(config MockEgressConfig, bundle CaptureBundle, cana
 		BaselineBytes:    baseline.CapturedBytes,
 		ExerciseBytes:    exercise.CapturedBytes,
 		DeltaBytes:       deltaBytes,
-		Truncated:        exercise.Truncated || exercise.DeadlineHit,
+		Truncated:        baseline.Truncated || baseline.DeadlineHit || exercise.Truncated || exercise.DeadlineHit,
+		CaptureComplete:  mockEgressReceiptComplete(baseline) && mockEgressReceiptComplete(exercise),
 		PayloadEncoding:  encoding,
 		CanariesObserved: []string{},
 	}
@@ -330,7 +339,7 @@ func buildMockEgressEvidence(config MockEgressConfig, bundle CaptureBundle, cana
 	}
 	// Never scan opaque bytes: we do not pretend TLS-pinned or otherwise encrypted
 	// payloads were decoded. Canary presence is a delta over the baseline lane.
-	if encoding == "cleartext" {
+	if evidence.CaptureComplete && encoding == "cleartext" {
 		for _, canary := range canaries {
 			if canary.Marker == "" {
 				continue
@@ -367,7 +376,7 @@ func payloadEncoding(data []byte) string {
 	return "cleartext"
 }
 
-func validateMockEgressEvidence(evidence *MockEgressEvidence) error {
+func validateMockEgressEvidence(evidence *MockEgressEvidence, requireCaptureComplete ...bool) error {
 	if evidence == nil {
 		return nil
 	}
@@ -396,8 +405,14 @@ func validateMockEgressEvidence(evidence *MockEgressEvidence) error {
 	if evidence.PayloadSHA256 != "" && !isSHA256Digest(evidence.PayloadSHA256) {
 		return errors.New("evidence controlled mock egress payload digest is invalid")
 	}
+	if evidence.CaptureComplete && evidence.Truncated {
+		return errors.New("evidence controlled mock egress cannot be complete and truncated")
+	}
 	if evidence.CanariesObserved == nil {
 		return errors.New("evidence controlled mock egress canary list is required")
+	}
+	if len(requireCaptureComplete) > 0 && requireCaptureComplete[0] && !evidence.CaptureComplete && len(evidence.CanariesObserved) != 0 {
+		return errors.New("evidence incomplete controlled mock egress must not report canaries")
 	}
 	if evidence.PayloadEncoding != "cleartext" && len(evidence.CanariesObserved) != 0 {
 		return errors.New("evidence must not report canaries for opaque controlled mock egress payloads")

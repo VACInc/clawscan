@@ -117,15 +117,15 @@ func TestConfigRejectsMockEgressLargerThanBundleBudget(t *testing.T) {
 
 func TestGuestFirewallPinsControlledSink(t *testing.T) {
 	sink := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
-	enabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, sink)
+	enabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, sink)
 	if !strings.Contains(enabled, `ip daddr 127.0.0.9 tcp dport 9009 accept comment "controlled-mock-egress-sink"`) {
 		t.Fatalf("firewall missing sink pin:\n%s", enabled)
 	}
 	if !strings.Contains(enabled, "ip daddr 10.0.0.2 tcp dport 8000 accept") {
 		t.Fatalf("firewall dropped the model allowlist:\n%s", enabled)
 	}
-	disabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, MockEgressConfig{})
-	if strings.Contains(disabled, "controlled-mock-egress-sink") || strings.Contains(disabled, "@AGENT_UID@") {
+	disabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, MockEgressConfig{})
+	if strings.Contains(disabled, "controlled-mock-egress-sink") {
 		t.Fatalf("disabled sink leaked a rule:\n%s", disabled)
 	}
 	if digestBytes([]byte(enabled)) == digestBytes([]byte(disabled)) {
@@ -135,9 +135,9 @@ func TestGuestFirewallPinsControlledSink(t *testing.T) {
 
 func TestGuestFirewallEnforcesExactSinkPortForAgentUID(t *testing.T) {
 	sink := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
-	rules := guestFirewallRules("policy", []string{"10.0.0.2:8000"}, sink)
+	rules := guestFirewallRules("policy", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, sink)
 	allow := `meta skuid @AGENT_UID@ ip daddr 127.0.0.9 tcp dport 9009 accept comment "controlled-mock-egress-sink"`
-	deny := `meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment "controlled-mock-egress-loopback-deny"`
+	deny := `meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment "agent-adjacent-loopback-deny"`
 	loopback := `oifname "lo" accept`
 	model := "ip daddr 10.0.0.2 tcp dport 8000 accept"
 	allowIdx := strings.Index(rules, allow)
@@ -163,16 +163,17 @@ func TestGuestFirewallEnforcesExactSinkPortForAgentUID(t *testing.T) {
 	if strings.Contains(rules, "127.0.0.0/8 drop") && strings.Contains(rules[denyIdx:denyIdx+len(deny)], "dport") {
 		t.Fatalf("agent loopback deny is port-scoped, so other ports would leak:\n%s", rules)
 	}
-	if got := strings.Count(rules, "meta skuid @AGENT_UID@"); got != 2 {
-		t.Fatalf("expected exactly two agent-scoped rules (one allow, one deny), got %d:\n%s", got, rules)
+	if got := strings.Count(rules, "meta skuid @AGENT_UID@"); got != 3 {
+		t.Fatalf("expected exactly three agent-scoped rules (relay, sink, deny), got %d:\n%s", got, rules)
 	}
 }
 
 func TestRemoteRunnerSubstitutesAgentUIDAndExposesSink(t *testing.T) {
 	for _, required := range []string{
-		`MOCK_AGENT_UID=$(id -u "$AGENT_USER")`,
+		`AGENT_UID=$(id -u "$AGENT_USER")`,
 		`@AGENT_UID@`,
-		"firewall agent-uid marker is missing",
+		`@CONTROL_UID@`,
+		"firewall UID marker is missing",
 		`if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then`,
 	} {
 		if !strings.Contains(remoteRunScript, required) {
@@ -382,8 +383,8 @@ func TestBuildMockEgressEvidenceSubtractsAndDetectsCanaries(t *testing.T) {
 }
 
 func TestValidateMockEgressEvidence(t *testing.T) {
-	valid := &MockEgressEvidence{SinkEndpoint: "controlled-sink:9009", ExerciseRequests: 2, DeltaRequests: 2, ExerciseBytes: 61, DeltaBytes: 61, PayloadEncoding: "cleartext", PayloadSHA256: "sha256:" + strings.Repeat("a", 64), CanariesObserved: []string{"cloud-credentials"}}
-	if err := validateMockEgressEvidence(valid); err != nil {
+	valid := &MockEgressEvidence{SinkEndpoint: "controlled-sink:9009", ExerciseRequests: 2, DeltaRequests: 2, ExerciseBytes: 61, DeltaBytes: 61, CaptureComplete: true, PayloadEncoding: "cleartext", PayloadSHA256: "sha256:" + strings.Repeat("a", 64), CanariesObserved: []string{"cloud-credentials"}}
+	if err := validateMockEgressEvidence(valid, true); err != nil {
 		t.Fatalf("valid evidence rejected: %v", err)
 	}
 	for _, test := range []struct {
@@ -394,6 +395,8 @@ func TestValidateMockEgressEvidence(t *testing.T) {
 		{"bad endpoint", func(m *MockEgressEvidence) { m.SinkEndpoint = "10.0.0.9:9009" }, "endpoint is invalid"},
 		{"inconsistent delta", func(m *MockEgressEvidence) { m.DeltaRequests = 5 }, "deltas are inconsistent"},
 		{"opaque canaries", func(m *MockEgressEvidence) { m.PayloadEncoding = "opaque-or-encrypted" }, "must not report canaries"},
+		{"incomplete canaries", func(m *MockEgressEvidence) { m.CaptureComplete = false }, "incomplete controlled mock egress"},
+		{"complete truncation", func(m *MockEgressEvidence) { m.Truncated = true }, "cannot be complete and truncated"},
 		{"bad digest", func(m *MockEgressEvidence) { m.PayloadSHA256 = "deadbeef" }, "payload digest is invalid"},
 		{"duplicate canary", func(m *MockEgressEvidence) { m.CanariesObserved = []string{"cloud-credentials", "cloud-credentials"} }, "canary identifier is invalid"},
 	} {
@@ -401,13 +404,18 @@ func TestValidateMockEgressEvidence(t *testing.T) {
 			evidence := *valid
 			evidence.CanariesObserved = append([]string(nil), valid.CanariesObserved...)
 			test.mutate(&evidence)
-			if err := validateMockEgressEvidence(&evidence); err == nil || !strings.Contains(err.Error(), test.want) {
+			if err := validateMockEgressEvidence(&evidence, true); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("err = %v", err)
 			}
 		})
 	}
-	if err := validateMockEgressEvidence(nil); err != nil {
+	if err := validateMockEgressEvidence(nil, true); err != nil {
 		t.Fatalf("nil mock egress evidence rejected: %v", err)
+	}
+	legacy := *valid
+	legacy.CaptureComplete = false
+	if err := validateMockEgressEvidence(&legacy); err != nil {
+		t.Fatalf("legacy v2 mock egress evidence rejected: %v", err)
 	}
 	full := fixtureEvidence()
 	full.MockEgress = valid
@@ -535,7 +543,7 @@ func TestRenderSiteShowsControlledMockEgress(t *testing.T) {
 	evidence := fixtureEvidence()
 	evidence.MockEgress = &MockEgressEvidence{
 		SinkEndpoint: "controlled-sink:9009", ExerciseRequests: 1, DeltaRequests: 1, ExerciseBytes: 61, DeltaBytes: 61,
-		PayloadEncoding: "cleartext", PayloadSHA256: "sha256:" + strings.Repeat("a", 64), CanariesObserved: []string{"cloud-credentials"},
+		CaptureComplete: true, PayloadEncoding: "cleartext", PayloadSHA256: "sha256:" + strings.Repeat("a", 64), CanariesObserved: []string{"cloud-credentials"},
 	}
 	evidence.Coverage.CanaryStages[3].Source = "socket-send-syscall-payload+typed-sink-receipt"
 	output := t.TempDir()

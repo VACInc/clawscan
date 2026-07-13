@@ -388,7 +388,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // version comparisons cannot mix evidence produced by different protocols. It
 // embeds PersistenceProtocolRevision so a change to the persistence surface
 // catalog or before/after inventory semantics also invalidates stale receipts.
-const CaptureProtocolRevision = "observatory.capture-protocol.v20+" + PersistenceProtocolRevision
+const CaptureProtocolRevision = "observatory.capture-protocol.v21+" + PersistenceProtocolRevision
 
 func captureConfigSHA256(config Config) (string, error) {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -403,6 +403,9 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) (str
 }
 
 func captureConfigSHA256WithTLSCA(config Config, protocolRevision string, tlsCASHA256 string) (string, error) {
+	// Bind effective defaults rather than their optional YAML spelling. In
+	// particular, every capture digest covers the exact bounded relay policy.
+	config.applyDefaults()
 	binding := struct {
 		CaptureProtocolRevision string          `json:"captureProtocolRevision"`
 		TargetLineage           string          `json:"targetLineage"`
@@ -491,6 +494,14 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err != nil {
 		return err
 	}
+	relayRuntime, err := modelRelayRuntime(config.Runtime.ModelRelay, config.Runtime.Model, config.Runtime.TimeoutSeconds)
+	if err != nil {
+		return err
+	}
+	relayBaseURL, err := modelRelayBaseURL(config.Runtime.ModelRelay, config.Runtime.Model)
+	if err != nil {
+		return err
+	}
 	runtime := map[string]any{
 		"runId":               runID,
 		"targetSha256":        target.SHA256,
@@ -506,6 +517,8 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"cpuQuotaPercent":     config.Limits.CPUQuotaPct,
 		"maxTasks":            config.Limits.MaxTasks,
 		"controlPlaneIps":     controlPlaneIPs(config.Runtime.ControlPlaneAddresses),
+		"modelRelayIps":       modelRelayCgroupIPs(config.Runtime.ModelRelay),
+		"modelRelay":          relayRuntime,
 		"mockEgressIps":       mockEgressCgroupIPs(config.Runtime.MockEgress),
 		"mockEgress":          mockEgressRuntime(config.Runtime.MockEgress, config.Runtime.TimeoutSeconds),
 		"firewallTable":       "observatory_" + runID,
@@ -514,7 +527,7 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"redirectSeeds":       redirectSeedFiles,
 		"model": map[string]any{
 			"provider":      config.Runtime.Model.Provider,
-			"baseUrl":       config.Runtime.Model.BaseURL,
+			"baseUrl":       relayBaseURL,
 			"id":            config.Runtime.Model.ID,
 			"api":           config.Runtime.Model.API,
 			"contextWindow": config.Runtime.Model.ContextWindow,
@@ -546,7 +559,10 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err := writeJSON(filepath.Join(runnerDir, "target-modes.json"), targetModes, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(runnerDir, "firewall.nft"), []byte(guestFirewallRules(runID, config.Runtime.ControlPlaneAddresses, config.Runtime.MockEgress)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(runnerDir, "firewall.nft"), []byte(guestFirewallRules(runID, config.Runtime.ControlPlaneAddresses, config.Runtime.ModelRelay, config.Runtime.MockEgress)), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(runnerDir, "model-relay.mjs"), []byte(modelRelayScript), 0o644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(runnerDir, "mock-egress-sink.mjs"), []byte(mockEgressSinkScript), 0o644); err != nil {
@@ -564,26 +580,25 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	return os.WriteFile(filepath.Join(stageDir, ".gitattributes"), []byte("* -text -filter -ident\n"), 0o644)
 }
 
-func guestFirewallRules(runID string, endpoints []string, mockEgress MockEgressConfig) string {
+func guestFirewallRules(runID string, endpoints []string, modelRelay ModelRelayConfig, mockEgress MockEgressConfig) string {
 	var rules strings.Builder
 	fmt.Fprintf(&rules, "table inet observatory_%s {\n", runID)
 	rules.WriteString("  chain input {\n    type filter hook input priority -50; policy drop;\n")
 	rules.WriteString("    iifname \"lo\" accept\n    ct state established,related accept\n    ip saddr @MANAGEMENT_IPV4@ tcp dport 22 accept\n    udp sport 67 udp dport 68 accept\n  }\n")
 	rules.WriteString("  chain output {\n    type filter hook output priority -50; policy drop;\n")
-	// Controlled mock egress enforcement, ordered before the generic loopback
-	// accept below: the dedicated agent UID may reach only the exact sink host and
-	// port on loopback, and every other agent loopback destination is dropped. This
-	// keeps the exact sink port—not any-loopback reachability—the boundary, since
-	// the coarser cgroup IPAddressAllow entry can only allow the sink address. The
-	// @AGENT_UID@ marker is substituted with the numeric agent UID inside the guest.
-	// Non-agent (control-plane) loopback, model, and management traffic are
-	// unaffected because these rules match only meta skuid @AGENT_UID@.
+	// The hostile lane reaches the exact bounded relay port and, when enabled, the
+	// exact controlled-sink port. Every adjacent loopback service and the real
+	// model endpoint are denied to the agent UID. Only the control UID that owns
+	// the hardened relay unit may reach the pinned upstream model endpoint.
+	if host, port, err := splitLoopbackAddress(effectiveModelRelayConfig(modelRelay).Address, "modelRelay.address"); err == nil {
+		fmt.Fprintf(&rules, "    meta skuid @AGENT_UID@ ip daddr %s tcp dport %d accept comment \"bounded-model-relay\"\n", host, port)
+	}
 	if mockEgress.Enabled {
 		if host, port, err := mockEgressHostPort(mockEgress.Address); err == nil {
 			fmt.Fprintf(&rules, "    meta skuid @AGENT_UID@ ip daddr %s tcp dport %s accept comment \"controlled-mock-egress-sink\"\n", host, port)
-			rules.WriteString("    meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment \"controlled-mock-egress-loopback-deny\"\n")
 		}
 	}
+	rules.WriteString("    meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment \"agent-adjacent-loopback-deny\"\n")
 	rules.WriteString("    oifname \"lo\" accept\n    ct state established,related accept\n    udp sport 68 udp dport 67 accept\n")
 	for _, endpoint := range endpoints {
 		host, port, err := net.SplitHostPort(endpoint)
@@ -594,7 +609,7 @@ func guestFirewallRules(runID string, endpoints []string, mockEgress MockEgressC
 		if parsed := net.ParseIP(strings.Trim(host, "[]")); parsed != nil && parsed.To4() == nil {
 			family = "ip6"
 		}
-		fmt.Fprintf(&rules, "    %s daddr %s tcp dport %s accept\n", family, strings.Trim(host, "[]"), port)
+		fmt.Fprintf(&rules, "    meta skuid @CONTROL_UID@ %s daddr %s tcp dport %s accept comment \"model-upstream-relay-only\"\n", family, strings.Trim(host, "[]"), port)
 	}
 	rules.WriteString("  }\n  chain forward {\n    type filter hook forward priority -50; policy drop;\n  }\n}\n")
 	return rules.String()
