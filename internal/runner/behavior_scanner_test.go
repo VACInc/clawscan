@@ -19,7 +19,7 @@ const behaviorFixture = `{
   "exercise":{"promptSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","turnLimit":1},
   "observations":[],"canaries":[],"redirectProbes":[],
   "persistence":{"scope":"selected-persistence-surfaces","inventoryPaired":false,"surfaces":[{"id":"shell-init","category":"shell-init","scope":"user","description":"User shell initialization files."}],"findings":[],"limitations":["Fixture persistence limitation."]},
-  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"redirectProbeScope":"seeded-workspace-redirects","redirectProbeCount":0,"redirectProbesExercised":0,"redirectDeepMode":false,"limitations":[]},
+  "coverage":{"syscallScope":"selected-mvp-syscalls","fileSyscalls":true,"processSyscalls":true,"networkSyscalls":true,"baselinePaired":true,"canaryStages":[{"stage":"read","coverage":"observed","source":"file-open-and-descriptor-syscall-trace"},{"stage":"write","coverage":"observed","source":"file-mutation-syscall-trace"},{"stage":"execute","coverage":"observed","source":"exec-syscall-trace"},{"stage":"outbound","coverage":"observed","source":"socket-send-syscall-payload"},{"stage":"agent-output","coverage":"observed","source":"agent-command-stdout"},{"stage":"tool","coverage":"limited","source":"openclaw-audit-metadata-no-bounded-args-results"}],"redirectProbeScope":"seeded-workspace-redirects","redirectProbeCount":0,"redirectProbesExercised":0,"redirectDeepMode":false,"limitations":[]},
   "toolCallLedger":{"source":"openclaw-audit-ledger","maxCallsPerLane":4096,"argumentSummaries":{"available":false,"reason":"metadata-only ledger carries no arguments"},"baseline":{"coverage":"unavailable","reason":"no ledger","callCount":0,"totalCalls":0,"truncated":false,"timed":false,"calls":[]},"exercise":{"coverage":"incomplete","reason":"audit persistence is best-effort","callCount":1,"totalCalls":1,"truncated":false,"timed":true,"durationMs":100,"calls":[{"sequence":1,"tool":"observatory_probe","state":"succeeded","durationMs":100,"offsetMs":0}]}},
   "runtimeTimeline":{"maxEventsPerLane":4096,"baseline":{"eventCount":0,"totalEvents":0,"truncated":false,"timed":false,"events":[]},"exercise":{"eventCount":0,"totalEvents":0,"truncated":false,"timed":false,"events":[]}}
 }`
@@ -162,7 +162,14 @@ func TestBehaviorScannerPreservesValidEvidenceOnNonzeroExit(t *testing.T) {
 
 func TestBehaviorScannerPreservesButFailsIncompleteEvidence(t *testing.T) {
 	incomplete := strings.Replace(behaviorFixture, `"status":"completed"`, `"status":"incomplete"`, 1)
+	incomplete = strings.Replace(incomplete, `"fileSyscalls":true`, `"fileSyscalls":false`, 1)
+	incomplete = strings.Replace(incomplete, `"processSyscalls":true`, `"processSyscalls":false`, 1)
+	incomplete = strings.Replace(incomplete, `"networkSyscalls":true`, `"networkSyscalls":false`, 1)
 	incomplete = strings.Replace(incomplete, `"baselinePaired":true`, `"baselinePaired":false`, 1)
+	incomplete = strings.Replace(incomplete, `"coverage":"observed","source":"file-open-and-descriptor-syscall-trace"`, `"coverage":"limited","source":"file-open-and-descriptor-syscall-trace"`, 1)
+	incomplete = strings.Replace(incomplete, `"coverage":"observed","source":"file-mutation-syscall-trace"`, `"coverage":"limited","source":"file-mutation-syscall-trace"`, 1)
+	incomplete = strings.Replace(incomplete, `"coverage":"observed","source":"exec-syscall-trace"`, `"coverage":"limited","source":"exec-syscall-trace"`, 1)
+	incomplete = strings.Replace(incomplete, `"coverage":"observed","source":"socket-send-syscall-payload"`, `"coverage":"limited","source":"unavailable-or-unpaired"`, 1)
 	result, err := (ExternalScannerRunner{
 		CommandRunner: &behaviorRecordingRunner{stdout: incomplete, err: errors.New("exit status 1")},
 		Env:           map[string]string{"CLAWSCAN_BEHAVIOR_CONFIG": "/private/config.yml"},

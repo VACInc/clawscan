@@ -140,8 +140,9 @@ and public JSON projection. A skill capture needs the same explicit
 native plugins use their manifest ID. The renderer also requires matching
 effective-capture digests, runtime versions, isolation receipts, prompts, and
 coverage, and refuses incomplete captures. It never labels incomparable runs as
-a version delta. Version deltas include both normalized trace observations and
-synthetic-canary interaction changes.
+a version delta. Version deltas include normalized trace observations,
+aggregate synthetic-canary interaction changes, and the exact canary stage
+whose delta changed.
 
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
@@ -257,6 +258,34 @@ Target digests bind file contents plus file/directory modes. A root-owned mode
 manifest restores permissions and empty directories that Git does not retain;
 target-controlled Git attributes are rejected.
 
+## Canary interaction correlation
+
+Each synthetic canary is labeled as `identity`, `memory`, or `credential` and
+reports ordered stage counts for `read`, `write`, `execute`, `outbound`,
+`agent-output`, and `tool`. Read means a read-intent file open, not a claim that
+an individual `read()` completed. Write covers write-intent opens and bounded
+mutation syscalls. Execute covers a canary path used as the executed program.
+Outbound combines literal marker bytes observed in socket send syscall payloads
+with literal marker bytes in canonical controlled-sink receipts. Agent output
+scans only the captured command stdout.
+
+Controlled-sink payloads enter correlation only from the already parsed, typed
+`MockEgressReceipt.payload` fields after the existing two-lane receipt verifier
+accepts lane identity, sink identity, and all request, byte, chunk, and socket
+bounds. The analyzer receives cloned private slices and independently caps the
+scan at 64 streams and 8 MiB. Raw payloads and marker values never enter public
+evidence. There is no second receipt parser or weaker receipt path.
+
+The current OpenClaw audit ledger contains metadata but no bounded tool
+arguments or results. Observatory therefore never infers a canary tool stage
+from stdout, syscalls, or tool names. Tool-stage coverage is always `limited`
+and non-authoritative. Each other stage publishes its exact source and either
+`observed` or `limited`; a zero count on a limited stage is inconclusive. The
+renderer shows class, stage counts, stage coverage, and stage-level version
+changes. The stage fields are an additive v2 extension; historical v1 and v2
+documents that lack the entire extension remain readable and render the stage
+section as not collected. A partially present extension fails validation.
+
 ## Controlled mock egress
 
 Controlled mock egress is an opt-in upgrade from safe outbound-attempt evidence
@@ -293,8 +322,10 @@ baseline/exercise/delta request and byte counts, a payload digest, a payload
 encoding label, and the IDs of any synthetic canaries observed in the captured
 bytes. Raw captured bytes stay only in the private per-lane receipt inside the
 capture bundle. TLS-encrypted or otherwise opaque payloads are recorded as byte
-counts and are never decoded, and canary scanning is skipped for them — the
-evidence never pretends opaque traffic was read. Connect/send observations to the
+counts and are never decoded. The `mockEgress.canariesObserved` summary remains
+cleartext-only; stage correlation performs only an exact synthetic-marker byte
+match against the bounded private receipt and never attempts to decode opaque
+traffic. Connect/send observations to the
 sink are labeled `controlled-sink:<port>`; the raw loopback address is redacted.
 
 The system fails closed: when the sink is enabled the bundle must contain a
@@ -505,6 +536,9 @@ comparison reject evidence produced by a different protocol.
 - Current embedded OpenClaw runs may expose no durable recorder lifecycle even
   when unrelated state created the SQLite database; the tool-call ledger then
   reports explicit `unavailable` coverage.
+- Canary tool-stage coverage is always limited because the current metadata-only
+  ledger has no bounded arguments or results. Agent stdout and syscalls are not
+  promoted into tool evidence.
 - Behavioral correlation is not author intent and is never a safety verdict.
 - Redirect probes cover two fixed workspace surfaces with one bounded trial each;
   a marker that was only read or repeated is not evidence of prompt injection.

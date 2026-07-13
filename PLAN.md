@@ -11,7 +11,7 @@ Build the missing dynamic scanner lane for `openclaw/clawscan`, plus the smalles
 1. `clawscan --scanner behavior` invokes the Observatory CLI and preserves its JSON evidence.
 2. The Observatory runs the same synthetic task twice in a disposable OpenClaw environment: once without the target (baseline), then with the skill or plugin installed (exercise).
 3. `strace` captures successful and attempted file, process, and network activity across the agent process tree.
-4. The analyzer subtracts baseline runtime noise, normalizes private paths/endpoints, records honeytoken interaction without publishing token values, and emits `observatory.behavior.v2`.
+4. The analyzer subtracts baseline runtime noise, normalizes private paths/endpoints, correlates synthetic honeytoken interactions across read, write, execute, outbound, and agent-output stages without publishing marker values, and emits `observatory.behavior.v2`. Tool-stage coverage remains explicitly limited because the current metadata ledger has no bounded arguments or results.
 5. A zero-dependency dark static page renders the evidence and an optional previous-version diff.
 
 The MVP is one owned skill fixture and one owned plugin fixture end to end, not a premature Hub watcher or top-100 batch service. No ClawHub package is executed during development.
@@ -72,7 +72,7 @@ This is the MVP’s main technical claim and the foundation for declared-vs-obse
   including fork inheritance and `CLONE_FS` sharing.
 - Replaces private-network addresses in every published observation subject with a marker; separately labels the configured model endpoint as control-plane traffic.
 - Suppresses dynamic-loader/locale noise and reports parser blind spots explicitly.
-- Records target SHA-256, copied/omitted file manifest, runtime versions, exit codes, duration, observation counts, canary interactions, coverage limitations, the per-run applied firewall hash, and a stable firewall-policy digest.
+- Records target SHA-256, copied/omitted file manifest, runtime versions, exit codes, duration, observation counts, canary class and stage interactions, coverage limitations, the per-run applied firewall hash, and a stable firewall-policy digest.
 - Binds every capture to a canonical digest of the effective prompt, model, endpoint allowlist, isolation receipt, resource limits, and runtime configuration; offline re-analysis rejects configuration drift.
 
 ## Security boundary
@@ -103,7 +103,7 @@ Top-level sections:
 - `observations`: kind, operation, normalized subject, baseline/exercise/delta
   counts, outcome; file descriptor acquisition is labeled `open-for-*` and is
   never presented as a completed read or write;
-- `canaries`: canary ID/surface and baseline/exercise interaction flags, never values;
+- `canaries`: canary ID, synthetic class (`identity`, `memory`, or `credential`), surface, aggregate counts, and ordered per-stage baseline/exercise/delta counts, never marker values;
 - `persistence`: a curated `selected-persistence-surfaces` catalog plus findings
   that distinguish attempted-but-denied persistence operations from successful
   residual changes confirmed by a before/after lane inventory; no reboot cycle,
@@ -119,7 +119,7 @@ Top-level sections:
   harmless (a reserved TEST-NET endpoint or a synthetic sentinel file) and cannot
   reach a real service. A read or repeat is never treated as prompt injection; only
   a positive `deviatedDelta` is;
-- `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
+- `coverage`: captured syscall families, ordered canary-stage coverage and source receipts (with tool coverage always limited), an explicit `selected-mvp-syscalls`
   scope (never an exhaustive Linux-audit claim), the redirect probe scope/count,
   the count of probes actually exercised (`redirectProbesExercised`; a missing
   read lowers coverage rather than implying resistance), the redirect deep-mode
@@ -153,7 +153,7 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 
 - Clawscan lists and dispatches `behavior` through the registry.
 - Adapter errors are secret-redacted; valid evidence survives nonzero scanner exit.
-- Trace parser proves baseline subtraction for file, process, network, failed-attempt, and canary cases.
+- Trace parser proves baseline subtraction for file, process, network, failed-attempt, and canary-stage cases. Owned typed sink receipts and agent stdout exercise their separate bounded private seams, while tool metadata remains non-authoritative.
 - Target staging rejects symlinks/Git attribute controls, records and digest-binds skipped `.git` metadata, bounds files plus directories plus omissions, and restores exact source permission modes and empty directories after Git transport.
 - Network evidence includes filesystem and Linux abstract Unix-domain sockets, and site rendering pins a no-follow output directory and refuses symlinked or hard-linked fixed output files.
 - Skill frontmatter names are validated as canonical OpenClaw allowlist IDs and used consistently for staging, prompting, and agent visibility; batched network evidence preserves repeated destinations and partial-send outcomes.

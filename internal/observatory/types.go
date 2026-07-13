@@ -17,6 +17,19 @@ const MaxEvidenceBytes = 64 << 20
 const MaxRuntimeTimelineEventsPerLane = 4096
 const MaxToolCallsPerLane = 4096
 
+const (
+	CanaryStageRead        = "read"
+	CanaryStageWrite       = "write"
+	CanaryStageExecute     = "execute"
+	CanaryStageOutbound    = "outbound"
+	CanaryStageAgentOutput = "agent-output"
+	CanaryStageTool        = "tool"
+)
+
+var canaryStageSequence = []string{CanaryStageRead, CanaryStageWrite, CanaryStageExecute, CanaryStageOutbound, CanaryStageAgentOutput, CanaryStageTool}
+
+const maxCanaryInteractionCount = 1 << 20
+
 type Evidence struct {
 	SchemaVersion       string                     `json:"schemaVersion"`
 	CaptureConfigSHA256 string                     `json:"captureConfigSha256"`
@@ -119,11 +132,26 @@ type Observation struct {
 }
 
 type CanaryObservation struct {
-	ID                   string `json:"id"`
-	Surface              string `json:"surface"`
+	ID                   string                   `json:"id"`
+	Surface              string                   `json:"surface"`
+	Class                string                   `json:"class,omitempty"`
+	BaselineInteractions int                      `json:"baselineInteractions"`
+	ExerciseInteractions int                      `json:"exerciseInteractions"`
+	DeltaInteractions    int                      `json:"deltaInteractions"`
+	Stages               []CanaryStageInteraction `json:"stages"`
+}
+
+type CanaryStageInteraction struct {
+	Stage                string `json:"stage"`
 	BaselineInteractions int    `json:"baselineInteractions"`
 	ExerciseInteractions int    `json:"exerciseInteractions"`
 	DeltaInteractions    int    `json:"deltaInteractions"`
+}
+
+type CanaryStageCoverage struct {
+	Stage    string `json:"stage"`
+	Coverage string `json:"coverage"`
+	Source   string `json:"source"`
 }
 
 // RedirectProbeObservation reports how far the exercised agent escalated a
@@ -155,16 +183,17 @@ type RedirectProbeObservation struct {
 }
 
 type CoverageEvidence struct {
-	SyscallScope            string   `json:"syscallScope"`
-	FileSyscalls            bool     `json:"fileSyscalls"`
-	ProcessSyscalls         bool     `json:"processSyscalls"`
-	NetworkSyscalls         bool     `json:"networkSyscalls"`
-	BaselinePaired          bool     `json:"baselinePaired"`
-	RedirectProbeScope      string   `json:"redirectProbeScope"`
-	RedirectProbeCount      int      `json:"redirectProbeCount"`
-	RedirectProbesExercised int      `json:"redirectProbesExercised"`
-	RedirectDeepMode        bool     `json:"redirectDeepMode"`
-	Limitations             []string `json:"limitations"`
+	SyscallScope            string                `json:"syscallScope"`
+	FileSyscalls            bool                  `json:"fileSyscalls"`
+	ProcessSyscalls         bool                  `json:"processSyscalls"`
+	NetworkSyscalls         bool                  `json:"networkSyscalls"`
+	BaselinePaired          bool                  `json:"baselinePaired"`
+	CanaryStages            []CanaryStageCoverage `json:"canaryStages,omitempty"`
+	RedirectProbeScope      string                `json:"redirectProbeScope"`
+	RedirectProbeCount      int                   `json:"redirectProbeCount"`
+	RedirectProbesExercised int                   `json:"redirectProbesExercised"`
+	RedirectDeepMode        bool                  `json:"redirectDeepMode"`
+	Limitations             []string              `json:"limitations"`
 }
 
 // PersistenceEvidence reports persistence- and lifecycle-relevant behavior for a
@@ -291,6 +320,7 @@ type CaptureMetadata struct {
 type CanaryDefinition struct {
 	ID      string
 	Surface string
+	Class   string
 	Path    string
 	Marker  string
 }
@@ -370,6 +400,32 @@ func ValidateEvidence(evidence Evidence) error {
 	if evidence.Coverage.SyscallScope != "selected-mvp-syscalls" {
 		return errors.New("evidence syscall coverage scope is missing or unsupported")
 	}
+	hasCanaryStageEvidence := evidence.Coverage.CanaryStages != nil
+	for _, canary := range evidence.Canaries {
+		hasCanaryStageEvidence = hasCanaryStageEvidence || canary.Class != "" || canary.Stages != nil
+	}
+	// Canary-stage fields are an additive v2 extension. Previously emitted v2
+	// artifacts have none of these fields and must remain readable. Once any
+	// extension field is present, validate the complete extension atomically.
+	if hasCanaryStageEvidence {
+		if evidence.Coverage.CanaryStages == nil {
+			return errors.New("evidence canary stage coverage is required")
+		}
+		pairedTraceCoverage := evidence.Coverage.BaselinePaired && evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
+		if err := validateCanaryStageCoverage(evidence.Coverage.CanaryStages, pairedTraceCoverage, evidence.MockEgress != nil); err != nil {
+			return err
+		}
+		if evidence.Coverage.BaselinePaired != evidence.Coverage.FileSyscalls ||
+			evidence.Coverage.BaselinePaired != evidence.Coverage.ProcessSyscalls ||
+			evidence.Coverage.BaselinePaired != evidence.Coverage.NetworkSyscalls {
+			return errors.New("evidence syscall and paired-trace coverage is inconsistent")
+		}
+		for _, index := range []int{0, 1, 2} {
+			if (evidence.Coverage.CanaryStages[index].Coverage == "observed") != pairedTraceCoverage {
+				return errors.New("evidence canary trace-stage coverage is inconsistent")
+			}
+		}
+	}
 	hasRedirectEvidence := evidence.RedirectProbes != nil || evidence.Coverage.RedirectProbeScope != "" ||
 		evidence.Coverage.RedirectProbeCount != 0 || evidence.Coverage.RedirectProbesExercised != 0 || evidence.Coverage.RedirectDeepMode
 	if evidence.SchemaVersion == EvidenceSchemaVersion || hasRedirectEvidence {
@@ -408,8 +464,33 @@ func ValidateEvidence(evidence Evidence) error {
 		if expectedDelta < 0 {
 			expectedDelta = 0
 		}
-		if canary.ID == "" || canary.Surface == "" || canary.BaselineInteractions < 0 || canary.ExerciseInteractions < 0 || canary.DeltaInteractions != expectedDelta {
+		if canary.ID == "" || canary.Surface == "" || canary.BaselineInteractions < 0 || canary.ExerciseInteractions < 0 ||
+			canary.BaselineInteractions > maxCanaryInteractionCount || canary.ExerciseInteractions > maxCanaryInteractionCount ||
+			canary.DeltaInteractions != expectedDelta {
 			return errors.New("evidence contains an invalid canary observation")
+		}
+		if hasCanaryStageEvidence {
+			if canary.Class != "identity" && canary.Class != "memory" && canary.Class != "credential" {
+				return errors.New("evidence contains an invalid canary class")
+			}
+			if canary.Stages == nil {
+				return errors.New("evidence canary stages are required")
+			}
+			if err := validateCanaryStages(canary.Stages); err != nil {
+				return err
+			}
+			stageBaselineTotal := 0
+			stageExerciseTotal := 0
+			for _, stage := range canary.Stages {
+				if stage.BaselineInteractions > canary.BaselineInteractions || stage.ExerciseInteractions > canary.ExerciseInteractions {
+					return errors.New("evidence canary stage interactions exceed their aggregate canary counts")
+				}
+				stageBaselineTotal += stage.BaselineInteractions
+				stageExerciseTotal += stage.ExerciseInteractions
+			}
+			if stageBaselineTotal < canary.BaselineInteractions || stageExerciseTotal < canary.ExerciseInteractions {
+				return errors.New("evidence aggregate canary interactions lack complete stage accounting")
+			}
 		}
 	}
 	if err := validateMockEgressEvidence(evidence.MockEgress); err != nil {
@@ -465,6 +546,100 @@ func ValidateEvidence(evidence Evidence) error {
 		return fmt.Errorf("evidence exceeds maximum encoded size (%d bytes)", MaxEvidenceBytes)
 	}
 	return nil
+}
+
+func validateCanaryStages(stages []CanaryStageInteraction) error {
+	lastRank := -1
+	for _, stage := range stages {
+		rank, ok := canaryStageRank(stage.Stage)
+		if !ok || rank <= lastRank {
+			return errors.New("evidence canary stages are unknown, duplicated, or out of order")
+		}
+		lastRank = rank
+		expected := stage.ExerciseInteractions - stage.BaselineInteractions
+		if expected < 0 {
+			expected = 0
+		}
+		if stage.BaselineInteractions < 0 || stage.ExerciseInteractions < 0 ||
+			stage.BaselineInteractions > maxCanaryInteractionCount || stage.ExerciseInteractions > maxCanaryInteractionCount ||
+			stage.DeltaInteractions != expected {
+			return errors.New("evidence contains an invalid canary stage interaction")
+		}
+		if stage.BaselineInteractions == 0 && stage.ExerciseInteractions == 0 {
+			return errors.New("evidence canary stage has no interactions")
+		}
+		if stage.Stage == CanaryStageTool {
+			return errors.New("evidence tool-stage interactions are unsupported by this capture protocol")
+		}
+	}
+	return nil
+}
+
+func validateCanaryStageCoverage(coverage []CanaryStageCoverage, pairedTrace bool, pairedSinkReceipt bool) error {
+	if len(coverage) != len(canaryStageSequence) {
+		return errors.New("evidence canary stage coverage is incomplete")
+	}
+	expectedSources := map[string]map[string]bool{
+		CanaryStageRead:    {"file-open-and-descriptor-syscall-trace": true},
+		CanaryStageWrite:   {"file-mutation-syscall-trace": true},
+		CanaryStageExecute: {"exec-syscall-trace": true},
+		CanaryStageOutbound: {
+			"socket-send-syscall-payload":                    true,
+			"typed-sink-receipt":                             true,
+			"socket-send-syscall-payload+typed-sink-receipt": true,
+			"unavailable-or-unpaired":                        true,
+		},
+		CanaryStageAgentOutput: {
+			"agent-command-stdout":                       true,
+			"agent-command-stdout-unpaired-or-truncated": true,
+		},
+		CanaryStageTool: {"openclaw-audit-metadata-no-bounded-args-results": true},
+	}
+	for index, entry := range coverage {
+		if entry.Stage != canaryStageSequence[index] {
+			return errors.New("evidence canary stage coverage is missing or out of order")
+		}
+		if entry.Coverage != "observed" && entry.Coverage != "limited" {
+			return errors.New("evidence canary stage coverage state is invalid")
+		}
+		if !expectedSources[entry.Stage][entry.Source] {
+			return errors.New("evidence canary stage coverage source is invalid")
+		}
+		if entry.Stage == CanaryStageTool && entry.Coverage != "limited" {
+			return errors.New("evidence tool-stage coverage cannot be authoritative for this capture protocol")
+		}
+		if entry.Stage == CanaryStageOutbound && (entry.Source == "unavailable-or-unpaired") != (entry.Coverage == "limited") {
+			return errors.New("evidence outbound coverage is inconsistent with its source")
+		}
+		if entry.Stage == CanaryStageAgentOutput && (entry.Source == "agent-command-stdout") != (entry.Coverage == "observed") {
+			return errors.New("evidence agent-output coverage is inconsistent with its source")
+		}
+	}
+	expectedOutbound := CanaryStageCoverage{Stage: CanaryStageOutbound, Coverage: "limited", Source: "unavailable-or-unpaired"}
+	switch {
+	case pairedTrace && pairedSinkReceipt:
+		expectedOutbound.Coverage = "observed"
+		expectedOutbound.Source = "socket-send-syscall-payload+typed-sink-receipt"
+	case pairedTrace:
+		expectedOutbound.Coverage = "observed"
+		expectedOutbound.Source = "socket-send-syscall-payload"
+	case pairedSinkReceipt:
+		expectedOutbound.Coverage = "observed"
+		expectedOutbound.Source = "typed-sink-receipt"
+	}
+	if coverage[3] != expectedOutbound {
+		return errors.New("evidence outbound coverage is inconsistent with paired trace and typed-sink provenance")
+	}
+	return nil
+}
+
+func canaryStageRank(stage string) (int, bool) {
+	for rank, name := range canaryStageSequence {
+		if name == stage {
+			return rank, true
+		}
+	}
+	return 0, false
 }
 
 func validatePersistenceEvidence(persistence PersistenceEvidence) error {

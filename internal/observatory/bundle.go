@@ -2,6 +2,7 @@ package observatory
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,17 +21,19 @@ import (
 )
 
 type CaptureBundle struct {
-	Metadata           CaptureMetadata
-	BaselineTraces     []string
-	ExerciseTraces     []string
-	BaselineOutput     []byte
-	ExerciseOutput     []byte
-	MockEgressBaseline *MockEgressReceipt
-	MockEgressExercise *MockEgressReceipt
-	BaselineInventory  laneInventory
-	ExerciseInventory  laneInventory
-	BaselineToolAudit  toolAuditCapture
-	ExerciseToolAudit  toolAuditCapture
+	Metadata              CaptureMetadata
+	BaselineTraces        []string
+	ExerciseTraces        []string
+	BaselineOutput        []byte
+	ExerciseOutput        []byte
+	BaselineOutputPresent bool
+	ExerciseOutputPresent bool
+	MockEgressBaseline    *MockEgressReceipt
+	MockEgressExercise    *MockEgressReceipt
+	BaselineInventory     laneInventory
+	ExerciseInventory     laneInventory
+	BaselineToolAudit     toolAuditCapture
+	ExerciseToolAudit     toolAuditCapture
 }
 
 type inventoryEntry struct {
@@ -132,8 +135,10 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 			bundle.ExerciseTraces = append(bundle.ExerciseTraces, string(data))
 		case name == "baseline/agent.stdout":
 			bundle.BaselineOutput = append([]byte(nil), data...)
+			bundle.BaselineOutputPresent = true
 		case name == "exercise/agent.stdout":
 			bundle.ExerciseOutput = append([]byte(nil), data...)
+			bundle.ExerciseOutputPresent = true
 		case name == "baseline/mock-egress.json":
 			receipt, err := parseMockEgressReceipt(data)
 			if err != nil {
@@ -436,7 +441,34 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 	if bundle.Metadata.CaptureConfigSHA != expectedCaptureConfig {
 		return Evidence{}, errors.New("TLS CA changed after capture configuration verification")
 	}
+	// The canonical typed receipts are parsed while the bundle is read. Verify
+	// both lanes before exposing their private payload slices to correlation.
+	// This keeps BuildEvidence safe for direct callers as well as Scan and
+	// AnalyzeBundle, without adding a second receipt parser or trust path.
+	if err := verifyCaptureMockEgress(bundle, config.Runtime.MockEgress); err != nil {
+		return Evidence{}, err
+	}
 	target.Lineage = config.TargetLineage
+	baselineAgentOutputs := [][]byte(nil)
+	exerciseAgentOutputs := [][]byte(nil)
+	if bundle.BaselineOutputPresent || len(bundle.BaselineOutput) > 0 {
+		baselineAgentOutputs = clonePrivatePayloads(bundle.BaselineOutput)
+	}
+	if bundle.ExerciseOutputPresent || len(bundle.ExerciseOutput) > 0 {
+		exerciseAgentOutputs = clonePrivatePayloads(bundle.ExerciseOutput)
+	}
+	baselineSinkPayloads := [][]byte(nil)
+	exerciseSinkPayloads := [][]byte(nil)
+	baselineSinkPayloadsPresent := false
+	exerciseSinkPayloadsPresent := false
+	if bundle.MockEgressBaseline != nil {
+		baselineSinkPayloads = clonePrivatePayloads(bundle.MockEgressBaseline.payload)
+		baselineSinkPayloadsPresent = true
+	}
+	if bundle.MockEgressExercise != nil {
+		exerciseSinkPayloads = clonePrivatePayloads(bundle.MockEgressExercise.payload)
+		exerciseSinkPayloadsPresent = true
+	}
 	analysisInput := AnalysisInput{
 		BaselineTraces:        bundle.BaselineTraces,
 		ExerciseTraces:        bundle.ExerciseTraces,
@@ -448,6 +480,15 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
 		MockEgressAddress:     mockEgressClassifiedAddress(config.Runtime.MockEgress),
 		RedirectDeepMode:      config.Redirect.Deep,
+		// Agent stdout feeds agent-output only. Verified controlled-sink
+		// payloads feed outbound only. Tool metadata has no bounded arguments
+		// or results, so it remains explicitly limited and non-authoritative.
+		BaselineAgentOutputs:        baselineAgentOutputs,
+		ExerciseAgentOutputs:        exerciseAgentOutputs,
+		BaselineSinkPayloads:        baselineSinkPayloads,
+		ExerciseSinkPayloads:        exerciseSinkPayloads,
+		BaselineSinkPayloadsPresent: baselineSinkPayloadsPresent,
+		ExerciseSinkPayloadsPresent: exerciseSinkPayloadsPresent,
 	}
 	analysis := AnalyzeTraces(analysisInput)
 	mockEgress := buildMockEgressEvidence(config.Runtime.MockEgress, bundle, bundle.Metadata.Canaries)
@@ -460,7 +501,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 	if bundle.Metadata.BaselineExitCode != 0 || bundle.Metadata.ExerciseExitCode != 0 || !analysis.Coverage.BaselinePaired {
 		status = "incomplete"
 	}
-	return Evidence{
+	evidence := Evidence{
 		SchemaVersion:       EvidenceSchemaVersion,
 		CaptureConfigSHA256: bundle.Metadata.CaptureConfigSHA,
 		Target:              target,
@@ -506,15 +547,54 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (
 		MockEgress:      mockEgress,
 		ToolCallLedger:  toolCallLedger,
 		RuntimeTimeline: runtimeTimeline,
-	}, nil
+	}
+	if err := validateBuiltEvidencePrivacy(evidence, bundle, config); err != nil {
+		return Evidence{}, err
+	}
+	return evidence, nil
+}
+
+func validateBuiltEvidencePrivacy(evidence Evidence, bundle CaptureBundle, config Config) error {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return fmt.Errorf("encode evidence for privacy validation: %w", err)
+	}
+	privateValues := []string{
+		bundle.Metadata.BaselineWorkspace, bundle.Metadata.ExerciseWorkspace,
+		bundle.Metadata.BaselineState, bundle.Metadata.ExerciseState,
+		bundle.Metadata.BaselineHome, bundle.Metadata.ExerciseHome,
+		bundle.Metadata.TargetRoot,
+	}
+	for _, canary := range bundle.Metadata.Canaries {
+		privateValues = append(privateValues, canary.Marker)
+	}
+	for _, redirect := range bundle.Metadata.Redirects {
+		privateValues = append(privateValues, redirect.Marker)
+	}
+	privateValues = append(privateValues, config.Runtime.MockEgress.Address)
+	if host, _, splitErr := net.SplitHostPort(config.Runtime.MockEgress.Address); splitErr == nil {
+		privateValues = append(privateValues, strings.Trim(host, "[]"))
+	}
+	for _, address := range config.Runtime.ControlPlaneAddresses {
+		privateValues = append(privateValues, address)
+		if host, _, splitErr := net.SplitHostPort(address); splitErr == nil {
+			privateValues = append(privateValues, strings.Trim(host, "[]"))
+		}
+	}
+	for _, value := range privateValues {
+		if value != "" && bytes.Contains(encoded, []byte(value)) {
+			return errors.New("refusing to publish evidence containing private capture material")
+		}
+	}
+	return nil
 }
 
 func canaryDefinitions(markers map[string]string) ([]CanaryDefinition, error) {
 	definitions := []CanaryDefinition{
-		{ID: "workspace-identity", Surface: "workspace file", Path: "$WORKSPACE/SOUL.md"},
-		{ID: "workspace-memory", Surface: "workspace file", Path: "$WORKSPACE/memory/private.md"},
-		{ID: "cloud-credentials", Surface: "home file", Path: "$HOME/.aws/credentials"},
-		{ID: "openclaw-credentials", Surface: "state file", Path: "$STATE/credentials.json"},
+		{ID: "workspace-identity", Surface: "workspace file", Class: "identity", Path: "$WORKSPACE/SOUL.md"},
+		{ID: "workspace-memory", Surface: "workspace file", Class: "memory", Path: "$WORKSPACE/memory/private.md"},
+		{ID: "cloud-credentials", Surface: "home file", Class: "credential", Path: "$HOME/.aws/credentials"},
+		{ID: "openclaw-credentials", Surface: "state file", Class: "credential", Path: "$STATE/credentials.json"},
 	}
 	if len(markers) != len(definitions) {
 		return nil, errors.New("capture bundle private canary set is incomplete")

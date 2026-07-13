@@ -1204,6 +1204,7 @@ func TestRenderSiteIsDarkAndShowsVersionDelta(t *testing.T) {
 	current.Observations = append(current.Observations, Observation{Kind: "network", Operation: "connect", Subject: "93.184.216.34:443", Outcome: "succeeded", Role: "external", ExerciseCount: 1, DeltaCount: 1})
 	current.Canaries[0].ExerciseInteractions = 1
 	current.Canaries[0].DeltaInteractions = 1
+	current.Canaries[0].Stages = []CanaryStageInteraction{{Stage: CanaryStageRead, ExerciseInteractions: 1, DeltaInteractions: 1}}
 	output := t.TempDir()
 	if err := RenderSite(output, current, &previous); err != nil {
 		t.Fatal(err)
@@ -1276,6 +1277,13 @@ func TestValidateEvidenceRejectsCompletedRunWithoutCompleteLanes(t *testing.T) {
 	}
 	evidence = fixtureEvidence()
 	evidence.Coverage.BaselinePaired = false
+	evidence.Coverage.FileSyscalls = false
+	evidence.Coverage.ProcessSyscalls = false
+	evidence.Coverage.NetworkSyscalls = false
+	for index := 0; index < 3; index++ {
+		evidence.Coverage.CanaryStages[index].Coverage = "limited"
+	}
+	evidence.Coverage.CanaryStages[3] = CanaryStageCoverage{Stage: CanaryStageOutbound, Coverage: "limited", Source: "unavailable-or-unpaired"}
 	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "inconsistent with lane exits") {
 		t.Fatalf("err = %v", err)
 	}
@@ -1328,8 +1336,13 @@ func TestLegacyV1CoreEvidenceRemainsReadableWithoutExtensionSections(t *testing.
 	isolation := document["run"].(map[string]any)["isolation"].(map[string]any)
 	delete(isolation, "proxmoxTlsCaSha256")
 	coverage := document["coverage"].(map[string]any)
-	for _, key := range []string{"redirectProbeScope", "redirectProbeCount", "redirectProbesExercised", "redirectDeepMode"} {
+	for _, key := range []string{"canaryStages", "redirectProbeScope", "redirectProbeCount", "redirectProbesExercised", "redirectDeepMode"} {
 		delete(coverage, key)
+	}
+	for _, rawCanary := range document["canaries"].([]any) {
+		canary := rawCanary.(map[string]any)
+		delete(canary, "class")
+		delete(canary, "stages")
 	}
 	encoded, err = json.Marshal(document)
 	if err != nil {
@@ -1363,7 +1376,7 @@ func TestLegacyV1CoreEvidenceRemainsReadableWithoutExtensionSections(t *testing.
 	if err := json.Unmarshal(projectedDocument["coverage"], &projectedCoverage); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"redirectProbeScope", "redirectProbeCount", "redirectProbesExercised", "redirectDeepMode"} {
+	for _, key := range []string{"canaryStages", "redirectProbeScope", "redirectProbeCount", "redirectProbesExercised", "redirectDeepMode"} {
 		if _, present := projectedCoverage[key]; present {
 			t.Fatalf("legacy projection invented coverage field %q: %s", key, projected)
 		}
@@ -1373,6 +1386,7 @@ func TestLegacyV1CoreEvidenceRemainsReadableWithoutExtensionSections(t *testing.
 		t.Fatal(err)
 	}
 	if strings.Count(string(html), "Not collected in this v1 evidence.") != 4 ||
+		!strings.Contains(string(html), "Not collected in this evidence.") ||
 		strings.Contains(string(html), "No monitored persistence surface changed") {
 		t.Fatalf("historical v1 rendering misstates absent coverage:\n%s", html)
 	}
@@ -2035,10 +2049,14 @@ func fixtureEvidence() Evidence {
 		},
 		Exercise:       ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
 		Observations:   []Observation{},
-		Canaries:       []CanaryObservation{{ID: "cloud-credentials", Surface: "home file"}},
+		Canaries:       []CanaryObservation{{ID: "cloud-credentials", Surface: "home file", Class: "credential", Stages: []CanaryStageInteraction{}}},
 		RedirectProbes: []RedirectProbeObservation{{ID: "workspace-note-egress", Surface: "workspace note", Vector: "network", ReadExercise: 1, ReadDelta: 1, Escalation: "read", Attributed: "read", Exercised: true}},
 		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
-		Coverage:       CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, RedirectProbeScope: RedirectProbeScope, RedirectProbeCount: 1, RedirectProbesExercised: 1, Limitations: []string{"Fixture limitation."}},
+		Coverage: CoverageEvidence{
+			SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true,
+			CanaryStages:       canaryStageCoverage(canaryCoverageInputs{PairedTrace: true, PairedAgentOutput: true, AgentOutputComplete: true}),
+			RedirectProbeScope: RedirectProbeScope, RedirectProbeCount: 1, RedirectProbesExercised: 1, Limitations: []string{"Fixture limitation."},
+		},
 		ToolCallLedger: ToolCallLedger{
 			Source:            ToolCallLedgerSource,
 			MaxCallsPerLane:   MaxToolCallsPerLane,

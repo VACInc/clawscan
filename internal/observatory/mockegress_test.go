@@ -411,6 +411,7 @@ func TestValidateMockEgressEvidence(t *testing.T) {
 	}
 	full := fixtureEvidence()
 	full.MockEgress = valid
+	full.Coverage.CanaryStages[3].Source = "socket-send-syscall-payload+typed-sink-receipt"
 	if err := ValidateEvidence(full); err != nil {
 		t.Fatalf("evidence with valid mock egress rejected: %v", err)
 	}
@@ -536,6 +537,7 @@ func TestRenderSiteShowsControlledMockEgress(t *testing.T) {
 		SinkEndpoint: "controlled-sink:9009", ExerciseRequests: 1, DeltaRequests: 1, ExerciseBytes: 61, DeltaBytes: 61,
 		PayloadEncoding: "cleartext", PayloadSHA256: "sha256:" + strings.Repeat("a", 64), CanariesObserved: []string{"cloud-credentials"},
 	}
+	evidence.Coverage.CanaryStages[3].Source = "socket-send-syscall-payload+typed-sink-receipt"
 	output := t.TempDir()
 	if err := RenderSite(output, evidence, nil); err != nil {
 		t.Fatal(err)
