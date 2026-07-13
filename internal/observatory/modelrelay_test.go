@@ -128,6 +128,13 @@ func TestModelRelayReceiptsFailClosedAndMockCompletenessIsExplicit(t *testing.T)
 	if err := verifyModelRelayReceipts(bundle, runtimeConfig); err != nil {
 		t.Fatalf("valid receipts rejected: %v", err)
 	}
+	bundle.ModelRelayBaseline.AcceptedRequests = 0
+	bundle.ModelRelayBaseline.RejectedRequests = 1
+	bundle.ModelRelayBaseline.RequestBytes = 100
+	bundle.ModelRelayBaseline.ResponseBytes = 0
+	if err := verifyModelRelayReceipts(bundle, runtimeConfig); err != nil {
+		t.Fatalf("bounded rejected request bytes rejected: %v", err)
+	}
 	bundle.ModelRelayExercise.PolicySHA256 = "sha256:" + strings.Repeat("f", 64)
 	if err := verifyModelRelayReceipts(bundle, runtimeConfig); err == nil || !strings.Contains(err.Error(), "policy digest") {
 		t.Fatalf("digest mismatch err = %v", err)
@@ -216,7 +223,7 @@ func TestModelRelayScriptRejectsAdjacentRoutesAndCapsRequests(t *testing.T) {
 	_ = probe.Close()
 	upstreamAddress := upstreamListener.Addr().String()
 	model := ModelConfig{BaseURL: "http://" + upstreamAddress + "/v1", ID: "fixture-model", API: "openai-completions"}
-	relayConfig := ModelRelayConfig{Address: relayAddress, MaxRequests: 5, MaxRequestBytes: 1024, MaxResponseBytes: 2048, MaxTotalBytes: 4096, MaxConcurrentRequests: 1, RequestTimeoutSeconds: 1}
+	relayConfig := ModelRelayConfig{Address: relayAddress, MaxRequests: 7, MaxRequestBytes: 1024, MaxResponseBytes: 2048, MaxTotalBytes: 2048, MaxConcurrentRequests: 1, RequestTimeoutSeconds: 1}
 	policy, err := buildModelRelayPolicy(relayConfig, model, 5)
 	if err != nil {
 		t.Fatal(err)
@@ -271,20 +278,27 @@ func TestModelRelayScriptRejectsAdjacentRoutesAndCapsRequests(t *testing.T) {
 		_ = response.Body.Close()
 		return response.StatusCode
 	}
+	validBody := `{"model":"fixture-model","messages":[]}`
+	if got := do(http.MethodPost, policy.AllowedPath, validBody); got != http.StatusOK {
+		t.Fatalf("valid request status = %d", got)
+	}
 	if got := do(http.MethodGet, policy.AllowedPath, ""); got != http.StatusMethodNotAllowed {
 		t.Fatalf("GET status = %d", got)
 	}
 	if got := do(http.MethodPost, policy.AllowedPath+"?next=/admin", `{"model":"fixture-model"}`); got != http.StatusNotFound {
 		t.Fatalf("query route status = %d", got)
 	}
-	if got := do(http.MethodPost, policy.AllowedPath, `{"model":"other"}`); got != http.StatusBadRequest {
-		t.Fatalf("wrong model status = %d", got)
+	wrongModelBody := `{"model":"other","padding":"` + strings.Repeat("x", 900) + `"}`
+	for attempt := 0; attempt < 2; attempt++ {
+		if got := do(http.MethodPost, policy.AllowedPath, wrongModelBody); got != http.StatusBadRequest {
+			t.Fatalf("wrong model attempt %d status = %d", attempt+1, got)
+		}
+	}
+	if got := do(http.MethodPost, policy.AllowedPath, wrongModelBody); got != http.StatusRequestEntityTooLarge {
+		t.Fatalf("cumulative rejected-body status = %d", got)
 	}
 	if got := do(http.MethodPost, policy.AllowedPath, `{"model":"fixture-model","padding":"`+strings.Repeat("x", 2048)+`"}`); got != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized request status = %d", got)
-	}
-	if got := do(http.MethodPost, policy.AllowedPath, `{"model":"fixture-model","messages":[]}`); got != http.StatusOK {
-		t.Fatalf("valid request status = %d", got)
 	}
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
@@ -304,7 +318,8 @@ func TestModelRelayScriptRejectsAdjacentRoutesAndCapsRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt.AcceptedRequests != 1 || receipt.RejectedRequests != 4 || receipt.RequestBytes == 0 || receipt.ResponseBytes == 0 || upstreamCalls.Load() != 1 || receipt.DeadlineHit {
+	expectedRequestBytes := int64(len(validBody) + 2*len(wrongModelBody))
+	if receipt.AcceptedRequests != 1 || receipt.RejectedRequests != 6 || receipt.RequestBytes != expectedRequestBytes || receipt.ResponseBytes == 0 || upstreamCalls.Load() != 1 || receipt.DeadlineHit {
 		t.Fatalf("receipt=%#v upstreamCalls=%d", receipt, upstreamCalls.Load())
 	}
 }

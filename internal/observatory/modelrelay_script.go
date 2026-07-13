@@ -123,13 +123,17 @@ const server = http.createServer((req, res) => {
     req.destroy();
   });
   req.on("data", chunk => {
-    bytes += chunk.length;
-    if (bytes > p.maxRequestBytes || receipt.requestBytes + receipt.responseBytes + bytes > p.maxTotalBytes) {
+    if (bytes + chunk.length > p.maxRequestBytes || receipt.requestBytes + receipt.responseBytes + chunk.length > p.maxTotalBytes) {
       receipt.truncated = true;
       reject(res, 413, "request exceeds relay byte cap");
       req.destroy();
       return;
     }
+    bytes += chunk.length;
+    // Charge every body byte the relay reads, including bodies later rejected
+    // for invalid JSON or model identity. This makes maxTotalBytes a cumulative
+    // ingress and egress bound rather than only an accepted-prompt bound.
+    receipt.requestBytes += chunk.length;
     chunks.push(chunk);
   });
   req.on("error", () => release());
@@ -143,12 +147,8 @@ const server = http.createServer((req, res) => {
     } catch {
       return reject(res, 400, "request must be valid JSON for the configured model");
     }
-    if (receipt.requestBytes + receipt.responseBytes + body.length > p.maxTotalBytes) {
-      return reject(res, 429, "relay traffic cap reached");
-    }
     receipt.rejectedRequests--;
     receipt.acceptedRequests++;
-    receipt.requestBytes += body.length;
     const transport = upstream.protocol === "https:" ? https : http;
     const upstreamRequest = transport.request(upstream, {
       method: "POST",

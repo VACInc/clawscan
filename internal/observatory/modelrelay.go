@@ -323,7 +323,8 @@ func verifyModelRelayReceipts(bundle CaptureBundle, config RuntimeConfig) error 
 		if receipt.AcceptedRequests+receipt.RejectedRequests > limits.MaxRequests || receipt.RequestBytes > limits.MaxTotalBytes || receipt.ResponseBytes > limits.MaxTotalBytes || receipt.RequestBytes+receipt.ResponseBytes > limits.MaxTotalBytes {
 			return fmt.Errorf("model relay %s receipt exceeds configured traffic limits", lane)
 		}
-		if receipt.RequestBytes > int64(receipt.AcceptedRequests)*limits.MaxRequestBytes || receipt.ResponseBytes > int64(receipt.AcceptedRequests)*limits.MaxResponseBytes {
+		requestCount := receipt.AcceptedRequests + receipt.RejectedRequests
+		if receipt.RequestBytes > int64(requestCount)*limits.MaxRequestBytes || receipt.ResponseBytes > int64(receipt.AcceptedRequests)*limits.MaxResponseBytes {
 			return fmt.Errorf("model relay %s receipt exceeds configured per-request limits", lane)
 		}
 		if receipt.PeakConcurrency > limits.MaxConcurrentRequests || receipt.PeakConcurrency > receipt.AcceptedRequests+receipt.RejectedRequests {
