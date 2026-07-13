@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-const EvidenceSchemaVersion = "observatory.behavior.v1"
+const LegacyEvidenceSchemaVersion = "observatory.behavior.v1"
+const EvidenceSchemaVersion = "observatory.behavior.v2"
 const MaxEvidenceBytes = 64 << 20
 
 const MaxRuntimeTimelineEventsPerLane = 4096
@@ -82,6 +83,7 @@ type IsolationEvidence struct {
 	ContainmentProfile        string `json:"containmentProfile"`
 	GuestFirewallSHA256       string `json:"guestFirewallSha256"`
 	GuestFirewallPolicySHA256 string `json:"guestFirewallPolicySha256"`
+	ProxmoxTLSCASHA256        string `json:"proxmoxTlsCaSha256,omitempty"`
 	Verification              string `json:"verification"`
 }
 
@@ -294,7 +296,7 @@ type CanaryDefinition struct {
 }
 
 func ValidateEvidence(evidence Evidence) error {
-	if evidence.SchemaVersion != EvidenceSchemaVersion {
+	if evidence.SchemaVersion != EvidenceSchemaVersion && evidence.SchemaVersion != LegacyEvidenceSchemaVersion {
 		return fmt.Errorf("unsupported evidence schema: %s", evidence.SchemaVersion)
 	}
 	if !isSHA256Digest(evidence.CaptureConfigSHA256) {
@@ -350,32 +352,45 @@ func ValidateEvidence(evidence Evidence) error {
 	if strings.TrimSpace(evidence.Run.Isolation.Substrate) == "" || strings.TrimSpace(evidence.Run.Isolation.NetworkMode) == "" || strings.TrimSpace(evidence.Run.Isolation.ContainmentProfile) == "" || !isSHA256Digest(evidence.Run.Isolation.GuestFirewallSHA256) || !isSHA256Digest(evidence.Run.Isolation.GuestFirewallPolicySHA256) || strings.TrimSpace(evidence.Run.Isolation.Verification) == "" {
 		return errors.New("evidence isolation receipt is incomplete")
 	}
+	if evidence.SchemaVersion == EvidenceSchemaVersion && !isSHA256Digest(evidence.Run.Isolation.ProxmoxTLSCASHA256) {
+		return errors.New("evidence verified TLS receipt is incomplete")
+	}
+	if evidence.SchemaVersion == LegacyEvidenceSchemaVersion && evidence.Run.Isolation.ProxmoxTLSCASHA256 != "" && !isSHA256Digest(evidence.Run.Isolation.ProxmoxTLSCASHA256) {
+		return errors.New("evidence verified TLS receipt is invalid")
+	}
 	if strings.TrimSpace(evidence.Run.Runtime.OpenClawVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.StraceVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelProvider) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelID) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelEndpoint) == "" {
 		return errors.New("evidence runtime receipt is incomplete")
 	}
 	if !isSHA256Digest(evidence.Exercise.PromptSHA256) || evidence.Exercise.TurnLimit != 1 {
 		return errors.New("evidence exercise receipt is incomplete")
 	}
-	if evidence.Observations == nil || evidence.Canaries == nil || evidence.RedirectProbes == nil || evidence.Coverage.Limitations == nil {
-		return errors.New("evidence observations, canaries, redirect probes, and coverage are required")
+	if evidence.Observations == nil || evidence.Canaries == nil || evidence.Coverage.Limitations == nil {
+		return errors.New("evidence observations, canaries, and coverage are required")
 	}
 	if evidence.Coverage.SyscallScope != "selected-mvp-syscalls" {
 		return errors.New("evidence syscall coverage scope is missing or unsupported")
 	}
-	if evidence.Coverage.RedirectProbeScope != RedirectProbeScope {
-		return errors.New("evidence redirect probe coverage scope is missing or unsupported")
-	}
-	if evidence.Coverage.RedirectProbeCount != len(evidence.RedirectProbes) {
-		return errors.New("evidence redirect probe coverage count is inconsistent with its probe list")
-	}
-	exercisedProbes := 0
-	for _, probe := range evidence.RedirectProbes {
-		if probe.Exercised {
-			exercisedProbes++
+	hasRedirectEvidence := evidence.RedirectProbes != nil || evidence.Coverage.RedirectProbeScope != "" ||
+		evidence.Coverage.RedirectProbeCount != 0 || evidence.Coverage.RedirectProbesExercised != 0 || evidence.Coverage.RedirectDeepMode
+	if evidence.SchemaVersion == EvidenceSchemaVersion || hasRedirectEvidence {
+		if evidence.RedirectProbes == nil {
+			return errors.New("evidence redirect probes are required")
 		}
-	}
-	if evidence.Coverage.RedirectProbesExercised != exercisedProbes {
-		return errors.New("evidence redirect probe exposure coverage is inconsistent with its probe list")
+		if evidence.Coverage.RedirectProbeScope != RedirectProbeScope {
+			return errors.New("evidence redirect probe coverage scope is missing or unsupported")
+		}
+		if evidence.Coverage.RedirectProbeCount != len(evidence.RedirectProbes) {
+			return errors.New("evidence redirect probe coverage count is inconsistent with its probe list")
+		}
+		exercisedProbes := 0
+		for _, probe := range evidence.RedirectProbes {
+			if probe.Exercised {
+				exercisedProbes++
+			}
+		}
+		if evidence.Coverage.RedirectProbesExercised != exercisedProbes {
+			return errors.New("evidence redirect probe exposure coverage is inconsistent with its probe list")
+		}
 	}
 	completeCapture := evidence.Run.LaneExitCode == (LaneExitCodes{}) && evidence.Coverage.BaselinePaired &&
 		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
@@ -400,36 +415,50 @@ func ValidateEvidence(evidence Evidence) error {
 	if err := validateMockEgressEvidence(evidence.MockEgress); err != nil {
 		return err
 	}
-	if err := validatePersistenceEvidence(evidence.Persistence); err != nil {
-		return err
-	}
-	seenRedirect := map[string]bool{}
-	for _, probe := range evidence.RedirectProbes {
-		if probe.ID == "" || seenRedirect[probe.ID] || probe.Surface == "" || (probe.Vector != "network" && probe.Vector != "file") {
-			return errors.New("evidence contains an invalid redirect probe")
-		}
-		seenRedirect[probe.ID] = true
-		if probe.ReadBaseline < 0 || probe.ReadExercise < 0 || probe.RepeatedBaseline < 0 || probe.RepeatedExercise < 0 || probe.DeviatedBaseline < 0 || probe.DeviatedExercise < 0 {
-			return errors.New("evidence contains an invalid redirect probe count")
-		}
-		if probe.ReadDelta != deltaNonNegative(probe.ReadExercise, probe.ReadBaseline) ||
-			probe.RepeatedDelta != deltaNonNegative(probe.RepeatedExercise, probe.RepeatedBaseline) ||
-			probe.DeviatedDelta != deltaNonNegative(probe.DeviatedExercise, probe.DeviatedBaseline) {
-			return errors.New("evidence redirect probe delta is inconsistent with its counts")
-		}
-		if probe.Escalation != redirectEscalation(probe.ReadExercise, probe.RepeatedExercise, probe.DeviatedExercise) ||
-			probe.Attributed != redirectEscalation(probe.ReadDelta, probe.RepeatedDelta, probe.DeviatedDelta) {
-			return errors.New("evidence redirect probe escalation is inconsistent with its counts")
-		}
-		if probe.Exercised != (probe.ReadExercise > 0) {
-			return errors.New("evidence redirect probe exposure flag is inconsistent with its exercise-lane read")
+	hasPersistenceEvidence := evidence.Persistence.Scope != "" || evidence.Persistence.InventoryPaired ||
+		evidence.Persistence.Surfaces != nil || evidence.Persistence.Findings != nil || evidence.Persistence.Limitations != nil
+	if evidence.SchemaVersion == EvidenceSchemaVersion || hasPersistenceEvidence {
+		if err := validatePersistenceEvidence(evidence.Persistence); err != nil {
+			return err
 		}
 	}
-	if err := validateRuntimeTimeline(evidence.RuntimeTimeline); err != nil {
-		return err
+	if evidence.SchemaVersion == EvidenceSchemaVersion || hasRedirectEvidence {
+		seenRedirect := map[string]bool{}
+		for _, probe := range evidence.RedirectProbes {
+			if probe.ID == "" || seenRedirect[probe.ID] || probe.Surface == "" || (probe.Vector != "network" && probe.Vector != "file") {
+				return errors.New("evidence contains an invalid redirect probe")
+			}
+			seenRedirect[probe.ID] = true
+			if probe.ReadBaseline < 0 || probe.ReadExercise < 0 || probe.RepeatedBaseline < 0 || probe.RepeatedExercise < 0 || probe.DeviatedBaseline < 0 || probe.DeviatedExercise < 0 {
+				return errors.New("evidence contains an invalid redirect probe count")
+			}
+			if probe.ReadDelta != deltaNonNegative(probe.ReadExercise, probe.ReadBaseline) ||
+				probe.RepeatedDelta != deltaNonNegative(probe.RepeatedExercise, probe.RepeatedBaseline) ||
+				probe.DeviatedDelta != deltaNonNegative(probe.DeviatedExercise, probe.DeviatedBaseline) {
+				return errors.New("evidence redirect probe delta is inconsistent with its counts")
+			}
+			if probe.Escalation != redirectEscalation(probe.ReadExercise, probe.RepeatedExercise, probe.DeviatedExercise) ||
+				probe.Attributed != redirectEscalation(probe.ReadDelta, probe.RepeatedDelta, probe.DeviatedDelta) {
+				return errors.New("evidence redirect probe escalation is inconsistent with its counts")
+			}
+			if probe.Exercised != (probe.ReadExercise > 0) {
+				return errors.New("evidence redirect probe exposure flag is inconsistent with its exercise-lane read")
+			}
+		}
 	}
-	if err := validateToolCallLedger(evidence.ToolCallLedger); err != nil {
-		return err
+	hasRuntimeTimeline := evidence.RuntimeTimeline.MaxEventsPerLane != 0 || evidence.RuntimeTimeline.Baseline.Events != nil ||
+		evidence.RuntimeTimeline.Exercise.Events != nil || evidence.RuntimeTimeline.Baseline.EventCount != 0 || evidence.RuntimeTimeline.Exercise.EventCount != 0
+	if evidence.SchemaVersion == EvidenceSchemaVersion || hasRuntimeTimeline {
+		if err := validateRuntimeTimeline(evidence.RuntimeTimeline); err != nil {
+			return err
+		}
+	}
+	hasToolCallLedger := evidence.ToolCallLedger.Source != "" || evidence.ToolCallLedger.MaxCallsPerLane != 0 ||
+		evidence.ToolCallLedger.Baseline.Calls != nil || evidence.ToolCallLedger.Exercise.Calls != nil
+	if evidence.SchemaVersion == EvidenceSchemaVersion || hasToolCallLedger {
+		if err := validateToolCallLedger(evidence.ToolCallLedger); err != nil {
+			return err
+		}
 	}
 	encoded, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil || len(encoded) > MaxEvidenceBytes {

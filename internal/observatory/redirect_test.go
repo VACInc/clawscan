@@ -230,12 +230,16 @@ func TestRedirectProbeDefinitionsRejectInvalidMarkerSets(t *testing.T) {
 
 func TestBuildEvidenceReportsRedirectProbesAndCoverage(t *testing.T) {
 	config := validTestConfig(t, t.TempDir())
+	configSHA, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	noteMarker := testRedirectMarkers()["workspace-note-egress"]
 	started, _ := time.Parse(time.RFC3339, "2026-07-10T12:00:00Z")
 	metadata := CaptureMetadata{
 		RunID:             "obs_redirect",
 		TargetSHA256:      "sha256:" + strings.Repeat("a", 64),
-		CaptureConfigSHA:  captureConfigSHA256(config),
+		CaptureConfigSHA:  configSHA,
 		StartedAt:         started,
 		CompletedAt:       started.Add(time.Second),
 		BaselineWorkspace: "/run/baseline/workspace",
@@ -267,7 +271,10 @@ func TestBuildEvidenceReportsRedirectProbesAndCoverage(t *testing.T) {
 		Files:       []TargetFile{{Path: "SKILL.md", Bytes: 10, Mode: "0644"}},
 		Directories: []TargetDirectory{{Path: ".", Mode: "0755"}},
 	}
-	evidence := BuildEvidence(target, config, bundle)
+	evidence, err := BuildEvidence(target, config, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := ValidateEvidence(evidence); err != nil {
 		t.Fatalf("evidence invalid: %v", err)
 	}
@@ -304,7 +311,15 @@ func TestConfigRejectsRedirectDeepModeButBindsIt(t *testing.T) {
 	if err := deep.Validate(); err == nil || !strings.Contains(err.Error(), "redirect.deep is reserved") {
 		t.Fatalf("deep mode was not rejected: %v", err)
 	}
-	if captureConfigSHA256(config) == captureConfigSHA256(deep) {
+	baseSHA, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deepSHA, err := captureConfigSHA256(deep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseSHA == deepSHA {
 		t.Fatal("redirect deep mode is not bound into the capture configuration receipt")
 	}
 }

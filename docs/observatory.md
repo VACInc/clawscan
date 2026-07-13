@@ -2,7 +2,7 @@
 
 The `behavior` adapter adds paired runtime evidence to Clawscan. Observatory
 runs the same synthetic OpenClaw task without and with a target, subtracts
-baseline runtime activity, and preserves normalized `observatory.behavior.v1`
+baseline runtime activity, and preserves normalized `observatory.behavior.v2`
 evidence. Both the standalone CLI and the Clawscan `behavior` adapter accept
 skills and native OpenClaw plugins; Clawscan classifies a target directory that
 holds `openclaw.plugin.json` as a plugin and passes it straight to Observatory.
@@ -12,6 +12,8 @@ Canonical public evidence is capped at 64 MiB; generation and rendering enforce
 the same bound. When rendering from a full multi-scanner Clawscan artifact, the
 outer artifact has a separate 256 MiB input cap and the embedded behavior
 payload still must satisfy the 64 MiB evidence bound.
+Current tools also read historical `observatory.behavior.v1` evidence, whose
+isolation receipt predates the required Proxmox CA digest.
 
 ## Build and configure
 
@@ -35,21 +37,41 @@ proxmox:
   apiUrl: https://pve-observatory.example:8006
   node: pve-observatory
   templateId: 9400
-  bridge: vmbr-observatory
+  bridge: vmbr1
   user: crabbox
   workRoot: /work/observatory
   fullClone: true
+  insecureTLS: false
 ```
 
-Use `chmod 600` on that file. When `executor.command` is a local credential
-wrapper, `executor.crabboxBinary` pins the reviewed Crabbox build; only the
-local 1Password Connect variables cross into that wrapper. Other ambient
-credentials and all ambient `CRABBOX_*` overrides are stripped.
+Use `chmod 600` on that file. Set `executor.tlsCAFile` to a regular,
+non-symlinked PEM CA bundle no larger than 1 MiB. Every certificate in the file
+must be a CA certificate, and the file must not be writable by group or other.
+The Proxmox API hostname or IP must match the server certificate SAN. Live scans
+copy the validated CA into the owner-only run directory, bind its SHA-256 into
+the capture configuration and public isolation receipt, pass that copy only as
+the Crabbox process's `SSL_CERT_FILE`, point `SSL_CERT_DIR` at a private empty
+read-only directory so host system roots cannot supplement it, and force
+`CRABBOX_PROXMOX_INSECURE_TLS=0`. The child shim also forces the older
+`CRABBOX_PROXMOX_INSECURE_SKIP_TLS_VERIFY=0` spelling defensively. This config
+key and primary environment variable follow the installed Crabbox v0.38.0
+contract. Ambient TLS and `CRABBOX_*` overrides are not
+inherited. Certificate or hostname verification failure stops before any VM is
+provisioned.
+
+When `executor.command` is a local credential
+wrapper, `executor.crabboxBinary` pins the reviewed Crabbox build. Observatory
+gives the wrapper a per-run binary shim so the CA and secure-TLS overrides are
+applied only after credential lookup, immediately before Crabbox starts. Only
+the local 1Password Connect variables cross into the credential wrapper. Other
+ambient credentials and all ambient `CRABBOX_*` overrides are stripped.
 The dedicated Crabbox YAML accepts only `provider`, `target`, and current
 Proxmox fields; profiles, jobs, sync overrides, and environment forwarding are
 rejected so they cannot weaken staging or pass control-plane credentials.
 Relative artifact, Crabbox config/binary, and path-like executor command values
-resolve from the Observatory config file's directory.
+resolve from the Observatory config file's directory. Because `SSL_CERT_DIR`
+uses the operating system path-list separator, the configured and resolved
+`artifactsDir` must not contain that separator.
 Target `.git` metadata is not transported into the guest; each skipped subtree
 is recorded in the public omission manifest and bound into the target digest.
 Skills without an explicit frontmatter name use the neutral public label
@@ -212,8 +234,9 @@ sandbox. Live mode requires:
   traffic, new SSH only from the active literal-IPv4 management peer, DHCP,
   loopback, and only the exact model IP/port; evidence retains both the per-run
   applied-rules hash and a stable canonical-policy digest;
-- an explicit full-clone template, isolated bridge, and `0600` dedicated
-  Crabbox config; arbitrary Crabbox arguments and ambient overrides are not
+- an explicit full-clone template, a PVE Linux bridge named `vmbr0` through
+  `vmbr9999`, a `0600` dedicated Crabbox config with `insecureTLS: false`, and
+  a pinned CA bundle; arbitrary Crabbox arguments and ambient overrides are not
   accepted.
 
 The generated agent has coding tools but no messaging, scheduling, delegation,

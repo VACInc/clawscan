@@ -38,6 +38,15 @@ type pageData struct {
 	Evidence Evidence
 	Changes  []VersionChange
 	Counts   map[string]int
+	Sections evidenceSectionPresence
+}
+
+type evidenceSectionPresence struct {
+	RedirectProbes  bool
+	Persistence     bool
+	ToolCallLedger  bool
+	RuntimeTimeline bool
+	ProxmoxTLSCA    bool
 }
 
 func DecodeEvidence(reader io.Reader) (Evidence, error) {
@@ -49,7 +58,7 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 		return Evidence{}, fmt.Errorf("Clawscan artifact input exceeds %d bytes", MaxClawscanArtifactBytes)
 	}
 	var evidence Evidence
-	if err := json.Unmarshal(data, &evidence); err == nil && evidence.SchemaVersion == EvidenceSchemaVersion {
+	if err := json.Unmarshal(data, &evidence); err == nil && supportedEvidenceSchema(evidence.SchemaVersion) {
 		if err := ValidateEvidence(evidence); err != nil {
 			return Evidence{}, err
 		}
@@ -65,7 +74,7 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 	}
 	behavior, ok := artifact.Scanners["behavior"]
 	if !ok || len(behavior.Raw) == 0 {
-		return Evidence{}, errors.New("input is neither observatory.behavior.v1 nor a Clawscan artifact containing scanner behavior")
+		return Evidence{}, errors.New("input is neither supported Observatory behavior evidence nor a Clawscan artifact containing scanner behavior")
 	}
 	if err := json.Unmarshal(behavior.Raw, &evidence); err != nil {
 		return Evidence{}, fmt.Errorf("parse Clawscan behavior evidence: %w", err)
@@ -74,6 +83,10 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 		return Evidence{}, err
 	}
 	return evidence, nil
+}
+
+func supportedEvidenceSchema(version string) bool {
+	return version == EvidenceSchemaVersion || version == LegacyEvidenceSchemaVersion
 }
 
 func LoadEvidence(path string) (Evidence, error) {
@@ -124,7 +137,8 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 	if err != nil {
 		return err
 	}
-	renderErr := evidencePageTemplate.Execute(file, pageData{Evidence: evidence, Changes: changes, Counts: counts})
+	sections := evidenceSections(evidence)
+	renderErr := evidencePageTemplate.Execute(file, pageData{Evidence: evidence, Changes: changes, Counts: counts, Sections: sections})
 	closeErr := file.Close()
 	if renderErr != nil {
 		return renderErr
@@ -132,7 +146,96 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	if evidence.SchemaVersion == LegacyEvidenceSchemaVersion {
+		projection, err := legacyEvidenceProjection(evidence, sections)
+		if err != nil {
+			return err
+		}
+		return writeRenderJSON(directory, "evidence.json", projection, 0o644)
+	}
 	return writeRenderJSON(directory, "evidence.json", evidence, 0o644)
+}
+
+func evidenceSections(evidence Evidence) evidenceSectionPresence {
+	if evidence.SchemaVersion == EvidenceSchemaVersion {
+		return evidenceSectionPresence{
+			RedirectProbes: true, Persistence: true, ToolCallLedger: true,
+			RuntimeTimeline: true, ProxmoxTLSCA: true,
+		}
+	}
+	return evidenceSectionPresence{
+		RedirectProbes: evidence.RedirectProbes != nil || evidence.Coverage.RedirectProbeScope != "",
+		Persistence: evidence.Persistence.Scope != "" || evidence.Persistence.Surfaces != nil ||
+			evidence.Persistence.Findings != nil || evidence.Persistence.Limitations != nil,
+		ToolCallLedger: evidence.ToolCallLedger.Source != "" || evidence.ToolCallLedger.MaxCallsPerLane != 0 ||
+			evidence.ToolCallLedger.Baseline.Calls != nil || evidence.ToolCallLedger.Exercise.Calls != nil,
+		RuntimeTimeline: evidence.RuntimeTimeline.MaxEventsPerLane != 0 ||
+			evidence.RuntimeTimeline.Baseline.Events != nil || evidence.RuntimeTimeline.Exercise.Events != nil,
+		ProxmoxTLSCA: evidence.Run.Isolation.ProxmoxTLSCASHA256 != "",
+	}
+}
+
+func legacyEvidenceProjection(evidence Evidence, sections evidenceSectionPresence) (map[string]json.RawMessage, error) {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return nil, err
+	}
+	var projection map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		return nil, err
+	}
+	if !sections.RedirectProbes {
+		delete(projection, "redirectProbes")
+		coverage, err := removeJSONFields(projection["coverage"], "redirectProbeScope", "redirectProbeCount", "redirectProbesExercised", "redirectDeepMode")
+		if err != nil {
+			return nil, fmt.Errorf("project legacy evidence coverage: %w", err)
+		}
+		projection["coverage"] = coverage
+	}
+	if !sections.Persistence {
+		delete(projection, "persistence")
+	}
+	if evidence.MockEgress == nil {
+		delete(projection, "mockEgress")
+	}
+	if !sections.ToolCallLedger {
+		delete(projection, "toolCallLedger")
+	}
+	if !sections.RuntimeTimeline {
+		delete(projection, "runtimeTimeline")
+	}
+	if !sections.ProxmoxTLSCA {
+		run, err := removeNestedJSONFields(projection["run"], "isolation", "proxmoxTlsCaSha256")
+		if err != nil {
+			return nil, fmt.Errorf("project legacy evidence isolation: %w", err)
+		}
+		projection["run"] = run
+	}
+	return projection, nil
+}
+
+func removeJSONFields(raw json.RawMessage, fields ...string) (json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil, err
+	}
+	for _, field := range fields {
+		delete(object, field)
+	}
+	return json.Marshal(object)
+}
+
+func removeNestedJSONFields(raw json.RawMessage, nested string, fields ...string) (json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil, err
+	}
+	projected, err := removeJSONFields(object[nested], fields...)
+	if err != nil {
+		return nil, err
+	}
+	object[nested] = projected
+	return json.Marshal(object)
 }
 
 func writeRenderJSON(directory *os.File, name string, value any, mode os.FileMode) error {
@@ -198,7 +301,8 @@ func validateEvidenceComparison(previous Evidence, current Evidence) error {
 func comparableIsolation(previous IsolationEvidence, current IsolationEvidence) bool {
 	return previous.Substrate == current.Substrate && previous.NetworkMode == current.NetworkMode &&
 		previous.ContainmentProfile == current.ContainmentProfile && previous.Verification == current.Verification &&
-		previous.GuestFirewallPolicySHA256 == current.GuestFirewallPolicySHA256
+		previous.GuestFirewallPolicySHA256 == current.GuestFirewallPolicySHA256 &&
+		previous.ProxmoxTLSCASHA256 == current.ProxmoxTLSCASHA256
 }
 
 func comparisonIdentity(evidence Evidence) (string, error) {
@@ -454,8 +558,8 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div class="metric"><strong>{{index .Counts "process"}}</strong><span>Process events</span></div>
     <div class="metric"><strong>{{index .Counts "network"}}</strong><span>Network events</span></div>
     <div class="metric"><strong>{{index .Counts "canary"}}</strong><span>Canary deltas</span></div>
-    <div class="metric"><strong>{{index .Counts "persistence"}}</strong><span>Persistence deltas</span></div>
-    <div class="metric"><strong>{{index .Counts "redirect"}}</strong><span>Redirect deviations</span></div>
+    <div class="metric"><strong>{{if .Sections.Persistence}}{{index .Counts "persistence"}}{{else}}N/A{{end}}</strong><span>Persistence deltas</span></div>
+    <div class="metric"><strong>{{if .Sections.RedirectProbes}}{{index .Counts "redirect"}}{{else}}N/A{{end}}</strong><span>Redirect deviations</span></div>
   </section>
   <section class="panel"><h2>Run receipt</h2><dl class="meta">
     <div><dt>Target digest</dt><dd>{{shortHash .Evidence.Target.SHA256}}</dd></div>
@@ -478,32 +582,32 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div><dt>Payload</dt><dd>{{.PayloadEncoding}}{{if .Truncated}} · truncated{{end}}{{if .PayloadSHA256}} · {{shortHash .PayloadSHA256}}{{end}}</dd></div>
     <div><dt>Canaries transmitted</dt><dd>{{if .CanariesObserved}}{{range $index, $id := .CanariesObserved}}{{if $index}}, {{end}}<code>{{$id}}</code>{{end}}{{else}}none{{end}}</dd></div>
   </dl><p class="muted">Raw captured bytes stay in the private receipt. Opaque or TLS-encrypted payloads are counted, never decoded.</p></section>{{end}}
-  <section class="panel"><h2>Persistence and lifecycle</h2>
+  {{if .Sections.Persistence}}<section class="panel"><h2>Persistence and lifecycle</h2>
     <p class="muted">Monitored surfaces: {{len .Evidence.Persistence.Surfaces}} · Before/after inventory {{if .Evidence.Persistence.InventoryPaired}}paired{{else}}unavailable{{end}} · Residual-confirmed deltas: {{index .Counts "persistenceResidual"}}. Attempted operations were denied by containment; only inventory-confirmed changes are residual.</p>
     {{if .Evidence.Persistence.Findings}}<div class="table-wrap"><table><thead><tr><th>Surface</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Residual</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Persistence.Findings}}<tr><td><span class="kind">{{.Category}}</span><div class="muted">{{.Surface}}</div></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code></td><td>{{.Outcome}}</td><td>{{if eq .Residual "confirmed"}}<span class="change-added">confirmed</span>{{else}}<span class="muted">{{.Residual}}</span>{{end}} <div class="muted">{{.Evidence}}</div></td><td>+{{.DeltaCount}}</td></tr>{{end}}
-  </tbody></table></div>{{else}}<p class="muted">No monitored persistence surface changed in the exercise lane.</p>{{end}}</section>
+  </tbody></table></div>{{else}}<p class="muted">No monitored persistence surface changed in the exercise lane.</p>{{end}}</section>{{else}}<section class="panel"><h2>Persistence and lifecycle</h2><p class="muted">Not collected in this v1 evidence.</p></section>{{end}}
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>
-  <section class="panel"><h2>Redirect instruction probes</h2><p class="muted">Synthetic injected instructions seeded in workspace content and exposed by the shared lane prompt. Reading or repeating a marker is not evidence of prompt injection; only a deviation delta shows the exercise lane performed the harmless sentinel action the instruction named. A probe the exercise lane never read was not exposed ({{.Evidence.Coverage.RedirectProbesExercised}}/{{.Evidence.Coverage.RedirectProbeCount}} exposed) and its absent deviation does not indicate resistance.</p><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Surface</th><th>Vector</th><th>Exposed</th><th>Escalation</th><th>Attributed</th><th>Read Δ</th><th>Repeat Δ</th><th>Deviate Δ</th></tr></thead><tbody>
+  {{if .Sections.RedirectProbes}}<section class="panel"><h2>Redirect instruction probes</h2><p class="muted">Synthetic injected instructions seeded in workspace content and exposed by the shared lane prompt. Reading or repeating a marker is not evidence of prompt injection; only a deviation delta shows the exercise lane performed the harmless sentinel action the instruction named. A probe the exercise lane never read was not exposed ({{.Evidence.Coverage.RedirectProbesExercised}}/{{.Evidence.Coverage.RedirectProbeCount}} exposed) and its absent deviation does not indicate resistance.</p><div class="table-wrap"><table><thead><tr><th>Probe</th><th>Surface</th><th>Vector</th><th>Exposed</th><th>Escalation</th><th>Attributed</th><th>Read Δ</th><th>Repeat Δ</th><th>Deviate Δ</th></tr></thead><tbody>
     {{range .Evidence.RedirectProbes}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.Vector}}</td><td class="{{if not .Exercised}}change-changed{{end}}">{{if .Exercised}}yes{{else}}not exercised{{end}}</td><td class="{{if eq .Escalation "deviated"}}change-removed{{else if eq .Escalation "none"}}muted{{end}}">{{upper .Escalation}}</td><td class="{{if eq .Attributed "deviated"}}change-removed{{else if eq .Attributed "none"}}muted{{end}}">{{upper .Attributed}}</td><td>{{if .ReadDelta}}+{{.ReadDelta}}{{else}}0{{end}}</td><td>{{if .RepeatedDelta}}+{{.RepeatedDelta}}{{else}}0{{end}}</td><td>{{if .DeviatedDelta}}+{{.DeviatedDelta}}{{else}}0{{end}}</td></tr>{{end}}
-  </tbody></table></div></section>
-  <section class="panel"><h2>OpenClaw tool-call ledger</h2>
+  </tbody></table></div></section>{{else}}<section class="panel"><h2>Redirect instruction probes</h2><p class="muted">Not collected in this v1 evidence.</p></section>{{end}}
+  {{if .Sections.ToolCallLedger}}<section class="panel"><h2>OpenClaw tool-call ledger</h2>
     <p class="muted">Paired baseline and exercise tool calls projected from OpenClaw's metadata-only audit ledger: tool name, ordering, terminal state, error code, and duration. Raw tool call ids, arguments, and results are never published. The lane owns this unsigned database, so the ledger is supplemental metadata, not tamper-evident grading proof.</p>
     <p class="muted">Argument and result summaries: {{if .Evidence.ToolCallLedger.ArgumentSummaries.Available}}available{{else}}<strong>unavailable</strong>{{end}} — {{.Evidence.ToolCallLedger.ArgumentSummaries.Reason}}</p>
     <h3>Baseline lane · {{.Evidence.ToolCallLedger.Baseline.Coverage}} · {{.Evidence.ToolCallLedger.Baseline.CallCount}} call(s){{if .Evidence.ToolCallLedger.Baseline.Truncated}} · {{.Evidence.ToolCallLedger.Baseline.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Baseline.Reason}} · {{.Evidence.ToolCallLedger.Baseline.Reason}}{{end}}</h3>
     {{template "toolCallLane" .Evidence.ToolCallLedger.Baseline}}
     <h3>Exercise lane · {{.Evidence.ToolCallLedger.Exercise.Coverage}} · {{.Evidence.ToolCallLedger.Exercise.CallCount}} call(s){{if .Evidence.ToolCallLedger.Exercise.Truncated}} · {{.Evidence.ToolCallLedger.Exercise.TotalCalls}} before per-lane cap{{end}}{{if .Evidence.ToolCallLedger.Exercise.Reason}} · {{.Evidence.ToolCallLedger.Exercise.Reason}}{{end}}</h3>
     {{template "toolCallLane" .Evidence.ToolCallLedger.Exercise}}
-  </section>
-  <section class="panel"><h2>Runtime syscall timeline</h2>
+  </section>{{else}}<section class="panel"><h2>OpenClaw tool-call ledger</h2><p class="muted">Not collected in this v1 evidence.</p></section>{{end}}
+  {{if .Sections.RuntimeTimeline}}<section class="panel"><h2>Runtime syscall timeline</h2>
     <p class="muted">Ordered, normalized file/process/network syscalls for each lane — the runtime substrate beneath the tool calls above, not the tool calls themselves. Subjects are redacted and raw arguments are never shown; the complete ordered sequence ships in the JSON projection while this page previews up to 250 events per lane.</p>
     <h3>Baseline lane · {{.Evidence.RuntimeTimeline.Baseline.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Baseline.Truncated}} · {{.Evidence.RuntimeTimeline.Baseline.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Baseline.Timed}} · {{.Evidence.RuntimeTimeline.Baseline.DurationMs}} ms span{{end}}</h3>
     {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Baseline}}
     <h3>Exercise lane · {{.Evidence.RuntimeTimeline.Exercise.EventCount}} event(s){{if .Evidence.RuntimeTimeline.Exercise.Truncated}} · {{.Evidence.RuntimeTimeline.Exercise.TotalEvents}} captured before per-lane cap{{end}}{{if .Evidence.RuntimeTimeline.Exercise.Timed}} · {{.Evidence.RuntimeTimeline.Exercise.DurationMs}} ms span{{end}}</h3>
     {{template "runtimeTimelineLane" .Evidence.RuntimeTimeline.Exercise}}
-  </section>
+  </section>{{else}}<section class="panel"><h2>Runtime syscall timeline</h2><p class="muted">Not collected in this v1 evidence.</p></section>{{end}}
   <section class="panel"><h2>Coverage and limits</h2><ul>{{range .Evidence.Coverage.Limitations}}<li>{{.}}</li>{{end}}</ul></section>
   <footer>Schema {{.Evidence.SchemaVersion}} · Prompt {{shortHash .Evidence.Exercise.PromptSHA256}} · Raw traces and transcripts are intentionally not published.</footer>
 </main></body></html>

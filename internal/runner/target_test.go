@@ -16,10 +16,10 @@ const probePluginManifest = `{
 }`
 
 const behaviorPluginFixture = `{
-  "schemaVersion":"observatory.behavior.v1",
+  "schemaVersion":"observatory.behavior.v2",
   "captureConfigSha256":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "target":{"name":"Observatory Probe Plugin","kind":"plugin","id":"observatory-probe","declaredTools":["observatory_probe"],"sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fileCount":1,"directoryCount":1,"totalBytes":7,"files":[{"path":"openclaw.plugin.json","bytes":7,"mode":"0644"}],"directories":[{"path":".","mode":"0755"}]},
-  "run":{"id":"obs_test","status":"completed","startedAt":"2026-07-10T12:00:00Z","completedAt":"2026-07-10T12:00:01Z","durationMs":1000,"executor":"fixture","isolation":{"substrate":"fixture","networkMode":"none","containmentProfile":"fixture","guestFirewallSha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","guestFirewallPolicySha256":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","verification":"fixture"},"runtime":{"openclawVersion":"OpenClaw fixture","straceVersion":"strace fixture","modelProvider":"fixture","modelId":"fixture","modelEndpoint":"private"},"laneExitCode":{"baseline":0,"exercise":0}},
+  "run":{"id":"obs_test","status":"completed","startedAt":"2026-07-10T12:00:00Z","completedAt":"2026-07-10T12:00:01Z","durationMs":1000,"executor":"fixture","isolation":{"substrate":"fixture","networkMode":"none","containmentProfile":"fixture","guestFirewallSha256":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","guestFirewallPolicySha256":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","proxmoxTlsCaSha256":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","verification":"fixture"},"runtime":{"openclawVersion":"OpenClaw fixture","straceVersion":"strace fixture","modelProvider":"fixture","modelId":"fixture","modelEndpoint":"private"},"laneExitCode":{"baseline":0,"exercise":0}},
   "exercise":{"promptSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","turnLimit":1},
   "observations":[],"canaries":[],"redirectProbes":[],
   "persistence":{"scope":"selected-persistence-surfaces","inventoryPaired":false,"surfaces":[{"id":"shell-init","category":"shell-init","scope":"user","description":"User shell initialization files."}],"findings":[],"limitations":["Fixture persistence limitation."]},

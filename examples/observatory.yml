@@ -13,6 +13,9 @@ executor:
   # If command is a credential wrapper, pin the audited Crabbox binary here.
   crabboxBinary: ""
   crabboxConfig: /path/to/isolated-observatory.crabbox.yml
+  # Process-local CA bundle used to verify the Proxmox API certificate. Live
+  # mode rejects missing, mutable, symlinked, non-CA, or oversized files.
+  tlsCAFile: /path/to/proxmox-ca.pem
   # Observatory pins the provider, target, full-clone, teardown, and TTL flags.
   args: []
 
@@ -22,7 +25,7 @@ isolation:
   verified: false
   verification: pending
   vmTemplateId: 9400
-  networkBridge: vmbr-observatory
+  networkBridge: vmbr1
   freshVm: true
   dedicatedNetwork: true
   defaultDenyEgress: true
