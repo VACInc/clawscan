@@ -29,6 +29,7 @@ type Evidence struct {
 	Persistence         PersistenceEvidence        `json:"persistence"`
 	Coverage            CoverageEvidence           `json:"coverage"`
 	MockEgress          *MockEgressEvidence        `json:"mockEgress,omitempty"`
+	ModelRelay          *ModelRelayEvidence        `json:"modelRelay,omitempty"`
 	ToolCallLedger      ToolCallLedger             `json:"toolCallLedger"`
 	RuntimeTimeline     RuntimeTimeline            `json:"runtimeTimeline"`
 }
@@ -360,6 +361,14 @@ func ValidateEvidence(evidence Evidence) error {
 	}
 	if strings.TrimSpace(evidence.Run.Runtime.OpenClawVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.StraceVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelProvider) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelID) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelEndpoint) == "" {
 		return errors.New("evidence runtime receipt is incomplete")
+	}
+	// ModelRelay is mandatory for capture protocol v20 and later through
+	// BuildEvidence's verified per-lane receipts. Keep it optional here so older
+	// v2 artifacts remain decodable; when present it is always validated.
+	if evidence.ModelRelay != nil {
+		if err := validateModelRelayEvidence(evidence.ModelRelay); err != nil {
+			return err
+		}
 	}
 	if !isSHA256Digest(evidence.Exercise.PromptSHA256) || evidence.Exercise.TurnLimit != 1 {
 		return errors.New("evidence exercise receipt is incomplete")

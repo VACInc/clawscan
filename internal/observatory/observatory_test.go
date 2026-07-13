@@ -1583,7 +1583,7 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 			t.Fatalf("%s syntax: %v: %s", name, err, output)
 		}
 	}
-	rules := guestFirewallRules("obs_fixture", []string{"10.0.0.2:8000"}, MockEgressConfig{})
+	rules := guestFirewallRules("obs_fixture", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, MockEgressConfig{})
 	for _, expected := range []string{"policy drop", "ip saddr @MANAGEMENT_IPV4@ tcp dport 22 accept", "ip daddr 10.0.0.2 tcp dport 8000 accept"} {
 		if !strings.Contains(rules, expected) {
 			t.Fatalf("guest firewall missing %q:\n%s", expected, rules)
@@ -1819,6 +1819,9 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 			Host    string `json:"host"`
 			Port    int    `json:"port"`
 		} `json:"mockEgress"`
+		ModelRelay struct {
+			PolicySHA256 string `json:"policySha256"`
+		} `json:"modelRelay"`
 		Redirects     map[string]string `json:"redirects"`
 		RedirectSeeds []struct {
 			ID   string `json:"id"`
@@ -1849,6 +1852,8 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 		executor.t.Fatalf("missing download arg: %#v", args)
 	}
 	entries := fixtureBundleEntries(runtime.RunID, runtime.TargetSHA256, runtime.CaptureConfigSHA, runtime.TargetKind, runtime.TargetID)
+	entries["baseline/model-relay.json"] = modelRelayReceiptJSON("baseline", runtime.ModelRelay.PolicySHA256, 1, 128, 256)
+	entries["exercise/model-relay.json"] = modelRelayReceiptJSON("exercise", runtime.ModelRelay.PolicySHA256, 1, 128, 256)
 	canaryJSON, err := json.Marshal(runtime.Canaries)
 	if err != nil {
 		executor.t.Fatal(err)
@@ -1916,6 +1921,8 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 	if targetKind == "skill" {
 		toolName = "bash"
 	}
+	policy, _ := buildModelRelayPolicy(ModelRelayConfig{}, ModelConfig{Provider: "local", BaseURL: "http://10.0.0.2:8000/v1", ID: "fixture-model", API: "openai-completions", ContextWindow: 8192, MaxTokens: 1024}, 10)
+	relayDigest := modelRelayPolicySHA256(policy)
 	return map[string]string{
 		"meta/run-id":                runID + "\n",
 		"meta/target-sha256":         targetSHA256 + "\n",
@@ -1943,6 +1950,8 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"exercise/trace":             exerciseTrace,
 		"baseline/agent.stdout":      "baseline\n",
 		"exercise/agent.stdout":      "exercise\n",
+		"baseline/model-relay.json":  modelRelayReceiptJSON("baseline", relayDigest, 1, 128, 256),
+		"exercise/model-relay.json":  modelRelayReceiptJSON("exercise", relayDigest, 1, 128, 256),
 		"baseline/inventory.before":  stateInventory,
 		"baseline/inventory.after":   stateInventory,
 		"exercise/inventory.before":  stateInventory,
@@ -1950,6 +1959,19 @@ func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA st
 		"baseline/audit.json":        `{"source":"openclaw-state-sqlite","recorderObserved":true,"maxCalls":4096,"events":[],"totalCalls":0,"truncated":false}` + "\n",
 		"exercise/audit.json":        fixtureToolAuditJSON(toolName),
 	}
+}
+
+func modelRelayReceiptJSON(lane string, policySHA string, accepted int, requestBytes int64, responseBytes int64) string {
+	receipt := ModelRelayReceipt{
+		Lane:             lane,
+		PolicySHA256:     policySHA,
+		AcceptedRequests: accepted,
+		RequestBytes:     requestBytes,
+		ResponseBytes:    responseBytes,
+		PeakConcurrency:  1,
+	}
+	encoded, _ := json.Marshal(receipt)
+	return string(encoded) + "\n"
 }
 
 // fixtureToolAuditJSON builds a direct SQLite export with one completed tool
@@ -2039,6 +2061,10 @@ func fixtureEvidence() Evidence {
 		RedirectProbes: []RedirectProbeObservation{{ID: "workspace-note-egress", Surface: "workspace note", Vector: "network", ReadExercise: 1, ReadDelta: 1, Escalation: "read", Attributed: "read", Exercised: true}},
 		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
 		Coverage:       CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, RedirectProbeScope: RedirectProbeScope, RedirectProbeCount: 1, RedirectProbesExercised: 1, Limitations: []string{"Fixture limitation."}},
+		ModelRelay: &ModelRelayEvidence{
+			Route: "bounded-control-relay", PolicySHA256: "sha256:" + strings.Repeat("9", 64),
+			BaselineReceiptSHA256: "sha256:" + strings.Repeat("8", 64), ExerciseReceiptSHA256: "sha256:" + strings.Repeat("7", 64),
+		},
 		ToolCallLedger: ToolCallLedger{
 			Source:            ToolCallLedgerSource,
 			MaxCallsPerLane:   MaxToolCallsPerLane,

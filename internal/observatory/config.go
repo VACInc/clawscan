@@ -74,6 +74,7 @@ type RuntimeConfig struct {
 	AgentUser             string           `yaml:"agentUser"`
 	TimeoutSeconds        int              `yaml:"timeoutSeconds"`
 	Model                 ModelConfig      `yaml:"model"`
+	ModelRelay            ModelRelayConfig `yaml:"modelRelay"`
 	ControlPlaneAddresses []string         `yaml:"controlPlaneAddresses"`
 	MockEgress            MockEgressConfig `yaml:"mockEgress"`
 }
@@ -193,6 +194,7 @@ func (config *Config) applyDefaults() {
 	if config.Runtime.Model.MaxTokens == 0 {
 		config.Runtime.Model.MaxTokens = 4096
 	}
+	config.Runtime.ModelRelay.applyDefaults()
 	if config.Runtime.MockEgress.Enabled {
 		if config.Runtime.MockEgress.MaxRequests == 0 {
 			config.Runtime.MockEgress.MaxRequests = 16
@@ -271,8 +273,8 @@ func (config Config) Validate() error {
 			return errors.New("executor.crabboxBinary must be an executable regular non-symlink file")
 		}
 	}
-	if !guestAccountPattern.MatchString(config.Runtime.AgentUser) || config.Runtime.AgentUser == "root" {
-		return errors.New("runtime.agentUser must name a dedicated non-root user")
+	if config.Runtime.AgentUser != "observatory" {
+		return errors.New("runtime.agentUser must be exactly the pinned dedicated account observatory")
 	}
 	if config.Runtime.TimeoutSeconds < 1 || config.Runtime.TimeoutSeconds > 3600 {
 		return errors.New("runtime.timeoutSeconds must be between 1 and 3600")
@@ -293,6 +295,9 @@ func (config Config) Validate() error {
 	}
 	if model.API != "openai-completions" && model.API != "openai-responses" {
 		return errors.New("runtime.model.api must be openai-completions or openai-responses")
+	}
+	if _, err := modelRelayAllowedPath(parsed, model.API); err != nil {
+		return err
 	}
 	if model.ContextWindow < 4096 || model.MaxTokens < 1 {
 		return errors.New("runtime model contextWindow/maxTokens are too small")
@@ -329,6 +334,9 @@ func (config Config) Validate() error {
 	}
 	if config.Limits.MaxTasks < 32 || config.Limits.MaxTasks > 1024 {
 		return errors.New("limits.maxTasks must be between 32 and 1024")
+	}
+	if err := config.Runtime.ModelRelay.validateShape(config.Runtime.TimeoutSeconds); err != nil {
+		return err
 	}
 	if err := config.Runtime.MockEgress.validateShape(); err != nil {
 		return err
@@ -437,6 +445,13 @@ func (config Config) ValidateLive() error {
 	}
 	if err := config.Runtime.MockEgress.validateLive(config.Runtime.ControlPlaneAddresses); err != nil {
 		return err
+	}
+	relayHost, relayPort, _ := splitLoopbackAddress(effectiveModelRelayConfig(config.Runtime.ModelRelay).Address, "modelRelay.address")
+	if config.Runtime.MockEgress.Enabled {
+		sinkHost, sinkPort, _ := splitLoopbackAddress(config.Runtime.MockEgress.Address, "mockEgress.address")
+		if relayHost == sinkHost && relayPort == sinkPort {
+			return errors.New("modelRelay.address must not overlap mockEgress.address")
+		}
 	}
 	return nil
 }

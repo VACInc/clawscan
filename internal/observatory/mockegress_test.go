@@ -117,15 +117,15 @@ func TestConfigRejectsMockEgressLargerThanBundleBudget(t *testing.T) {
 
 func TestGuestFirewallPinsControlledSink(t *testing.T) {
 	sink := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
-	enabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, sink)
+	enabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, sink)
 	if !strings.Contains(enabled, `ip daddr 127.0.0.9 tcp dport 9009 accept comment "controlled-mock-egress-sink"`) {
 		t.Fatalf("firewall missing sink pin:\n%s", enabled)
 	}
 	if !strings.Contains(enabled, "ip daddr 10.0.0.2 tcp dport 8000 accept") {
 		t.Fatalf("firewall dropped the model allowlist:\n%s", enabled)
 	}
-	disabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, MockEgressConfig{})
-	if strings.Contains(disabled, "controlled-mock-egress-sink") || strings.Contains(disabled, "@AGENT_UID@") {
+	disabled := guestFirewallRules("obs_sink", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, MockEgressConfig{})
+	if strings.Contains(disabled, "controlled-mock-egress-sink") {
 		t.Fatalf("disabled sink leaked a rule:\n%s", disabled)
 	}
 	if digestBytes([]byte(enabled)) == digestBytes([]byte(disabled)) {
@@ -135,9 +135,9 @@ func TestGuestFirewallPinsControlledSink(t *testing.T) {
 
 func TestGuestFirewallEnforcesExactSinkPortForAgentUID(t *testing.T) {
 	sink := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
-	rules := guestFirewallRules("policy", []string{"10.0.0.2:8000"}, sink)
+	rules := guestFirewallRules("policy", []string{"10.0.0.2:8000"}, ModelRelayConfig{}, sink)
 	allow := `meta skuid @AGENT_UID@ ip daddr 127.0.0.9 tcp dport 9009 accept comment "controlled-mock-egress-sink"`
-	deny := `meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment "controlled-mock-egress-loopback-deny"`
+	deny := `meta skuid @AGENT_UID@ ip daddr 127.0.0.0/8 drop comment "agent-adjacent-loopback-deny"`
 	loopback := `oifname "lo" accept`
 	model := "ip daddr 10.0.0.2 tcp dport 8000 accept"
 	allowIdx := strings.Index(rules, allow)
@@ -163,16 +163,17 @@ func TestGuestFirewallEnforcesExactSinkPortForAgentUID(t *testing.T) {
 	if strings.Contains(rules, "127.0.0.0/8 drop") && strings.Contains(rules[denyIdx:denyIdx+len(deny)], "dport") {
 		t.Fatalf("agent loopback deny is port-scoped, so other ports would leak:\n%s", rules)
 	}
-	if got := strings.Count(rules, "meta skuid @AGENT_UID@"); got != 2 {
-		t.Fatalf("expected exactly two agent-scoped rules (one allow, one deny), got %d:\n%s", got, rules)
+	if got := strings.Count(rules, "meta skuid @AGENT_UID@"); got != 3 {
+		t.Fatalf("expected exactly three agent-scoped rules (relay, sink, deny), got %d:\n%s", got, rules)
 	}
 }
 
 func TestRemoteRunnerSubstitutesAgentUIDAndExposesSink(t *testing.T) {
 	for _, required := range []string{
-		`MOCK_AGENT_UID=$(id -u "$AGENT_USER")`,
+		`AGENT_UID=$(id -u "$AGENT_USER")`,
 		`@AGENT_UID@`,
-		"firewall agent-uid marker is missing",
+		`@CONTROL_UID@`,
+		"firewall UID marker is missing",
 		`if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then`,
 	} {
 		if !strings.Contains(remoteRunScript, required) {

@@ -214,25 +214,31 @@ sandbox. Live mode requires:
 - a fresh Proxmox VM on a dedicated non-LAN network;
 - a Linux control host; live execution and secure target staging fail closed on
   other platforms because the MVP pins and traverses target directories by file descriptor;
-- default-deny/sinkholed egress with only the model endpoint allowed;
-- a dedicated non-root `observatory` agent user;
+- default-deny/sinkholed egress where the hostile lane can reach only an exact
+  Observatory-owned loopback relay port and the optional controlled sink;
+- the exactly pinned non-root `observatory` agent user;
 - a same-name primary group, no supplementary groups, and no passwordless sudo
   for that user;
+- no preexisting process owned by the `observatory` UID when a run begins;
 - root-owned `strace` instrumentation and trace files;
 - synthetic state, memory, credentials, and API markers only;
 - no host sockets, production OpenClaw state, real channels, or real accounts;
 - bounded runtime and artifact sizes;
 - bounded per-lane tmpfs storage so target writes cannot fill the guest disk;
-- transient systemd cgroups with hard whole-group deadlines, CPU/memory/task
+- transient systemd cgroups with hard whole-group deadlines, CPU/memory/swap/task
   quotas, a read-only OS, hidden homes, private tmp/devices, namespace and
-  kernel protections, socket-bind denial, and destination-IP filtering;
-- an empty child environment and literal-IP allowlist containing only the model
-  control plane;
+  kernel protections, private IPC, a 1024 file-descriptor ceiling, socket-bind
+  denial, and destination-IP filtering;
+- no AF_UNIX or AF_INET6 socket family in the hostile lane, preventing access to
+  filesystem and abstract guest runtime sockets;
+- an empty child environment and a literal-IP cgroup allowlist containing only
+  the model relay and optional controlled-sink loopback IPs;
 - an IPv4-only model endpoint in the MVP; IPv6 is rejected until its discovery
   traffic has an equally narrow policy;
 - a VM-wide nftables default-drop policy allowing established management
   traffic, new SSH only from the active literal-IPv4 management peer, DHCP,
-  loopback, and only the exact model IP/port; evidence retains both the per-run
+  the exact relay/sink loopback ports for the hostile UID, and the exact model
+  IP/port only for the separate control UID; evidence retains both the per-run
   applied-rules hash and a stable canonical-policy digest;
 - an explicit full-clone template, a PVE Linux bridge named `vmbr0` through
   `vmbr9999`, a `0600` dedicated Crabbox config with `insecureTLS: false`, and
@@ -257,6 +263,34 @@ Target digests bind file contents plus file/directory modes. A root-owned mode
 manifest restores permissions and empty directories that Git does not retain;
 target-controlled Git attributes are rejected.
 
+## Bounded model relay
+
+The hostile lane never receives direct reachability to the real model endpoint.
+OpenClaw is configured with a guest-local HTTP base URL under
+`runtime.modelRelay`; nftables permits the agent UID to reach only that exact
+loopback host and port, then drops every adjacent loopback destination. The real
+model IP and port are allowed only for the control UID that owns a separate,
+hardened relay unit.
+
+The relay accepts only `POST` to the one path implied by `runtime.model.api`:
+`/chat/completions` for `openai-completions`, or `/responses` for
+`openai-responses`, beneath the configured base path. It rejects queries,
+alternate paths and methods, non-JSON bodies, and requests whose `model` differs
+from the configured model ID. The upstream URL and authorization header are
+fixed by Observatory rather than copied from target-controlled input. Redirects
+are not followed.
+
+Request count, request bytes, response bytes, aggregate bytes, concurrency,
+per-request time, and whole-unit lifetime are all capped. The unit has no
+capabilities, no AF_UNIX access, a read-only system, private tmp/devices/IPC,
+zero swap, fixed CPU/task/file-descriptor/output bounds, one exact bind port, and
+an upstream IP allowlist. Every lane emits a body-free receipt containing the
+effective policy digest and bounded counters. Missing, mismatched, or over-limit
+receipts fail evidence construction. The effective relay configuration is also
+covered by `captureConfigSha256`, while public evidence exposes the policy and
+canonical per-lane receipt digests plus safe counts under `modelRelay`, never the
+upstream address or message bodies.
+
 ## Controlled mock egress
 
 Controlled mock egress is an opt-in upgrade from safe outbound-attempt evidence
@@ -270,9 +304,8 @@ the VM. The exact port is a real enforcement boundary: the guest firewall gives
 the dedicated agent UID an allow rule for only the exact sink host and port and
 then drops every other agent loopback destination, both ordered before the
 generic loopback accept. The agent UID marker is substituted with the numeric UID
-inside the guest, and non-agent (control-plane), model, and management traffic are
-untouched. This entry is kept separate from the exact model control-plane
-allowlist; everything else stays default-deny. The sink applies strict request,
+inside the guest. This entry is kept separate from the mandatory model relay;
+everything else stays default-deny. The sink applies strict request,
 per-request byte, total byte, and wall-clock caps, and returns an optional
 deterministic canned response. The sink itself runs in a separate transient
 systemd unit with no capabilities, a read-only system, an exact bind-port rule,

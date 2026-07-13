@@ -80,6 +80,13 @@ type MockEgressReceipt struct {
 	payload          []byte
 }
 
+// mockEgressReceiptComplete is the single completeness seam used by canary
+// correlation. A bounded payload is not complete if the sink truncated, timed
+// out, or rejected any request.
+func mockEgressReceiptComplete(receipt *MockEgressReceipt) bool {
+	return receipt != nil && !receipt.Truncated && !receipt.DeadlineHit && receipt.RejectedRequests == 0
+}
+
 func mockEgressHostPort(address string) (string, string, error) {
 	host, port, err := net.SplitHostPort(strings.TrimSpace(address))
 	if err != nil {

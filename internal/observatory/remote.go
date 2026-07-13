@@ -518,6 +518,8 @@ META="$OUT/meta"
 BASELINE="$OUT/runtime/baseline"
 EXERCISE="$OUT/runtime/exercise"
 DOWNLOAD_OUT="$REPO_ROOT/.observatory"
+ACTIVE_RELAY_UNIT=""
+ACTIVE_SINK_UNIT=""
 
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then
@@ -532,6 +534,17 @@ fail() {
   exit 20
 }
 
+cleanup_capture_units() {
+  set +e
+  if [ -n "$ACTIVE_SINK_UNIT" ] && as_root systemctl is-active --quiet "$ACTIVE_SINK_UNIT"; then
+    as_root systemctl kill --kill-who=main --signal=SIGTERM "$ACTIVE_SINK_UNIT"
+  fi
+  if [ -n "$ACTIVE_RELAY_UNIT" ] && as_root systemctl is-active --quiet "$ACTIVE_RELAY_UNIT"; then
+    as_root systemctl kill --kill-who=main --signal=SIGTERM "$ACTIVE_RELAY_UNIT"
+  fi
+}
+trap cleanup_capture_units EXIT
+
 command -v node >/dev/null 2>&1 || fail "node is required in the Observatory VM template"
 command -v strace >/dev/null 2>&1 || fail "strace is required in the Observatory VM template"
 command -v systemd-run >/dev/null 2>&1 || fail "systemd-run is required in the Observatory VM template"
@@ -541,7 +554,9 @@ command -v nft >/dev/null 2>&1 || fail "nftables is required in the Observatory 
 command -v mount >/dev/null 2>&1 || fail "mount is required in the Observatory VM template"
 command -v findmnt >/dev/null 2>&1 || fail "findmnt is required in the Observatory VM template"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required in the Observatory VM template"
+command -v pgrep >/dev/null 2>&1 || fail "pgrep is required in the Observatory VM template"
 command -v "$OPENCLAW_COMMAND" >/dev/null 2>&1 || fail "OpenClaw is required in the Observatory VM template"
+[ "$AGENT_USER" = "observatory" ] || fail "Observatory agent user must be the pinned observatory account"
 id "$AGENT_USER" >/dev/null 2>&1 || fail "dedicated Observatory agent user is missing"
 as_root true >/dev/null 2>&1 || fail "passwordless root instrumentation is required"
 [ "$(id -u "$AGENT_USER")" -ne 0 ] || fail "Observatory agent user must not be root"
@@ -551,6 +566,9 @@ read -r -a agent_group_ids <<< "$(id -G "$AGENT_USER")"
 [ "${#agent_group_ids[@]}" -eq 1 ] || fail "Observatory agent user must not have supplementary groups"
 if as_root runuser -u "$AGENT_USER" -- sudo -n true >/dev/null 2>&1; then
   fail "Observatory agent user must not have passwordless sudo"
+fi
+if as_root pgrep -u "$AGENT_USER" >/dev/null 2>&1; then
+  fail "Observatory agent UID has preexisting processes"
 fi
 
 CONTROL_UID=$(id -u)
@@ -566,9 +584,13 @@ as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/appl
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/export-tool-audit.mjs" "$CONTROL/export-tool-audit.mjs"
 as_root install -m 0555 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
+as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/model-relay.mjs" "$CONTROL/model-relay.mjs"
 as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
 as_root install -m 0700 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
 RUNTIME_JSON="$CONTROL/runtime.json"
+MODEL_RELAY_DEADLINE_SECONDS=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.modelRelay.deadlineSeconds))' "$RUNTIME_JSON")
+MODEL_RELAY_RECEIPT_MAX_BYTES=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.modelRelay.receiptMaxBytes))' "$RUNTIME_JSON")
+MODEL_RELAY_PORT=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(new URL("http://"+r.modelRelay.listenAddress).port))' "$RUNTIME_JSON")
 MOCK_EGRESS_ENABLED=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.mockEgress && r.mockEgress.enabled ? "1" : "0")' "$RUNTIME_JSON")
 MOCK_DEADLINE_SECONDS=0
 MOCK_RECEIPT_MAX_BYTES=0
@@ -583,10 +605,8 @@ SSH_PEER=${SSH_CONNECTION:-}
 SSH_PEER=${SSH_PEER%% *}
 [ -n "$SSH_PEER" ] || fail "SSH_CONNECTION is required to pin the management firewall peer"
 as_root node -e 'const fs=require("fs"),net=require("net");const [file,peer]=process.argv.slice(1);if(!net.isIPv4(peer))throw new Error("management peer must be literal IPv4");const marker="@MANAGEMENT_IPV4@",input=fs.readFileSync(file,"utf8");if(input.split(marker).length!==2)throw new Error("firewall management marker is missing or repeated");fs.writeFileSync(file,input.replace(marker,peer),{mode:0o600});' "$CONTROL/firewall.nft" "$SSH_PEER"
-if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
-  MOCK_AGENT_UID=$(id -u "$AGENT_USER")
-  as_root node -e 'const fs=require("fs");const [file,uid]=process.argv.slice(1);if(!/^[0-9]+$/.test(uid))throw new Error("agent uid must be numeric");const marker="@AGENT_UID@",input=fs.readFileSync(file,"utf8");if(!input.includes(marker))throw new Error("firewall agent-uid marker is missing");fs.writeFileSync(file,input.split(marker).join(uid),{mode:0o600});' "$CONTROL/firewall.nft" "$MOCK_AGENT_UID"
-fi
+AGENT_UID=$(id -u "$AGENT_USER")
+as_root node -e 'const fs=require("fs");const [file,agent,control]=process.argv.slice(1);if(!/^[0-9]+$/.test(agent)||!/^[0-9]+$/.test(control))throw new Error("firewall UIDs must be numeric");let input=fs.readFileSync(file,"utf8");for(const [marker,value] of [["@AGENT_UID@",agent],["@CONTROL_UID@",control]]){if(!input.includes(marker))throw new Error("firewall UID marker is missing: "+marker);input=input.split(marker).join(value)}fs.writeFileSync(file,input,{mode:0o600});' "$CONTROL/firewall.nft" "$AGENT_UID" "$CONTROL_UID"
 as_root nft -f "$CONTROL/firewall.nft"
 
 as_root install -d -m 0711 "$OUT" "$OUT/runtime"
@@ -731,11 +751,13 @@ run_lane() {
   local other_root="$EXERCISE"
   [ "$lane" = "exercise" ] && other_root="$BASELINE"
   local network_args=(--property=IPAddressDeny=any)
+  # The hostile lane receives only the bounded relay's loopback IP, never the
+  # upstream model IP. nftables narrows this cgroup-level IP allowance to the
+  # relay's exact TCP port and blocks every adjacent loopback destination.
   while IFS= read -r address; do
     [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
-  done < <(node -e 'const r=require(process.argv[1]); for (const value of r.controlPlaneIps) console.log(value)' "$RUNTIME_JSON")
-  # The controlled mock egress sink is a distinct, auditable allowlist entry kept
-  # separate from the exact model control-plane allowlist above.
+  done < <(node -e 'const r=require(process.argv[1]); for (const value of r.modelRelayIps) console.log(value)' "$RUNTIME_JSON")
+  # The controlled mock egress sink is a second exact loopback allowlist entry.
   while IFS= read -r address; do
     [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
   done < <(node -e 'const r=require(process.argv[1]); for (const value of (r.mockEgressIps||[])) console.log(value)' "$RUNTIME_JSON")
@@ -750,10 +772,13 @@ run_lane() {
     --property=TimeoutStopSec=5s \
     --property="RuntimeMaxSec=${TIMEOUT_SECONDS}s" \
     --property="MemoryMax=$MAX_MEMORY_BYTES" \
+    --property=MemorySwapMax=0 \
     --property="CPUQuota=$CPU_QUOTA_PERCENT%" \
     --property="TasksMax=$MAX_TASKS" \
+    --property=LimitNOFILE=1024 \
     --property=NoNewPrivileges=yes \
     --property=PrivateDevices=yes \
+    --property=PrivateIPC=yes \
     --property="BindPaths=$root/tmp:/tmp $root/var-tmp:/var/tmp" \
     --property=ProtectClock=yes \
     --property=ProtectControlGroups=yes \
@@ -765,7 +790,7 @@ run_lane() {
     --property=ProtectProc=invisible \
     --property=ProtectSystem=strict \
     --property=ProcSubset=pid \
-    --property=RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6" \
+    --property=RestrictAddressFamilies=AF_INET \
     --property=RestrictNamespaces=yes \
     --property=RestrictRealtime=yes \
     --property=RestrictSUIDSGID=yes \
@@ -787,17 +812,93 @@ run_lane() {
   run_inventory "$lane" "$root" after
 }
 
-# run_lane_and_capture brackets each lane with a dedicated hardened sink unit.
-# The sink stays outside the untrusted agent cgroup but has no capabilities,
-# write access only to its lane receipt directory, and strict resource limits.
+# run_lane_and_capture brackets each lane with a mandatory bounded model relay
+# and the optional controlled sink. Both stay outside the hostile cgroup, expose
+# only exact ports, and write only body-free or bounded private receipts.
 run_lane_and_capture() {
   local lane=$1
   local root=$2
+  local relay_wait_pid=""
+  local relay_unit="observatory-$RUN_ID-$lane-model-relay"
+  local relay_receipt="$OUT/$lane/model-relay.json"
+  local relay_network_args=(--property=IPAddressDeny=any)
+  while IFS= read -r address; do
+    [ -n "$address" ] && relay_network_args+=(--property="IPAddressAllow=$address")
+  done < <(node -e 'const r=require(process.argv[1]); for (const value of r.modelRelayIps) console.log(value)' "$RUNTIME_JSON")
+  while IFS= read -r address; do
+    [ -n "$address" ] && relay_network_args+=(--property="IPAddressAllow=$address")
+  done < <(node -e 'const r=require(process.argv[1]); for (const value of r.controlPlaneIps) console.log(value)' "$RUNTIME_JSON")
+  [ ! -e "$relay_receipt" ] && [ ! -e "$relay_receipt.ready" ] || fail "model relay receipt path already exists for $lane lane"
+  ACTIVE_RELAY_UNIT="$relay_unit"
+  as_root systemd-run --quiet --wait --collect --unit="$relay_unit" \
+    --property="User=$CONTROL_USER" \
+    --property="Group=$(id -gn)" \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property=NoNewPrivileges=yes \
+    --property=PrivateDevices=yes \
+    --property=PrivateIPC=yes \
+    --property=PrivateMounts=yes \
+    --property=PrivateTmp=yes \
+    --property=ProtectClock=yes \
+    --property=ProtectControlGroups=yes \
+    --property=ProtectHome=yes \
+    --property=ProtectHostname=yes \
+    --property=ProtectKernelLogs=yes \
+    --property=ProtectKernelModules=yes \
+    --property=ProtectKernelTunables=yes \
+    --property=ProtectProc=invisible \
+    --property=ProtectSystem=strict \
+    --property=ProcSubset=pid \
+    --property=RestrictAddressFamilies=AF_INET \
+    --property=RestrictNamespaces=yes \
+    --property=RestrictRealtime=yes \
+    --property=RestrictSUIDSGID=yes \
+    --property=LockPersonality=yes \
+    --property=MemoryMax=268435456 \
+    --property=MemorySwapMax=0 \
+    --property=CPUQuota=50% \
+    --property=TasksMax=16 \
+    --property=LimitNOFILE=64 \
+    --property="LimitFSIZE=$MODEL_RELAY_RECEIPT_MAX_BYTES" \
+    --property="RuntimeMaxSec=$((MODEL_RELAY_DEADLINE_SECONDS + 5))s" \
+    --property=TimeoutStopSec=2s \
+    --property=KillMode=control-group \
+    --property=SendSIGKILL=yes \
+    --property="SocketBindAllow=tcp:ipv4:$MODEL_RELAY_PORT" \
+    --property=SocketBindDeny=any \
+    --property="ReadOnlyPaths=$CONTROL/runtime.json $CONTROL/model-relay.mjs" \
+    --property="ReadWritePaths=$OUT/$lane" \
+    --property="InaccessiblePaths=$REPO_ROOT $BASELINE $EXERCISE" \
+    --property="WorkingDirectory=$OUT/$lane" \
+    --property=StandardOutput=null \
+    --property=StandardError=null \
+    --property=SystemCallArchitectures=native \
+    --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+    --property=SystemCallErrorNumber=EPERM \
+    --property=UMask=0077 \
+    "${relay_network_args[@]}" \
+    /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      node "$CONTROL/model-relay.mjs" "$RUNTIME_JSON" "$relay_receipt" "$lane" &
+  relay_wait_pid=$!
+  local relay_waited=0
+  while [ "$relay_waited" -lt 100 ]; do
+    [ -f "$relay_receipt.ready" ] && break
+    kill -0 "$relay_wait_pid" 2>/dev/null || break
+    sleep 0.1
+    relay_waited=$((relay_waited + 1))
+  done
+  [ -f "$relay_receipt.ready" ] || fail "bounded model relay did not bind for $lane lane"
+  local expected_relay_policy
+  expected_relay_policy=$(node -e 'const r=require(process.argv[1]);process.stdout.write(r.modelRelay.policySha256)' "$RUNTIME_JSON")
+  [ "$(tr -d '\n' < "$relay_receipt.ready")" = "$expected_relay_policy" ] || fail "bounded model relay readiness policy mismatch for $lane lane"
+
   local sink_wait_pid=""
   local sink_unit="observatory-$RUN_ID-$lane-mock-egress"
   local receipt="$OUT/$lane/mock-egress.json"
   if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
     [ ! -e "$receipt" ] && [ ! -e "$receipt.ready" ] || fail "controlled mock egress receipt path already exists for $lane lane"
+    ACTIVE_SINK_UNIT="$sink_unit"
     as_root systemd-run --quiet --wait --collect --unit="$sink_unit" \
       --property="User=$CONTROL_USER" \
       --property="Group=$(id -gn)" \
@@ -805,6 +906,7 @@ run_lane_and_capture() {
       --property=AmbientCapabilities= \
       --property=NoNewPrivileges=yes \
       --property=PrivateDevices=yes \
+      --property=PrivateIPC=yes \
       --property=PrivateMounts=yes \
       --property=PrivateTmp=yes \
       --property=ProtectClock=yes \
@@ -862,9 +964,17 @@ run_lane_and_capture() {
       as_root systemctl kill --kill-who=main --signal=SIGTERM "$sink_unit" || fail "failed to stop controlled mock egress sink for $lane lane"
     fi
     wait "$sink_wait_pid" || fail "controlled mock egress sink unit failed for $lane lane"
+    ACTIVE_SINK_UNIT=""
     [ -f "$receipt" ] || fail "controlled mock egress receipt is missing for $lane lane"
     [ "$(stat -c %s "$receipt")" -le "$MOCK_RECEIPT_MAX_BYTES" ] || fail "controlled mock egress receipt exceeded its output cap"
   fi
+  if [ ! -f "$relay_receipt" ]; then
+    as_root systemctl kill --kill-who=main --signal=SIGTERM "$relay_unit" || fail "failed to stop bounded model relay for $lane lane"
+  fi
+  wait "$relay_wait_pid" || fail "bounded model relay unit failed for $lane lane"
+  ACTIVE_RELAY_UNIT=""
+  [ -f "$relay_receipt" ] || fail "bounded model relay receipt is missing for $lane lane"
+  [ "$(stat -c %s "$relay_receipt")" -le "$MODEL_RELAY_RECEIPT_MAX_BYTES" ] || fail "bounded model relay receipt exceeded its output cap"
 }
 
 # capture_tool_audit directly exports OpenClaw's metadata-only audit_events table
