@@ -127,6 +127,54 @@ capture. Their canonical digest
 is stored in both the raw bundle and public evidence; drift fails closed instead
 of relabeling old data.
 
+## Persistence and lifecycle evidence
+
+Each scan derives a `persistence` section that reports persistence- and
+lifecycle-relevant behavior over a curated, versioned catalog of surfaces:
+OpenClaw config, hooks, MCP and plugin/skill registrations, scheduled work, and
+workspace startup instructions, plus a bounded set of conventional user surfaces
+(shell init files, XDG autostart, systemd user units, user cron, SSH trust,
+PATH binaries) and read-only system locations (system cron, systemd units,
+profile scripts, the dynamic loader preload, and legacy init).
+
+Findings distinguish two outcomes explicitly:
+
+- **attempted** — a persistence operation the read-only OS or containment
+  denied. These never carry `residual: confirmed`.
+- **succeeded residual change** — a successful write whose residual on-disk
+  effect a before/after lane inventory confirms (`residual: confirmed`,
+  `evidence: syscall+inventory` or `inventory`).
+
+Evidence comes from two sources that are correlated per finding:
+
+1. **Existing syscall traces** classify every mutating file operation whose
+   normalized subject maps to a monitored surface, preserving the
+   attempted/succeeded outcome. This is the authoritative attempt record and the
+   only source for denied writes to read-only system locations.
+2. **A before/after lane inventory** snapshots the writable lane surfaces after
+   seeding (before the agent runs) and again after it finishes. Baseline runtime
+   noise (state the OpenClaw runtime rewrites in both lanes) is subtracted by a
+   lane-independent transition identity — path, change kind, and mode transition.
+   Content digests differ per lane and are kept **private**; they are never
+   published. A target-specific change to a path the runtime also rewrites is
+   still confirmed because the succeeded, baseline-subtracted **syscall** write
+   correlates against the full exercise residue set. The default run does **not**
+   add a reboot cycle; residual confirmation is inventory-based.
+
+The inventory records only file digests and modes, never contents, so seeded
+canary values never leave the guest. The current protocol always emits complete
+before/after inventory receipts, so a capture whose inventory is missing,
+malformed, duplicated, or truncated is **rejected as incomplete** rather than
+graded — an incomplete inventory can never silently yield a `not-observed` or
+clean result. `residual: unavailable` is reserved for read-only system locations
+that cannot be inventoried (for example `/etc/cron.d`), where a denied attempt is
+still recorded from the syscall trace.
+
+`persistence.surfaces` publishes the monitored catalog so coverage is explicit.
+The section never claims exhaustive host persistence detection, carries no
+verdict, and a persistence-surface write is a behavioral observation, not proof
+of intent.
+
 ## Isolation contract
 
 Crabbox provisions and operates the runner; it is not itself a hostile-code
@@ -226,11 +274,15 @@ least `mockEgress.maxTotalBytes * 2 + 1 MiB`.
 Development and validation use only:
 
 - `testdata/fixtures/probe-skill` — reads a synthetic canary, attempts an
-  inaccessible system file, writes a synthetic workspace receipt, and attempts
-  a TEST-NET connection that containment must drop;
+  inaccessible system file, writes a synthetic workspace receipt, appends a
+  synthetic line to the lane `$HOME/.bashrc` (a confirmed residual persistence
+  change), attempts a denied `/etc/cron.d` write (an attempted, non-residual
+  persistence change), and attempts a TEST-NET connection that containment must
+  drop;
 - `testdata/fixtures/probe-plugin` — a native tool plugin that reads the same
-  synthetic canary, proves `/etc/shadow` remains unreadable, and writes a
-  synthetic receipt.
+  synthetic canary, proves `/etc/shadow` remains unreadable, performs the same
+  shell-init and denied-system-cron persistence probes, and writes a synthetic
+  receipt.
 
 No ClawHub target is used until the owned fixtures pass the real VM lane.
 Skill names are validated as canonical OpenClaw identifiers and the same ID is
@@ -249,4 +301,12 @@ no declared tools require an operator-supplied `exercise.prompt`.
   attempts. Opaque or TLS-encrypted sink payloads are counted, never decoded.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
+- Persistence coverage is a curated selection of agent and conventional user
+  surfaces, not an exhaustive host persistence audit. Residual confirmation
+  depends on a complete before/after lane inventory, which the protocol always
+  emits; a capture with missing, malformed, or truncated inventory is rejected as
+  incomplete. Cross-lane baseline-noise subtraction uses path, change kind, and
+  mode transition, so a target change to a shared path is confirmed through its
+  correlated syscall rather than by comparing lane-specific content. No reboot
+  cycle is performed in the default run.
 - Behavioral correlation is not author intent and is never a safety verdict.

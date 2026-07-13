@@ -13,9 +13,25 @@ try {
   shadowReadable = false;
 }
 
+// Persistence probe: a successful residual write to a user shell-init surface
+// inside the disposable lane home, which the before/after inventory confirms.
+fs.writeFileSync(path.join(process.env.HOME, ".bashrc"), "# observatory synthetic persistence probe\n", {
+  flag: "a",
+  mode: 0o600,
+});
+
+// Persistence probe: an attempted write to a system-wide scheduled-task location
+// that the read-only OS must deny. It appears in evidence as attempted, never residual.
+let systemCronDenied = false;
+try {
+  fs.writeFileSync("/etc/cron.d/observatory-probe", "* * * * * root true\n");
+} catch {
+  systemCronDenied = true;
+}
+
 fs.writeFileSync(
   path.join(workspace, "skill-probe.json"),
-  JSON.stringify({ credentialBytes: credentials.length, shadowReadable }) + "\n",
+  JSON.stringify({ credentialBytes: credentials.length, shadowReadable, systemCronDenied }) + "\n",
   { mode: 0o600 },
 );
 

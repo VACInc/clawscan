@@ -95,12 +95,18 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 		return err
 	}
 	defer directory.Close()
-	counts := map[string]int{"file": 0, "process": 0, "network": 0, "canary": 0}
+	counts := map[string]int{"file": 0, "process": 0, "network": 0, "canary": 0, "persistence": 0, "persistenceResidual": 0}
 	for _, observation := range evidence.Observations {
 		counts[observation.Kind] += observation.DeltaCount
 	}
 	for _, canary := range evidence.Canaries {
 		counts["canary"] += canary.DeltaInteractions
+	}
+	for _, finding := range evidence.Persistence.Findings {
+		counts["persistence"] += finding.DeltaCount
+		if finding.Residual == "confirmed" {
+			counts["persistenceResidual"] += finding.DeltaCount
+		}
 	}
 	file, err := openRenderOutputFile(directory, "index.html", 0o644)
 	if err != nil {
@@ -168,6 +174,11 @@ func validateEvidenceComparison(previous Evidence, current Evidence) error {
 	}
 	if !reflect.DeepEqual(previous.Coverage, current.Coverage) {
 		return errors.New("version comparison requires identical capture coverage")
+	}
+	if previous.Persistence.Scope != current.Persistence.Scope ||
+		previous.Persistence.InventoryPaired != current.Persistence.InventoryPaired ||
+		!reflect.DeepEqual(previous.Persistence.Surfaces, current.Persistence.Surfaces) {
+		return errors.New("version comparison requires identical persistence coverage")
 	}
 	return nil
 }
@@ -255,6 +266,7 @@ func DiffEvidence(previous Evidence, current Evidence) []VersionChange {
 			PreviousDelta: canary.DeltaInteractions,
 		})
 	}
+	changes = append(changes, diffPersistenceFindings(previous.Persistence.Findings, current.Persistence.Findings)...)
 	sort.Slice(changes, func(i, j int) bool {
 		order := map[string]int{"added": 0, "changed": 1, "removed": 2}
 		a, b := changes[i], changes[j]
@@ -268,6 +280,54 @@ func DiffEvidence(previous Evidence, current Evidence) []VersionChange {
 
 func publicObservationKey(observation Observation) string {
 	return strings.Join([]string{observation.Kind, observation.Operation, observation.Subject, observation.Outcome, observation.Role}, "\x00")
+}
+
+// diffPersistenceFindings reports added, changed, and removed persistence
+// findings between two comparable captures. The subject includes the surface so
+// a delta reads as, for example, "shell-init $HOME/.bashrc".
+func diffPersistenceFindings(previous []PersistenceFinding, current []PersistenceFinding) []VersionChange {
+	previousByKey := map[string]PersistenceFinding{}
+	currentByKey := map[string]PersistenceFinding{}
+	for _, finding := range previous {
+		previousByKey[persistenceFindingKey(finding)] = finding
+	}
+	for _, finding := range current {
+		currentByKey[persistenceFindingKey(finding)] = finding
+	}
+	changes := []VersionChange{}
+	for key, finding := range currentByKey {
+		before, exists := previousByKey[key]
+		change := "added"
+		if exists {
+			if before.DeltaCount == finding.DeltaCount {
+				continue
+			}
+			change = "changed"
+		}
+		changes = append(changes, persistenceChange(change, finding, before.DeltaCount))
+	}
+	for key, finding := range previousByKey {
+		if _, exists := currentByKey[key]; exists {
+			continue
+		}
+		changes = append(changes, persistenceChange("removed", finding, finding.DeltaCount))
+	}
+	return changes
+}
+
+func persistenceChange(change string, finding PersistenceFinding, previousDelta int) VersionChange {
+	current := finding.DeltaCount
+	if change == "removed" {
+		current = 0
+	}
+	if change == "added" {
+		previousDelta = 0
+	}
+	return VersionChange{
+		Change: change, Kind: "persistence", Operation: finding.Operation,
+		Subject: finding.Surface + " " + finding.Subject, Outcome: finding.Outcome, Role: finding.Residual,
+		PreviousDelta: previousDelta, CurrentDelta: current,
+	}
 }
 
 var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template.FuncMap{
@@ -300,7 +360,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     .badge { display:inline-flex; width:max-content; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line); border-radius:999px; background:#0b111b; color:var(--muted); font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace; }
     .badge::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 12px var(--green); }
     .badge.incomplete::before { background:var(--amber); box-shadow:0 0 12px var(--amber); }
-    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:24px 0; }
+    .grid { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; margin:24px 0; }
     .metric,.panel { border:1px solid var(--line); border-radius:14px; background:linear-gradient(150deg,rgba(21,30,45,.96),rgba(12,17,26,.96)); box-shadow:0 18px 55px rgba(0,0,0,.22); }
     .metric { padding:18px; }
     .metric strong { display:block; font-size:28px; line-height:1; }
@@ -335,6 +395,7 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div class="metric"><strong>{{index .Counts "process"}}</strong><span>Process events</span></div>
     <div class="metric"><strong>{{index .Counts "network"}}</strong><span>Network events</span></div>
     <div class="metric"><strong>{{index .Counts "canary"}}</strong><span>Canary deltas</span></div>
+    <div class="metric"><strong>{{index .Counts "persistence"}}</strong><span>Persistence deltas</span></div>
   </section>
   <section class="panel"><h2>Run receipt</h2><dl class="meta">
     <div><dt>Target digest</dt><dd>{{shortHash .Evidence.Target.SHA256}}</dd></div>
@@ -357,6 +418,11 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <div><dt>Payload</dt><dd>{{.PayloadEncoding}}{{if .Truncated}} · truncated{{end}}{{if .PayloadSHA256}} · {{shortHash .PayloadSHA256}}{{end}}</dd></div>
     <div><dt>Canaries transmitted</dt><dd>{{if .CanariesObserved}}{{range $index, $id := .CanariesObserved}}{{if $index}}, {{end}}<code>{{$id}}</code>{{end}}{{else}}none{{end}}</dd></div>
   </dl><p class="muted">Raw captured bytes stay in the private receipt. Opaque or TLS-encrypted payloads are counted, never decoded.</p></section>{{end}}
+  <section class="panel"><h2>Persistence and lifecycle</h2>
+    <p class="muted">Monitored surfaces: {{len .Evidence.Persistence.Surfaces}} · Before/after inventory {{if .Evidence.Persistence.InventoryPaired}}paired{{else}}unavailable{{end}} · Residual-confirmed deltas: {{index .Counts "persistenceResidual"}}. Attempted operations were denied by containment; only inventory-confirmed changes are residual.</p>
+    {{if .Evidence.Persistence.Findings}}<div class="table-wrap"><table><thead><tr><th>Surface</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Residual</th><th>Δ</th></tr></thead><tbody>
+    {{range .Evidence.Persistence.Findings}}<tr><td><span class="kind">{{.Category}}</span><div class="muted">{{.Surface}}</div></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code></td><td>{{.Outcome}}</td><td>{{if eq .Residual "confirmed"}}<span class="change-added">confirmed</span>{{else}}<span class="muted">{{.Residual}}</span>{{end}} <div class="muted">{{.Evidence}}</div></td><td>+{{.DeltaCount}}</td></tr>{{end}}
+  </tbody></table></div>{{else}}<p class="muted">No monitored persistence surface changed in the exercise lane.</p>{{end}}</section>
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>

@@ -27,7 +27,26 @@ type CaptureBundle struct {
 	ExerciseOutput     []byte
 	MockEgressBaseline *MockEgressReceipt
 	MockEgressExercise *MockEgressReceipt
+	BaselineInventory  laneInventory
+	ExerciseInventory  laneInventory
 }
+
+type inventoryEntry struct {
+	Mode   string
+	SHA256 string
+}
+
+// laneInventory holds the before/after persistence-surface snapshots for one
+// lane. Present is false when either snapshot is missing or unparseable, in which
+// case residual mutations cannot be confirmed and persistence findings fall back
+// to syscall evidence only.
+type laneInventory struct {
+	Present bool
+	Before  map[string]inventoryEntry
+	After   map[string]inventoryEntry
+}
+
+const maxInventoryEntries = 20000
 
 func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error) {
 	info, err := os.Stat(bundlePath)
@@ -133,7 +152,76 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 	if !traceLaneHasCompleteSyscall(bundle.ExerciseTraces) {
 		return CaptureBundle{}, errors.New("capture bundle exercise lane contains no complete syscall trace record")
 	}
+	bundle.BaselineInventory, err = readLaneInventory(entries, "baseline")
+	if err != nil {
+		return CaptureBundle{}, err
+	}
+	bundle.ExerciseInventory, err = readLaneInventory(entries, "exercise")
+	if err != nil {
+		return CaptureBundle{}, err
+	}
 	return bundle, nil
+}
+
+// readLaneInventory requires and strictly validates the before/after
+// persistence-surface snapshot pair for one lane. The current capture protocol
+// always emits these receipts, so a missing, malformed, duplicated, or truncated
+// snapshot is a genuine capture defect: it is rejected as incomplete rather than
+// silently degraded, which would risk a false negative or clean grade.
+func readLaneInventory(entries map[string][]byte, lane string) (laneInventory, error) {
+	before, hasBefore := entries[lane+"/inventory.before"]
+	after, hasAfter := entries[lane+"/inventory.after"]
+	if !hasBefore || !hasAfter {
+		return laneInventory{}, fmt.Errorf("capture bundle is missing the %s persistence inventory receipts", lane)
+	}
+	beforeEntries, err := parseInventorySnapshot(before)
+	if err != nil {
+		return laneInventory{}, fmt.Errorf("capture bundle %s before-inventory is invalid: %w", lane, err)
+	}
+	afterEntries, err := parseInventorySnapshot(after)
+	if err != nil {
+		return laneInventory{}, fmt.Errorf("capture bundle %s after-inventory is invalid: %w", lane, err)
+	}
+	return laneInventory{Present: true, Before: beforeEntries, After: afterEntries}, nil
+}
+
+// parseInventorySnapshot decodes "mode<TAB>digest<TAB>relpath" lines emitted by
+// the guest inventory step. Any non-empty line that is not a well-formed entry —
+// including the guest's `# truncated` marker or any other marker — makes the
+// snapshot incomplete and is rejected, so an inventory that stopped early can
+// never be treated as a complete surface census.
+func parseInventorySnapshot(data []byte) (map[string]inventoryEntry, error) {
+	entries := map[string]inventoryEntry{}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			return nil, fmt.Errorf("incomplete inventory marker: %s", strings.TrimSpace(line))
+		}
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) != 3 {
+			return nil, errors.New("malformed inventory line")
+		}
+		mode, digest, relative := fields[0], fields[1], fields[2]
+		if !isPermissionMode(mode) || digest == "" || strings.ContainsAny(digest, " \t") {
+			return nil, errors.New("malformed inventory field")
+		}
+		cleaned := path.Clean(relative)
+		if relative == "" || cleaned != relative || path.IsAbs(cleaned) || cleaned == "." ||
+			strings.HasPrefix(cleaned, "../") || strings.ContainsAny(cleaned, "\x00") {
+			return nil, errors.New("unsafe inventory path")
+		}
+		if _, duplicate := entries[cleaned]; duplicate {
+			return nil, errors.New("duplicate inventory path")
+		}
+		entries[cleaned] = inventoryEntry{Mode: mode, SHA256: digest}
+		if len(entries) > maxInventoryEntries {
+			return nil, errors.New("inventory exceeds maximum entry count")
+		}
+	}
+	return entries, nil
 }
 
 func captureMetadataFromEntries(entries map[string][]byte) (CaptureMetadata, error) {
@@ -295,6 +383,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		MockEgressAddress:     mockEgressClassifiedAddress(config.Runtime.MockEgress),
 	})
 	mockEgress := buildMockEgressEvidence(config.Runtime.MockEgress, bundle, bundle.Metadata.Canaries)
+	persistence := analyzePersistence(analysis.Observations, diffLaneInventories(bundle.BaselineInventory, bundle.ExerciseInventory))
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
@@ -340,6 +429,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		},
 		Observations: analysis.Observations,
 		Canaries:     analysis.Canaries,
+		Persistence:  persistence,
 		Coverage:     analysis.Coverage,
 		MockEgress:   mockEgress,
 	}
