@@ -350,6 +350,13 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
   <section class="panel"><h2>Observed exercise deltas</h2>{{if .Evidence.Observations}}<div class="table-wrap"><table><thead><tr><th>Kind</th><th>Operation</th><th>Subject</th><th>Outcome</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Observations}}<tr><td><span class="kind">{{.Kind}}</span></td><td>{{.Operation}}</td><td><code>{{.Subject}}</code>{{if .Role}}<div class="muted">{{.Role}}</div>{{end}}</td><td>{{.Outcome}}</td><td>{{.BaselineCount}}</td><td>{{.ExerciseCount}}</td><td>+{{.DeltaCount}}</td></tr>{{end}}
   </tbody></table></div>{{else}}<p class="muted">No trace event increased in the exercise lane.</p>{{end}}</section>
+  {{with .Evidence.MockEgress}}<section class="panel"><h2>Controlled mock egress</h2><dl class="meta">
+    <div><dt>Sink</dt><dd>{{.SinkEndpoint}}</dd></div>
+    <div><dt>Requests (Δ)</dt><dd>{{.BaselineRequests}} → {{.ExerciseRequests}} (+{{.DeltaRequests}})</dd></div>
+    <div><dt>Bytes captured (Δ)</dt><dd>{{.BaselineBytes}} → {{.ExerciseBytes}} (+{{.DeltaBytes}})</dd></div>
+    <div><dt>Payload</dt><dd>{{.PayloadEncoding}}{{if .Truncated}} · truncated{{end}}{{if .PayloadSHA256}} · {{shortHash .PayloadSHA256}}{{end}}</dd></div>
+    <div><dt>Canaries transmitted</dt><dd>{{if .CanariesObserved}}{{range $index, $id := .CanariesObserved}}{{if $index}}, {{end}}<code>{{$id}}</code>{{end}}{{else}}none{{end}}</dd></div>
+  </dl><p class="muted">Raw captured bytes stay in the private receipt. Opaque or TLS-encrypted payloads are counted, never decoded.</p></section>{{end}}
   <section class="panel"><h2>Synthetic canaries</h2><div class="table-wrap"><table><thead><tr><th>Canary</th><th>Surface</th><th>Baseline</th><th>Exercise</th><th>Δ</th></tr></thead><tbody>
     {{range .Evidence.Canaries}}<tr><td><code>{{.ID}}</code></td><td>{{.Surface}}</td><td>{{.BaselineInteractions}}</td><td>{{.ExerciseInteractions}}</td><td>{{if .DeltaInteractions}}+{{.DeltaInteractions}}{{else}}0{{end}}</td></tr>{{end}}
   </tbody></table></div></section>

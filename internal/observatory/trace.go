@@ -16,6 +16,7 @@ type AnalysisInput struct {
 	Metadata              CaptureMetadata
 	Canaries              []CanaryDefinition
 	ControlPlaneAddresses []string
+	MockEgressAddress     string
 }
 
 type analysisResult struct {
@@ -105,7 +106,7 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 						}
 					}
 				}
-				for _, observation := range parseTraceLineAtCWD(line, input.Metadata, input.ControlPlaneAddresses, exercise, cwd) {
+				for _, observation := range parseTraceLineAtCWD(line, input.Metadata, input.ControlPlaneAddresses, input.MockEgressAddress, exercise, cwd) {
 					key := observationKey(observation)
 					entry := counts[key]
 					if entry == nil {
@@ -188,6 +189,10 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 			"A behavioral delta shows correlation with the exercise lane, not author intent or a safety verdict.",
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
 		},
+	}
+	if input.MockEgressAddress != "" {
+		result.Coverage.Limitations = append(result.Coverage.Limitations,
+			"Controlled mock egress captures raw bytes sent to the pinned Observatory sink only; all other destinations stay default-denied and appear as attempts. TLS-encrypted or otherwise opaque payloads are recorded as byte counts and never decoded.")
 	}
 	return result
 }
@@ -381,10 +386,10 @@ func isOperationallyPrivateIP(ip net.IP) bool {
 }
 
 func parseTraceLine(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool) []traceObservation {
-	return parseTraceLineAtCWD(line, metadata, controlPlaneAddresses, exercise, "")
+	return parseTraceLineAtCWD(line, metadata, controlPlaneAddresses, "", exercise, "")
 }
 
-func parseTraceLineAtCWD(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool, cwd string) []traceObservation {
+func parseTraceLineAtCWD(line string, metadata CaptureMetadata, controlPlaneAddresses []string, mockEgressAddress string, exercise bool, cwd string) []traceObservation {
 	open := strings.IndexByte(line, '(')
 	if open <= 0 {
 		return nil
@@ -503,9 +508,9 @@ func parseTraceLineAtCWD(line string, metadata CaptureMetadata, controlPlaneAddr
 	case "connect", "sendto", "sendmsg", "sendmmsg":
 		if syscall == "sendmmsg" {
 			sent, known := successfulResultCount(line)
-			endpoints := repeatedNetworkSubjects(line, metadata, controlPlaneAddresses, exercise, cwd)
+			endpoints := repeatedNetworkSubjects(line, metadata, controlPlaneAddresses, mockEgressAddress, exercise, cwd)
 			if len(endpoints) == 0 {
-				if subject, role := networkFDSubject(line, controlPlaneAddresses); subject != "" {
+				if subject, role := networkFDSubject(line, controlPlaneAddresses, mockEgressAddress); subject != "" {
 					count := 1
 					if known && sent > count {
 						count = sent
@@ -532,9 +537,9 @@ func parseTraceLineAtCWD(line string, metadata CaptureMetadata, controlPlaneAddr
 			}
 			return observations
 		}
-		subject, role := networkSubject(line, metadata, controlPlaneAddresses, exercise, cwd)
+		subject, role := networkSubject(line, metadata, controlPlaneAddresses, mockEgressAddress, exercise, cwd)
 		if subject == "" && syscall != "connect" {
-			subject, role = networkFDSubject(line, controlPlaneAddresses)
+			subject, role = networkFDSubject(line, controlPlaneAddresses, mockEgressAddress)
 		}
 		if subject == "" {
 			return nil
@@ -545,7 +550,7 @@ func parseTraceLineAtCWD(line string, metadata CaptureMetadata, controlPlaneAddr
 		}
 		return []traceObservation{{Kind: "network", Operation: operation, Subject: subject, Outcome: outcome, Role: role}}
 	case "write", "writev":
-		subject, role := networkFDSubject(line, controlPlaneAddresses)
+		subject, role := networkFDSubject(line, controlPlaneAddresses, mockEgressAddress)
 		if subject == "" {
 			return nil
 		}
@@ -728,8 +733,8 @@ func isKnownRuntimeReadNoise(path string) bool {
 	return strings.Contains(base, ".so") && (strings.HasPrefix(base, "lib") || strings.HasPrefix(base, "ld-") || strings.HasPrefix(base, "ld-linux"))
 }
 
-func networkSubject(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool, cwd string) (string, string) {
-	endpoints := networkSubjects(line, metadata, controlPlaneAddresses, exercise, cwd)
+func networkSubject(line string, metadata CaptureMetadata, controlPlaneAddresses []string, mockEgressAddress string, exercise bool, cwd string) (string, string) {
+	endpoints := networkSubjects(line, metadata, controlPlaneAddresses, mockEgressAddress, exercise, cwd)
 	if len(endpoints) == 0 {
 		return "", ""
 	}
@@ -741,15 +746,15 @@ type networkEndpoint struct {
 	Role    string
 }
 
-func networkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool, cwd string) []networkEndpoint {
-	return collectNetworkSubjects(line, metadata, controlPlaneAddresses, exercise, cwd, true)
+func networkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, mockEgressAddress string, exercise bool, cwd string) []networkEndpoint {
+	return collectNetworkSubjects(line, metadata, controlPlaneAddresses, mockEgressAddress, exercise, cwd, true)
 }
 
-func repeatedNetworkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool, cwd string) []networkEndpoint {
-	return collectNetworkSubjects(line, metadata, controlPlaneAddresses, exercise, cwd, false)
+func repeatedNetworkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, mockEgressAddress string, exercise bool, cwd string) []networkEndpoint {
+	return collectNetworkSubjects(line, metadata, controlPlaneAddresses, mockEgressAddress, exercise, cwd, false)
 }
 
-func collectNetworkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, exercise bool, cwd string, deduplicate bool) []networkEndpoint {
+func collectNetworkSubjects(line string, metadata CaptureMetadata, controlPlaneAddresses []string, mockEgressAddress string, exercise bool, cwd string, deduplicate bool) []networkEndpoint {
 	endpoints := []networkEndpoint{}
 	seen := map[string]bool{}
 	quotedSpans := quotedTraceStrings(line)
@@ -790,7 +795,7 @@ func collectNetworkSubjects(line string, metadata CaptureMetadata, controlPlaneA
 			if portMatch := portPattern.FindStringSubmatch(sockaddr); len(portMatch) == 2 {
 				port = portMatch[1]
 			}
-			subject, role := classifyNetworkHost(host, port, controlPlaneAddresses)
+			subject, role := classifyNetworkHost(host, port, controlPlaneAddresses, mockEgressAddress)
 			add(subject, role)
 		}
 	}
@@ -821,7 +826,7 @@ func sockaddrContaining(line string, position int) string {
 	return line[start : position+end+1]
 }
 
-func networkFDSubject(line string, controlPlaneAddresses []string) (string, string) {
+func networkFDSubject(line string, controlPlaneAddresses []string, mockEgressAddress string) (string, string) {
 	open := strings.IndexByte(line, '(')
 	if open < 0 {
 		return "", ""
@@ -838,14 +843,23 @@ func networkFDSubject(line string, controlPlaneAddresses []string) (string, stri
 	if err != nil {
 		return "", ""
 	}
-	return classifyNetworkHost(strings.Trim(host, "[]"), port, controlPlaneAddresses)
+	return classifyNetworkHost(strings.Trim(host, "[]"), port, controlPlaneAddresses, mockEgressAddress)
 }
 
-func classifyNetworkHost(host string, port string, controlPlaneAddresses []string) (string, string) {
+func classifyNetworkHost(host string, port string, controlPlaneAddresses []string, mockEgressAddress string) (string, string) {
 	for _, allowed := range controlPlaneAddresses {
 		allowedHost, allowedPort, err := net.SplitHostPort(allowed)
 		if err == nil && strings.EqualFold(strings.Trim(allowedHost, "[]"), host) && allowedPort == port {
 			return "model-endpoint:" + port, "model-control-plane"
+		}
+	}
+	// The controlled sink is checked before the private/loopback fallback so its
+	// traffic is labeled and the raw loopback address never appears in evidence.
+	if mockEgressAddress != "" {
+		if sinkHost, sinkPort, err := net.SplitHostPort(mockEgressAddress); err == nil {
+			if strings.EqualFold(strings.Trim(sinkHost, "[]"), host) && sinkPort == port {
+				return "controlled-sink:" + port, "controlled-sink"
+			}
 		}
 	}
 	ip := net.ParseIP(host)

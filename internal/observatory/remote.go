@@ -149,6 +149,14 @@ WORKSPACE="$ROOT/workspace"
 STATE="$ROOT/state"
 HOME_DIR="$ROOT/home"
 
+# Only when the controlled sink is enabled, expose a clearly synthetic sink URL to
+# the contained agent through the otherwise-empty child environment. Both lanes get
+# the same value; only the exercise lane has a target that can act on it. When the
+# sink is disabled the variable is not introduced at all.
+MOCK_EGRESS_URL=$(node -e 'const r=require(process.argv[1]); const m=r.mockEgress; process.stdout.write(m && m.enabled ? ("http://"+m.host+":"+m.port+"/observatory-mock-egress") : "")' "$RUNTIME_JSON")
+MOCK_ENV=()
+[ -n "$MOCK_EGRESS_URL" ] && MOCK_ENV=("OBSERVATORY_MOCK_EGRESS_URL=$MOCK_EGRESS_URL")
+
 # Bash applies this RLIMIT_FSIZE (in 1024-byte blocks) to the trace and both
 # redirected streams, and every descendant inherits it.
 ulimit -f "$CAPTURE_FILE_BLOCKS"
@@ -156,6 +164,7 @@ exec strace -f -qq -s 0 -yy -e signal=none \
   -e trace=open,openat,openat2,creat,link,linkat,symlink,symlinkat,unlink,unlinkat,rename,renameat,renameat2,mkdir,mkdirat,rmdir,truncate,ftruncate,chdir,fchdir,clone,clone3,fork,vfork,unshare,execve,execveat,connect,sendto,sendmsg,sendmmsg,write,writev \
   -u "$AGENT_USER" -o "$TRACE_DIR/trace" \
   env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    ${MOCK_ENV[@]+"${MOCK_ENV[@]}"} \
     HOME="$HOME_DIR" TMPDIR=/tmp OBSERVATORY_WORKSPACE="$WORKSPACE" OPENCLAW_STATE_DIR="$STATE" OPENCLAW_CONFIG_PATH="$STATE/openclaw.json" \
     "$OPENCLAW_COMMAND" agent --local --agent observatory --session-id "$SESSION" \
       --message-file "$PROMPT" --json \
@@ -231,13 +240,19 @@ as_root install -m 0600 "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
 as_root install -m 0600 "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
 as_root install -m 0600 "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
 as_root install -m 0600 "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
+as_root install -m 0600 "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
 as_root install -m 0700 "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
 RUNTIME_JSON="$CONTROL/runtime.json"
+MOCK_EGRESS_ENABLED=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.mockEgress && r.mockEgress.enabled ? "1" : "0")' "$RUNTIME_JSON")
 
 SSH_PEER=${SSH_CONNECTION:-}
 SSH_PEER=${SSH_PEER%% *}
 [ -n "$SSH_PEER" ] || fail "SSH_CONNECTION is required to pin the management firewall peer"
 as_root node -e 'const fs=require("fs"),net=require("net");const [file,peer]=process.argv.slice(1);if(!net.isIPv4(peer))throw new Error("management peer must be literal IPv4");const marker="@MANAGEMENT_IPV4@",input=fs.readFileSync(file,"utf8");if(input.split(marker).length!==2)throw new Error("firewall management marker is missing or repeated");fs.writeFileSync(file,input.replace(marker,peer),{mode:0o600});' "$CONTROL/firewall.nft" "$SSH_PEER"
+if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
+  MOCK_AGENT_UID=$(id -u "$AGENT_USER")
+  as_root node -e 'const fs=require("fs");const [file,uid]=process.argv.slice(1);if(!/^[0-9]+$/.test(uid))throw new Error("agent uid must be numeric");const marker="@AGENT_UID@",input=fs.readFileSync(file,"utf8");if(!input.includes(marker))throw new Error("firewall agent-uid marker is missing");fs.writeFileSync(file,input.split(marker).join(uid),{mode:0o600});' "$CONTROL/firewall.nft" "$MOCK_AGENT_UID"
+fi
 as_root nft -f "$CONTROL/firewall.nft"
 
 as_root install -d -m 0711 "$OUT" "$OUT/runtime"
@@ -318,6 +333,11 @@ run_lane() {
   while IFS= read -r address; do
     [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
   done < <(node -e 'const r=require(process.argv[1]); for (const value of r.controlPlaneIps) console.log(value)' "$RUNTIME_JSON")
+  # The controlled mock egress sink is a distinct, auditable allowlist entry kept
+  # separate from the exact model control-plane allowlist above.
+  while IFS= read -r address; do
+    [ -n "$address" ] && network_args+=(--property="IPAddressAllow=$address")
+  done < <(node -e 'const r=require(process.argv[1]); for (const value of (r.mockEgressIps||[])) console.log(value)' "$RUNTIME_JSON")
   local code=0
   as_root systemd-run --quiet --wait --collect --unit="$unit" \
     --property=KillMode=control-group \
@@ -361,8 +381,37 @@ run_lane() {
   printf '%s\n' "$code" > "$META/$lane-exit"
 }
 
-run_lane baseline "$BASELINE"
-run_lane exercise "$EXERCISE"
+# run_lane_and_capture brackets each lane with the bounded controlled mock egress
+# sink. The sink runs outside the untrusted agent cgroup, self-terminates on its
+# own caps/deadline, and always leaves a private per-lane receipt behind.
+run_lane_and_capture() {
+  local lane=$1
+  local root=$2
+  local sink_pid=""
+  if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
+    rm -f "$OUT/$lane/mock-egress.json" "$OUT/$lane/mock-egress.json.ready"
+    node "$CONTROL/mock-egress-sink.mjs" "$RUNTIME_JSON" "$OUT/$lane/mock-egress.json" "$lane" &
+    sink_pid=$!
+    local waited=0
+    while [ "$waited" -lt 100 ]; do
+      [ -f "$OUT/$lane/mock-egress.json.ready" ] && break
+      kill -0 "$sink_pid" 2>/dev/null || break
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    [ -f "$OUT/$lane/mock-egress.json.ready" ] || fail "controlled mock egress sink did not bind for $lane lane"
+  fi
+  run_lane "$lane" "$root"
+  if [ -n "$sink_pid" ]; then
+    kill -TERM "$sink_pid" 2>/dev/null || true
+    wait "$sink_pid" 2>/dev/null || true
+    rm -f "$OUT/$lane/mock-egress.json.ready"
+    [ -f "$OUT/$lane/mock-egress.json" ] || fail "controlled mock egress receipt is missing for $lane lane"
+  fi
+}
+
+run_lane_and_capture baseline "$BASELINE"
+run_lane_and_capture exercise "$EXERCISE"
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$META/completed-at"
 
 as_root tar -C "$OUT" -czf "$OUT/raw.tar.gz" meta baseline exercise

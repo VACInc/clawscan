@@ -43,6 +43,22 @@ runtime:
     maxTokens: 4096
   # Addresses as seen from the guest. Values never enter public evidence.
   controlPlaneAddresses: [10.0.0.20:8000]
+  # Controlled mock egress upgrades outbound-attempt evidence to payload-aware
+  # evidence without permitting real egress. Opt-in and disabled by default. The
+  # sink is a guest-local IPv4 loopback endpoint (captured bytes never leave the
+  # VM); its address is a distinct, auditable allowlist entry separate from the
+  # exact model control plane above. Raw captured bytes stay in the private
+  # bundle; only counts, a digest, encoding, and canary presence are published.
+  mockEgress:
+    enabled: false
+    address: 127.0.0.9:9009
+    maxRequests: 16
+    maxBytesPerRequest: 65536
+    maxTotalBytes: 262144
+    # deadlineSeconds: 0 derives a lane-length backstop from timeoutSeconds.
+    deadlineSeconds: 0
+    # Optional deterministic canned response returned to the target, base64.
+    cannedResponseBase64: ""
 
 exercise:
   turnLimit: 1

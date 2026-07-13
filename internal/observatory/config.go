@@ -62,11 +62,12 @@ type IsolationConfig struct {
 }
 
 type RuntimeConfig struct {
-	OpenClawCommand       string      `yaml:"openclawCommand"`
-	AgentUser             string      `yaml:"agentUser"`
-	TimeoutSeconds        int         `yaml:"timeoutSeconds"`
-	Model                 ModelConfig `yaml:"model"`
-	ControlPlaneAddresses []string    `yaml:"controlPlaneAddresses"`
+	OpenClawCommand       string           `yaml:"openclawCommand"`
+	AgentUser             string           `yaml:"agentUser"`
+	TimeoutSeconds        int              `yaml:"timeoutSeconds"`
+	Model                 ModelConfig      `yaml:"model"`
+	ControlPlaneAddresses []string         `yaml:"controlPlaneAddresses"`
+	MockEgress            MockEgressConfig `yaml:"mockEgress"`
 }
 
 type ModelConfig struct {
@@ -174,6 +175,19 @@ func (config *Config) applyDefaults() {
 	}
 	if config.Runtime.Model.MaxTokens == 0 {
 		config.Runtime.Model.MaxTokens = 4096
+	}
+	if config.Runtime.MockEgress.Enabled {
+		if config.Runtime.MockEgress.MaxRequests == 0 {
+			config.Runtime.MockEgress.MaxRequests = 16
+		}
+		if config.Runtime.MockEgress.MaxBytesPerRequest == 0 {
+			config.Runtime.MockEgress.MaxBytesPerRequest = 64 << 10
+		}
+		if config.Runtime.MockEgress.MaxTotalBytes == 0 {
+			config.Runtime.MockEgress.MaxTotalBytes = 256 << 10
+		}
+		// DeadlineSeconds stays optional; 0 derives a lane-length backstop at
+		// runtime rather than a config-validated bound.
 	}
 	if config.Exercise.Prompt == "" {
 		config.Exercise.Prompt = DefaultExercisePrompt
@@ -293,6 +307,12 @@ func (config Config) Validate() error {
 	if config.Limits.MaxTasks < 32 || config.Limits.MaxTasks > 1024 {
 		return errors.New("limits.maxTasks must be between 32 and 1024")
 	}
+	if err := config.Runtime.MockEgress.validateShape(); err != nil {
+		return err
+	}
+	if config.Runtime.MockEgress.Enabled && config.Runtime.MockEgress.MaxTotalBytes*2+(1<<20) > config.Limits.MaxBundleBytes {
+		return errors.New("limits.maxBundleBytes must leave room for the controlled mock egress receipts (at least mockEgress.maxTotalBytes*2 + 1 MiB)")
+	}
 	return nil
 }
 
@@ -384,6 +404,9 @@ func (config Config) ValidateLive() error {
 	}
 	if !matchedModelEndpoint {
 		return errors.New("runtime.model.baseUrl host and effective port must appear in runtime.controlPlaneAddresses")
+	}
+	if err := config.Runtime.MockEgress.validateLive(config.Runtime.ControlPlaneAddresses); err != nil {
+		return err
 	}
 	return nil
 }

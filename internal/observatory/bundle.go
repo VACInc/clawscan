@@ -20,11 +20,13 @@ import (
 )
 
 type CaptureBundle struct {
-	Metadata       CaptureMetadata
-	BaselineTraces []string
-	ExerciseTraces []string
-	BaselineOutput []byte
-	ExerciseOutput []byte
+	Metadata           CaptureMetadata
+	BaselineTraces     []string
+	ExerciseTraces     []string
+	BaselineOutput     []byte
+	ExerciseOutput     []byte
+	MockEgressBaseline *MockEgressReceipt
+	MockEgressExercise *MockEgressReceipt
 }
 
 func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error) {
@@ -111,6 +113,18 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 			bundle.BaselineOutput = append([]byte(nil), data...)
 		case name == "exercise/agent.stdout":
 			bundle.ExerciseOutput = append([]byte(nil), data...)
+		case name == "baseline/mock-egress.json":
+			receipt, err := parseMockEgressReceipt(data)
+			if err != nil {
+				return CaptureBundle{}, err
+			}
+			bundle.MockEgressBaseline = receipt
+		case name == "exercise/mock-egress.json":
+			receipt, err := parseMockEgressReceipt(data)
+			if err != nil {
+				return CaptureBundle{}, err
+			}
+			bundle.MockEgressExercise = receipt
 		}
 	}
 	if !traceLaneHasCompleteSyscall(bundle.BaselineTraces) {
@@ -278,7 +292,9 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
+		MockEgressAddress:     mockEgressClassifiedAddress(config.Runtime.MockEgress),
 	})
+	mockEgress := buildMockEgressEvidence(config.Runtime.MockEgress, bundle, bundle.Metadata.Canaries)
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
@@ -301,7 +317,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 				NetworkMode:               config.Isolation.NetworkMode,
 				ContainmentProfile:        "proxmox-vm+nftables+systemd-cgroup",
 				GuestFirewallSHA256:       "sha256:" + bundle.Metadata.FirewallSHA256,
-				GuestFirewallPolicySHA256: digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses))),
+				GuestFirewallPolicySHA256: digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.MockEgress))),
 				Verification:              config.Isolation.Verification,
 			},
 			Runtime: RuntimeEvidence{
@@ -325,6 +341,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Observations: analysis.Observations,
 		Canaries:     analysis.Canaries,
 		Coverage:     analysis.Coverage,
+		MockEgress:   mockEgress,
 	}
 }
 
