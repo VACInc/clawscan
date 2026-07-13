@@ -147,6 +147,71 @@ a version delta. Version deltas include normalized trace observations,
 aggregate synthetic-canary interaction changes, and the exact canary stage
 whose delta changed.
 
+## Hands-off version-diff history
+
+Every scan of a completed capture records its public evidence in a bounded
+local history keyed by the stable lineage (skills) or manifest ID (plugins).
+On the next release, `observatory scan` selects the latest strictly comparable
+prior evidence for that identity and renders or emits an evidence-based version
+delta — no version, target, or history is ever fetched from the network.
+
+```bash
+# Record this scan and render a site that auto-includes the latest comparable
+# predecessor delta. Also write the structured delta document.
+./bin/observatory scan --config ./observatory.yml \
+  --site ./site --delta ./version-delta.json ./path/to/skill
+
+# Render a delta later from stored history instead of a hand-picked file.
+./bin/observatory render --input ./skill-v2.json --output ./site \
+  --auto-previous --config ./observatory.yml
+```
+
+The evidence JSON on stdout is unchanged; delta selection is a side channel and
+never pollutes the Clawscan adapter contract. Selection runs before the current
+run is recorded and also excludes it by run ID, so a run is never its own
+predecessor. Selection reuses the same comparability gate as `--previous`: a
+mismatched capture protocol, isolation receipt, prompt, model, resource limits,
+or target kind/identity is skipped rather than diffed. The structured
+`observatory.version-delta.v1` document carries the behavioral `changes` plus a
+reserved, nil-by-default `grade` field so a future external grade signal can be
+integrated alongside — never in place of — the evidence-based delta.
+
+The history workflow fails closed. When history is enabled, an unexpected
+failure — an unavailable store, a corrupt index or snapshot, a failed selection
+or recording, or an unexpected comparison error — makes `scan` exit nonzero
+after the valid current evidence has already been emitted on stdout; the same
+condition makes `render --auto-previous` return an error. Only clean cases
+degrade with a diagnostic and no delta: a completed run with no comparable
+predecessor, a target with no stable lineage/plugin ID, an incomplete capture,
+or history disabled. Because a delta needs history, `--delta` combined with
+`--no-history` (or with history disabled) is rejected rather than ignored.
+
+History is configured under `history` in the Observatory YAML:
+
+```yaml
+history:
+  enabled: true       # default; set false to disable recording and diffs
+  maxPerIdentity: 1000  # bounded high cap per stable lineage/plugin ID (1..100000)
+```
+
+History is append-only. Prior snapshots are never deleted or overwritten:
+re-recording the same run id succeeds only when the preserved snapshot is valid
+and byte-identical, a conflicting payload for the same run id is rejected, and
+reaching `maxPerIdentity` fails a new record closed instead of pruning older
+entries. Canonical per-run artifact directories and raw capture bundles are
+never touched. History snapshots live under `<artifactsDir>/history` with
+owner-only permissions and contain only the public evidence projection,
+preserving the private/public artifact boundary. Use `--no-history` to skip
+recording and diffing for a single run.
+
+History storage is fail-closed on Linux. The store, index, writer lock,
+snapshot directories, snapshots, and temporary index must be owned by the
+current user with exact owner-only modes; symbolic links and other file types
+are rejected. Writers take a bounded cross-process lock. Each snapshot is
+synced before an atomically replaced and directory-synced index can reference
+it, and every index field derived from evidence is revalidated against the
+canonical snapshot before the index is trusted.
+
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
 capture. Their canonical digest

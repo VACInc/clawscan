@@ -16,19 +16,26 @@ import (
 // validEvidenceForTest builds a minimal, valid, complete piece of behavior
 // evidence for exercising the CLI grade surface without provisioning a VM.
 func validEvidenceForTest() observatory.Evidence {
+	return cliEvidence("obs_cli", "2026-07-10T12:00:00Z")
+}
+
+func cliEvidence(runID string, completedAt string) observatory.Evidence {
 	return observatory.Evidence{
 		SchemaVersion:       observatory.EvidenceSchemaVersion,
 		CaptureConfigSHA256: "sha256:" + strings.Repeat("d", 64),
 		Target: observatory.TargetEvidence{
-			Name: "cli-fixture", Kind: "skill", ID: "cli-fixture", SHA256: "sha256:" + strings.Repeat("a", 64),
-			FileCount: 1, DirectoryCount: 1, TotalBytes: 10,
+			Name: "fixture-skill", Kind: "skill", ID: "fixture-skill", Lineage: "example/fixture-skill",
+			SHA256: "sha256:" + strings.Repeat("a", 64), FileCount: 1, DirectoryCount: 1, TotalBytes: 10,
 			Files:       []observatory.TargetFile{{Path: "SKILL.md", Bytes: 10, Mode: "0644"}},
 			Directories: []observatory.TargetDirectory{{Path: ".", Mode: "0755"}},
 		},
 		Run: observatory.RunEvidence{
-			ID: "obs_cli", Status: "completed", StartedAt: "2026-07-10T11:59:59Z", CompletedAt: "2026-07-10T12:00:00Z", Executor: "fixture",
-			Isolation: observatory.IsolationEvidence{Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture", GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), Verification: "fixture"},
-			Runtime:   observatory.RuntimeEvidence{OpenClawVersion: "OpenClaw fixture", StraceVersion: "strace fixture", ModelProvider: "local", ModelID: "fixture", ModelEndpoint: "private"},
+			ID: runID, Status: "completed", StartedAt: "2026-07-10T11:59:59Z", CompletedAt: completedAt, Executor: "fixture",
+			Isolation: observatory.IsolationEvidence{
+				Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture",
+				GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), Verification: "fixture",
+			},
+			Runtime: observatory.RuntimeEvidence{OpenClawVersion: "OpenClaw fixture", StraceVersion: "strace fixture", ModelProvider: "local", ModelID: "fixture", ModelEndpoint: "private"},
 		},
 		Exercise:     observatory.ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},
 		Observations: []observatory.Observation{},
@@ -42,21 +49,40 @@ func validEvidenceForTest() observatory.Evidence {
 	}
 }
 
-func writeEvidenceFile(t *testing.T, evidence observatory.Evidence) string {
+func writeTempEvidenceFile(t *testing.T, evidence observatory.Evidence) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "evidence.json")
+	writeEvidenceFile(t, path, evidence)
+	return path
+}
+
+func writeEvidenceFile(t *testing.T, path string, evidence observatory.Evidence) {
+	t.Helper()
 	data, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeHistoryConfig(t *testing.T, dir string, artifactsDir string) string {
+	t.Helper()
+	config := "version: 1\n" +
+		"targetLineage: example/fixture-skill\n" +
+		"artifactsDir: " + artifactsDir + "\n" +
+		"executor:\n  kind: crabbox\n  command: crabbox\n  crabboxConfig: crabbox.yml\n" +
+		"runtime:\n  model:\n    id: fixture-model\n    baseUrl: http://10.0.0.2:8000/v1\n    api: openai-completions\n"
+	path := filepath.Join(dir, "observatory.yml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
 func TestGradeCommandEmitsDerivedGradeJSON(t *testing.T) {
-	path := writeEvidenceFile(t, validEvidenceForTest())
+	path := writeTempEvidenceFile(t, validEvidenceForTest())
 	var stdout, stderr bytes.Buffer
 	if err := run(context.Background(), []string{"grade", "--input", path}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
@@ -87,7 +113,7 @@ func TestGradeCommandGradesHardEscalatorF(t *testing.T) {
 		Kind: "network", Operation: "send", Subject: "[canary:cloud-credentials]->198.51.100.7:443", Outcome: "succeeded",
 		Role: "external", BaselineCount: 0, ExerciseCount: 1, DeltaCount: 1,
 	}}
-	path := writeEvidenceFile(t, evidence)
+	path := writeTempEvidenceFile(t, evidence)
 	output := filepath.Join(t.TempDir(), "grade.json")
 	var stdout, stderr bytes.Buffer
 	if err := run(context.Background(), []string{"grade", "--input", path, "--output", output}, &stdout, &stderr); err != nil {
@@ -109,6 +135,127 @@ func TestGradeCommandGradesHardEscalatorF(t *testing.T) {
 func TestGradeCommandRequiresInput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if err := run(context.Background(), []string{"grade"}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func stubScan(evidence observatory.Evidence, runDir string) func() {
+	previous := scanFn
+	scanFn = func(_ context.Context, _ string, _ observatory.Config, _ observatory.CommandExecutor) (observatory.ScanResult, error) {
+		return observatory.ScanResult{Evidence: evidence, RunDirectory: runDir}, nil
+	}
+	return func() { scanFn = previous }
+}
+
+func countSnapshotFiles(t *testing.T, artifactsDir string) int {
+	t.Helper()
+	root := filepath.Join(artifactsDir, "history", "snapshots")
+	identities, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, identity := range identities {
+		if !identity.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(root, identity.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range files {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".json") {
+				total++
+			}
+		}
+	}
+	return total
+}
+
+func TestScanFailsClosedOnCorruptHistoryButKeepsEvidence(t *testing.T) {
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Record(cliEvidence("obs_prev", "2026-07-10T12:00:00Z"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactsDir, "history", "index.json"), []byte("{ broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	defer stubScan(current, dir)()
+
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"scan", "--config", configPath, "--json", "./target"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "corrupt history") {
+		t.Fatalf("expected corrupt-history failure, err = %v", err)
+	}
+	// Valid current evidence must still have been emitted to stdout.
+	if !strings.Contains(stdout.String(), observatory.EvidenceSchemaVersion) || !strings.Contains(stdout.String(), "obs_cur") {
+		t.Fatalf("valid current evidence was suppressed: %s", stdout.String())
+	}
+	// The prior snapshot must be preserved, not cleaned up.
+	if got := countSnapshotFiles(t, artifactsDir); got != 1 {
+		t.Fatalf("prior snapshot not preserved: %d snapshot files", got)
+	}
+}
+
+func TestScanRecordsHistoryAndEmitsVersionDelta(t *testing.T) {
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Record(cliEvidence("obs_prev", "2026-07-10T12:00:00Z"), 10); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	current.Target.SHA256 = "sha256:" + strings.Repeat("f", 64)
+	current.Observations = append(current.Observations, observatory.Observation{
+		Kind: "network", Operation: "connect", Subject: "93.184.216.34:443", Outcome: "succeeded", Role: "external", ExerciseCount: 1, DeltaCount: 1,
+	})
+	defer stubScan(current, dir)()
+
+	deltaPath := filepath.Join(dir, "delta.json")
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"scan", "--config", configPath, "--json", "--delta", deltaPath, "./target"}, &stdout, &stderr); err != nil {
+		t.Fatalf("scan: %v (stderr=%s)", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "obs_cur") {
+		t.Fatalf("evidence missing from stdout: %s", stdout.String())
+	}
+	data, err := os.ReadFile(deltaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delta observatory.VersionDelta
+	if err := json.Unmarshal(data, &delta); err != nil {
+		t.Fatal(err)
+	}
+	if delta.SchemaVersion != observatory.VersionDeltaSchemaVersion || delta.Previous.RunID != "obs_prev" || len(delta.Changes) != 1 {
+		t.Fatalf("delta = %#v", delta)
+	}
+	// The current run is now recorded and the prior snapshot is preserved.
+	if got := countSnapshotFiles(t, artifactsDir); got != 2 {
+		t.Fatalf("snapshots after scan = %d", got)
+	}
+}
+
+func TestScanRejectsDeltaWithNoHistory(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"scan", "--no-history", "--delta", "delta.json", "./target"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "--delta cannot be combined with --no-history") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -162,5 +309,123 @@ func TestPairedArtifactPathsMustDiffer(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("identical artifact path was created: %v", err)
+	}
+}
+
+func TestRenderAutoPreviousSelectsHistoryPredecessor(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("secure site rendering requires Linux")
+	}
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := cliEvidence("obs_prev", "2026-07-10T12:00:00Z")
+	if err := store.Record(previous, 10); err != nil {
+		t.Fatal(err)
+	}
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	current.Target.SHA256 = "sha256:" + strings.Repeat("f", 64)
+	current.Observations = append(current.Observations, observatory.Observation{
+		Kind: "network", Operation: "connect", Subject: "93.184.216.34:443", Outcome: "succeeded", Role: "external", ExerciseCount: 1, DeltaCount: 1,
+	})
+	inputPath := filepath.Join(dir, "current.json")
+	writeEvidenceFile(t, inputPath, current)
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+	site := filepath.Join(dir, "site")
+
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"render", "--input", inputPath, "--output", site, "--auto-previous", "--config", configPath}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("render --auto-previous: %v (stderr=%s)", err, stderr.String())
+	}
+	html, err := os.ReadFile(filepath.Join(site, "index.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.ToUpper(string(html))
+	if !strings.Contains(text, "VERSION DELTA") || !strings.Contains(text, "93.184.216.34:443") {
+		t.Fatalf("rendered site missing auto-selected version delta: %s", html)
+	}
+}
+
+func TestRenderAutoPreviousRendersCurrentOnlyWithoutPredecessor(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("secure site rendering requires Linux")
+	}
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	if _, err := observatory.OpenHistoryStore(artifactsDir); err != nil {
+		t.Fatal(err)
+	}
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	inputPath := filepath.Join(dir, "current.json")
+	writeEvidenceFile(t, inputPath, current)
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+	site := filepath.Join(dir, "site")
+
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"render", "--input", inputPath, "--output", site, "--auto-previous", "--config", configPath}, &stdout, &stderr); err != nil {
+		t.Fatalf("render --auto-previous: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "no comparable predecessor") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(site, "index.html")); err != nil {
+		t.Fatalf("current-only site not rendered: %v", err)
+	}
+}
+
+func TestRenderAutoPreviousFailsClosedOnCorruptHistory(t *testing.T) {
+	dir := t.TempDir()
+	artifactsDir := filepath.Join(dir, "artifacts")
+	store, err := observatory.OpenHistoryStore(artifactsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Record(cliEvidence("obs_prev", "2026-07-10T12:00:00Z"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactsDir, "history", "index.json"), []byte("{ broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current := cliEvidence("obs_cur", "2026-07-11T12:00:00Z")
+	inputPath := filepath.Join(dir, "current.json")
+	writeEvidenceFile(t, inputPath, current)
+	configPath := writeHistoryConfig(t, dir, artifactsDir)
+
+	var stdout, stderr bytes.Buffer
+	err = run(context.Background(), []string{"render", "--input", inputPath, "--output", filepath.Join(dir, "site"), "--auto-previous", "--config", configPath}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "corrupt history") {
+		t.Fatalf("expected corrupt-history failure, err = %v", err)
+	}
+}
+
+func TestRenderRejectsPreviousWithAutoPrevious(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"render", "--input", "x.json", "--output", "site", "--previous", "y.json", "--auto-previous"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestScanRejectsMissingTarget(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"scan"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "usage: observatory scan") {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "--no-history") {
+		t.Fatalf("scan usage does not document history flags: %v", err)
+	}
+}
+
+func TestRenderRequiresInputAndOutput(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run(context.Background(), []string{"render", "--auto-previous"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "usage: observatory render") {
+		t.Fatalf("err = %v", err)
 	}
 }

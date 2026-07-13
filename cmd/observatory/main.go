@@ -16,6 +16,10 @@ import (
 
 var version = "dev"
 
+// scanFn is the scan entrypoint, overridable in tests so the history side
+// channel can be exercised without provisioning a real isolated runner.
+var scanFn = observatory.Scan
+
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -38,7 +42,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 	case "analyze":
 		return runAnalyze(args[1:], stdout, stderr)
 	case "render":
-		return runRender(args[1:], stdout)
+		return runRender(args[1:], stdout, stderr)
 	case "grade":
 		return runGrade(args[1:], stdout)
 	case "validate-config":
@@ -55,17 +59,23 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	output := flags.String("output", "", "write evidence JSON to a file")
 	gradeOutput := flags.String("grade-output", "", "write the derived grade JSON to a file")
 	jsonOutput := flags.Bool("json", false, "write evidence JSON to stdout")
+	site := flags.String("site", "", "render a self-contained site, auto-including the latest comparable predecessor delta")
+	deltaOutput := flags.String("delta", "", "write a structured version delta JSON when a comparable predecessor exists")
+	noHistory := flags.Bool("no-history", false, "do not record this scan in local history or compute a version delta")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 1 {
-		return errors.New("usage: observatory scan [--config path] [--json] [--grade-output path] <target>")
+		return errors.New("usage: observatory scan [--config path] [--json] [--grade-output path] [--site dir] [--delta path] [--no-history] <target>")
+	}
+	if *noHistory && *deltaOutput != "" {
+		return errors.New("--delta cannot be combined with --no-history: a version delta requires local history")
 	}
 	config, err := observatory.LoadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	result, err := observatory.Scan(ctx, flags.Arg(0), config, nil)
+	result, err := scanFn(ctx, flags.Arg(0), config, nil)
 	hasEvidence := result.Evidence.SchemaVersion != ""
 	evidenceOutput := ""
 	if hasEvidence {
@@ -89,7 +99,84 @@ func runScan(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	if result.RunDirectory != "" {
 		fmt.Fprintf(stderr, "run_directory: %s\n", result.RunDirectory)
 	}
+	if hasEvidence {
+		if diffErr := recordAndDiff(config, result.Evidence, *site, *deltaOutput, *noHistory, stderr); diffErr != nil {
+			return errors.Join(err, diffErr)
+		}
+	}
 	return err
+}
+
+// recordAndDiff runs the hands-off local-history workflow as a side channel: it
+// records the completed capture, selects the latest strictly comparable
+// predecessor, and renders or emits the version delta. It never writes to stdout
+// so the evidence JSON contract with the Clawscan adapter is preserved; the
+// caller emits evidence before invoking this so a fail-closed history error
+// never suppresses valid current evidence.
+//
+// When history is enabled, unexpected failures (store unavailable, corrupt
+// index or snapshot, failed selection or recording, or an unexpected
+// comparison error) fail closed by returning an error. Only clean cases degrade
+// with a diagnostic: no comparable predecessor, no stable identity, an
+// incomplete capture, or history explicitly disabled.
+func recordAndDiff(config observatory.Config, evidence observatory.Evidence, sitePath string, deltaPath string, noHistory bool, stderr io.Writer) error {
+	if noHistory || !config.HistoryEnabled() {
+		if deltaPath != "" {
+			return errors.New("--delta requires history to be enabled")
+		}
+		return renderSiteIfRequested(sitePath, evidence, nil, stderr)
+	}
+	store, err := observatory.OpenHistoryStore(config.ArtifactsDir)
+	if err != nil {
+		return fmt.Errorf("history unavailable: %w", err)
+	}
+	// Select before recording so the current run is never its own predecessor.
+	previous, err := store.LatestComparable(evidence)
+	if err != nil {
+		return fmt.Errorf("version delta unavailable: %w", err)
+	}
+	recorded := true
+	if recErr := store.Record(evidence, config.HistoryMaxPerIdentity()); recErr != nil {
+		switch {
+		case errors.Is(recErr, observatory.ErrHistoryNoStableIdentity):
+			recorded = false
+			fmt.Fprintln(stderr, "history: target has no stable lineage/plugin ID; version diffs disabled")
+		case errors.Is(recErr, observatory.ErrHistoryIncompleteCapture):
+			recorded = false
+			fmt.Fprintln(stderr, "history: incomplete capture not recorded")
+		default:
+			return fmt.Errorf("history record failed: %w", recErr)
+		}
+	}
+	if previous == nil {
+		if recorded {
+			fmt.Fprintln(stderr, "version delta: no comparable predecessor in local history")
+		}
+		return renderSiteIfRequested(sitePath, evidence, nil, stderr)
+	}
+	delta, err := observatory.ComputeVersionDelta(*previous, evidence)
+	if err != nil {
+		return fmt.Errorf("version delta unavailable: %w", err)
+	}
+	if deltaPath != "" {
+		if err := writeVersionDelta(deltaPath, delta); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "version delta written: %s\n", deltaPath)
+	}
+	fmt.Fprintf(stderr, "version delta: %d change(s) vs prior run %s\n", len(delta.Changes), previous.Run.ID)
+	return renderSiteIfRequested(sitePath, evidence, previous, stderr)
+}
+
+func renderSiteIfRequested(sitePath string, evidence observatory.Evidence, previous *observatory.Evidence, stderr io.Writer) error {
+	if sitePath == "" {
+		return nil
+	}
+	if err := observatory.RenderSite(sitePath, evidence, previous); err != nil {
+		return err
+	}
+	fmt.Fprintf(stderr, "site: %s\n", filepath.Join(sitePath, "index.html"))
+	return nil
 }
 
 func runAnalyze(args []string, stdout io.Writer, stderr io.Writer) error {
@@ -152,24 +239,37 @@ func runGrade(args []string, stdout io.Writer) error {
 	}
 	return encodeJSON(stdout, grade)
 }
-func runRender(args []string, stdout io.Writer) error {
+
+func runRender(args []string, stdout io.Writer, stderr io.Writer) error {
 	flags := flag.NewFlagSet("render", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	input := flags.String("input", "", "Observatory or Clawscan evidence JSON")
 	previousPath := flags.String("previous", "", "optional previous evidence JSON")
+	autoPrevious := flags.Bool("auto-previous", false, "select the latest comparable predecessor from local history")
+	configPath := flags.String("config", "", "Observatory config used to locate local history for --auto-previous")
 	output := flags.String("output", "", "static site output directory")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *input == "" || *output == "" {
-		return errors.New("usage: observatory render --input evidence.json --output site [--previous evidence.json]")
+		return errors.New("usage: observatory render --input evidence.json --output site [--previous evidence.json | --auto-previous --config path]")
+	}
+	if *autoPrevious && *previousPath != "" {
+		return errors.New("--previous and --auto-previous are mutually exclusive")
 	}
 	evidence, err := observatory.LoadEvidence(*input)
 	if err != nil {
 		return err
 	}
 	var previous *observatory.Evidence
-	if *previousPath != "" {
+	switch {
+	case *autoPrevious:
+		selected, err := selectHistoryPredecessor(*configPath, evidence, stderr)
+		if err != nil {
+			return err
+		}
+		previous = selected
+	case *previousPath != "":
 		loaded, err := observatory.LoadEvidence(*previousPath)
 		if err != nil {
 			return err
@@ -181,6 +281,51 @@ func runRender(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout, filepath.Join(*output, "index.html"))
 	return nil
+}
+
+// selectHistoryPredecessor resolves the latest strictly comparable predecessor
+// for evidence from the configured local history. It fails closed loudly on
+// corrupt history because the operator asked for the diff explicitly.
+func selectHistoryPredecessor(configPath string, evidence observatory.Evidence, stderr io.Writer) (*observatory.Evidence, error) {
+	path := strings.TrimSpace(configPath)
+	if path == "" {
+		path = defaultConfigPath()
+	}
+	config, err := observatory.LoadConfig(path)
+	if err != nil {
+		return nil, err
+	}
+	if !config.HistoryEnabled() {
+		return nil, errors.New("--auto-previous requires history.enabled in the config")
+	}
+	store, err := observatory.OpenHistoryStore(config.ArtifactsDir)
+	if err != nil {
+		return nil, err
+	}
+	previous, err := store.LatestComparable(evidence)
+	if err != nil {
+		return nil, err
+	}
+	if previous == nil {
+		fmt.Fprintln(stderr, "no comparable predecessor in local history; rendering current evidence only")
+	}
+	return previous, nil
+}
+
+func writeVersionDelta(path string, delta observatory.VersionDelta) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	encodeErr := encodeJSON(file, delta)
+	closeErr := file.Close()
+	if encodeErr != nil {
+		return encodeErr
+	}
+	return closeErr
 }
 
 func runValidateConfig(args []string, stdout io.Writer) error {
@@ -276,11 +421,16 @@ func encodeJSON(writer io.Writer, value any) error {
 const helpText = `ClawHub Observatory — paired behavioral evidence for OpenClaw targets
 
 Usage:
-  observatory scan [--config path] [--json] [--grade-output path] <target>
+  observatory scan [--config path] [--json] [--grade-output path] [--site dir] [--delta path] [--no-history] <target>
   observatory analyze --config path --bundle raw.tar.gz [--json] [--grade-output path] <target>
   observatory grade --input evidence.json [--output grade.json]
-  observatory render --input evidence.json --output site [--previous evidence.json]
+  observatory render --input evidence.json --output site [--previous evidence.json | --auto-previous --config path]
   observatory validate-config [--live] <config>
+
+A normal scan records its completed evidence in a bounded local history and,
+when a strictly comparable prior release exists, renders (--site) or emits
+(--delta) an evidence-based version delta. History is never fetched from the
+network; incomparable or corrupt history fails closed by omitting the delta.
 
 The behavior evidence is observation, never a safety verdict. A scan also returns
 a deterministic behavioral grade (observatory.grade.v2) derived from that

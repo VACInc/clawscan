@@ -96,3 +96,13 @@ limits:
   maxMemoryBytes: 2147483648
   cpuQuotaPercent: 200
   maxTasks: 256
+
+history:
+  # Local version-diff history is on by default; set enabled: false to opt out.
+  # It never fetches versions or targets from the network.
+  enabled: true
+  # Bounded high cap on snapshots kept per stable lineage/plugin ID. History is
+  # append-only: prior snapshots are never deleted or overwritten. When the cap
+  # is reached, recording a new run fails closed instead of pruning; prune the
+  # private history store manually if you intend to keep going.
+  maxPerIdentity: 1000

@@ -184,6 +184,15 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
    full evidence digest, reports typed-channel coverage, fails closed on missing,
    malformed, or truncated mandatory inputs, and requires confirmed residual
    evidence before persistence can receive F. See `docs/observatory.md`.
-3. Add version-keyed storage and update diffs.
+3. Version-keyed storage and update diffs are delivered as a hands-off local
+   history: `scan` records completed evidence in a bounded, append-only,
+   per-identity store and selects the latest strictly comparable predecessor to
+   render or emit an evidence-based `observatory.version-delta.v1` document.
+   Selection is offline only, excludes the current run, and reserves a
+   nil-by-default grade seam. Prior snapshots are never deleted or overwritten;
+   the per-identity cap fails a new record closed instead of pruning, and
+   unexpected or corrupt history fails the workflow closed without suppressing
+   the valid current evidence. Network catalog-driven version discovery stays
+   out of scope (see item 4).
 4. Add catalog watching, bounded concurrency, retry policy, and private moderation routing.
 5. Publish a small pilot, then propose the adapter upstream with copied real-behavior proof.

@@ -43,6 +43,7 @@ type Config struct {
 	Exercise      ExerciseConfig  `yaml:"exercise"`
 	Redirect      RedirectConfig  `yaml:"redirect"`
 	Limits        LimitsConfig    `yaml:"limits"`
+	History       HistoryConfig   `yaml:"history"`
 }
 
 type ExecutorConfig struct {
@@ -110,6 +111,36 @@ type LimitsConfig struct {
 	MaxMemoryBytes int64 `yaml:"maxMemoryBytes"`
 	CPUQuotaPct    int   `yaml:"cpuQuotaPercent"`
 	MaxTasks       int   `yaml:"maxTasks"`
+}
+
+// HistoryConfig governs the local version-diff history store. It is
+// orchestration metadata only and is deliberately excluded from the
+// capture-configuration digest so it never affects comparability.
+type HistoryConfig struct {
+	// Enabled defaults to true when omitted; set false to opt out of recording
+	// and automatic predecessor selection entirely.
+	Enabled *bool `yaml:"enabled"`
+	// MaxPerIdentity is a bounded high cap on how many evidence snapshots may be
+	// recorded per stable lineage/plugin identity. History is append-only: prior
+	// snapshots are never deleted or overwritten. When the cap is reached,
+	// recording a new run fails closed instead of pruning older entries. Zero
+	// selects the built-in default.
+	MaxPerIdentity int `yaml:"maxPerIdentity"`
+}
+
+// HistoryEnabled reports whether local version-diff history is active. History
+// is on by default; only an explicit history.enabled: false disables it.
+func (config Config) HistoryEnabled() bool {
+	return config.History.Enabled == nil || *config.History.Enabled
+}
+
+// HistoryMaxPerIdentity resolves the effective bounded cap, applying the
+// built-in default when the operator left it unset.
+func (config Config) HistoryMaxPerIdentity() int {
+	if config.History.MaxPerIdentity <= 0 {
+		return defaultHistoryMaxPerIdentity
+	}
+	return config.History.MaxPerIdentity
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -238,6 +269,9 @@ func (config *Config) applyDefaults() {
 	if config.Limits.MaxTasks == 0 {
 		config.Limits.MaxTasks = 256
 	}
+	if config.History.MaxPerIdentity == 0 {
+		config.History.MaxPerIdentity = defaultHistoryMaxPerIdentity
+	}
 	if config.ArtifactsDir == "" {
 		if cacheDir, err := os.UserCacheDir(); err == nil {
 			config.ArtifactsDir = filepath.Join(cacheDir, "clawhub-observatory", "runs")
@@ -343,6 +377,12 @@ func (config Config) Validate() error {
 	}
 	if config.Runtime.MockEgress.Enabled && config.Runtime.MockEgress.MaxTotalBytes*2+(1<<20) > config.Limits.MaxBundleBytes {
 		return errors.New("limits.maxBundleBytes must leave room for the controlled mock egress receipts (at least mockEgress.maxTotalBytes*2 + 1 MiB)")
+	}
+	// Zero means "use the built-in default"; anything outside the bound is a
+	// misconfiguration. The cap is intentionally high and finite: history is
+	// append-only, so a new record fails closed at the cap rather than pruning.
+	if config.History.MaxPerIdentity < 0 || config.History.MaxPerIdentity > maxHistoryMaxPerIdentity {
+		return fmt.Errorf("history.maxPerIdentity must be between 1 and %d", maxHistoryMaxPerIdentity)
 	}
 	return nil
 }
