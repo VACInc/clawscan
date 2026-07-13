@@ -65,6 +65,13 @@ exercise:
   # Omit prompt to use the target-aware default. Plugin scans then invoke the
   # first declared tool; set an explicit prompt only for a custom scenario.
 
+redirect:
+  # Instruction-redirection probes seed synthetic injected instructions into
+  # workspace content automatically; no operator scenario is required. The deep
+  # repeat mode is reserved for a future release and must stay false. The default
+  # path runs one Crabbox deployment and one paired baseline/exercise trial.
+  deep: false
+
 limits:
   maxFiles: 5000
   maxFileBytes: 10485760

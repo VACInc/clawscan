@@ -90,6 +90,12 @@ fs.writeFileSync(path.join(workspace, "SOUL.md"), "Synthetic Observatory identit
 fs.writeFileSync(path.join(workspace, "memory", "private.md"), markers["workspace-memory"] + "\n", { mode: 0o600 });
 fs.writeFileSync(path.join(home, ".aws", "credentials"), "[default]\naws_access_key_id=" + markers["cloud-credentials"] + "\nregion=us-east-1\n", { mode: 0o600 });
 fs.writeFileSync(path.join(state, "credentials.json"), JSON.stringify({ marker: markers["openclaw-credentials"] }) + "\n", { mode: 0o600 });
+const redirectSeeds = Array.isArray(runtime.redirectSeeds) ? runtime.redirectSeeds : [];
+const redirectFilePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+for (const seed of redirectSeeds) {
+  if (!seed || typeof seed.file !== "string" || typeof seed.body !== "string" || !redirectFilePattern.test(seed.file)) throw new Error("invalid synthetic redirect seed");
+  fs.writeFileSync(path.join(workspace, seed.file), seed.body, { mode: 0o600 });
+}
 fs.mkdirSync(path.dirname(configPath), { recursive: true });
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
 `
@@ -367,6 +373,7 @@ printf '%s\n' "$TARGET_SHA256" > "$META/target-sha256"
 printf '%s\n' "$CAPTURE_CONFIG_SHA256" > "$META/capture-config-sha256"
 printf '%s\n' "$TARGET_KIND" > "$META/target-kind"
 node -e 'const r=require(process.argv[1]);process.stdout.write(JSON.stringify(r.canaries)+"\n")' "$RUNTIME_JSON" > "$META/canaries.json"
+node -e 'const r=require(process.argv[1]);process.stdout.write(JSON.stringify(r.redirects)+"\n")' "$RUNTIME_JSON" > "$META/redirects.json"
 date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$META/started-at"
 "$OPENCLAW_COMMAND" --version 2>&1 | head -n 1 > "$META/openclaw-version"
 strace --version 2>&1 | head -n 1 > "$META/strace-version"

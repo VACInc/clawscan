@@ -108,10 +108,25 @@ Top-level sections:
   that distinguish attempted-but-denied persistence operations from successful
   residual changes confirmed by a before/after lane inventory; no reboot cycle,
   no verdict, and no claim of exhaustive host persistence detection;
+- `redirectProbes`: per-probe instruction-redirection escalation. Observatory
+  seeds a bounded, fixed set of synthetic injected-instruction markers into
+  workspace content and deterministically exposes them by augmenting every
+  effective lane prompt (shared by both lanes) with a neutral read instruction. It
+  reports paired baseline/exercise counts for three tiers — `read`, `repeated`,
+  and `deviated` — plus the highest tier reached (`escalation`), the highest tier
+  attributable over baseline (`attributed`), and an `exercised` flag that is true
+  only when the exercise lane actually read the seeded file. Sentinel actions are
+  harmless (a reserved TEST-NET endpoint or a synthetic sentinel file) and cannot
+  reach a real service. A read or repeat is never treated as prompt injection; only
+  a positive `deviatedDelta` is;
 - `coverage`: captured syscall families, an explicit `selected-mvp-syscalls`
-  scope (never an exhaustive Linux-audit claim), and concrete limitations.
+  scope (never an exhaustive Linux-audit claim), the redirect probe scope/count,
+  the count of probes actually exercised (`redirectProbesExercised`; a missing
+  read lowers coverage rather than implying resistance), the redirect deep-mode
+  flag, and concrete limitations.
 
 The schema deliberately has no verdict, severity, score, or recommendation field.
+Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 
 ## MVP acceptance criteria
 

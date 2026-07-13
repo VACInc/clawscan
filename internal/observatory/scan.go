@@ -287,24 +287,28 @@ func verifyCaptureConfig(metadata CaptureMetadata, config Config) error {
 	return nil
 }
 
+// effectiveConfigForTarget resolves the base exercise prompt (target-aware
+// default or operator-supplied custom) and then augments every path exactly once
+// with the probe-exposure instruction. Both lanes share this single effective
+// prompt, so seeding stays exercised without breaking baseline subtraction, and
+// the augmented prompt is bound through captureConfigSHA256 and PromptSHA256.
 func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, error) {
-	if config.Exercise.Prompt != DefaultExercisePrompt {
-		return config, nil
+	base := config.Exercise.Prompt
+	if base == DefaultExercisePrompt {
+		switch target.Kind {
+		case "skill":
+			base = strings.Replace(DefaultExercisePrompt, `"observed"`, fmt.Sprintf("%q", target.ID), 1)
+		case "plugin":
+			if len(target.DeclaredTools) == 0 {
+				return Config{}, errors.New("plugin targets without a declared tool require an explicit exercise.prompt")
+			}
+			base = fmt.Sprintf(
+				`Invoke the installed plugin tool %q exactly once with harmless synthetic input. Use only synthetic files in this workspace. Do not contact people, make purchases, authenticate to real services, or request real credentials. Stop after that tool call and briefly report whether it completed.`,
+				target.DeclaredTools[0],
+			)
+		}
 	}
-	if target.Kind == "skill" {
-		config.Exercise.Prompt = strings.Replace(DefaultExercisePrompt, `"observed"`, fmt.Sprintf("%q", target.ID), 1)
-		return config, nil
-	}
-	if target.Kind != "plugin" {
-		return config, nil
-	}
-	if len(target.DeclaredTools) == 0 {
-		return Config{}, errors.New("plugin targets without a declared tool require an explicit exercise.prompt")
-	}
-	config.Exercise.Prompt = fmt.Sprintf(
-		`Invoke the installed plugin tool %q exactly once with harmless synthetic input. Use only synthetic files in this workspace. Do not contact people, make purchases, authenticate to real services, or request real credentials. Stop after that tool call and briefly report whether it completed.`,
-		target.DeclaredTools[0],
-	)
+	config.Exercise.Prompt = augmentPromptWithProbeExposure(base)
 	return config, nil
 }
 
@@ -313,7 +317,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // version comparisons cannot mix evidence produced by different protocols. It
 // embeds PersistenceProtocolRevision so a change to the persistence surface
 // catalog or before/after inventory semantics also invalidates stale receipts.
-const CaptureProtocolRevision = "observatory.capture-protocol.v15+" + PersistenceProtocolRevision
+const CaptureProtocolRevision = "observatory.capture-protocol.v16+" + PersistenceProtocolRevision
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -327,6 +331,7 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 		Isolation               IsolationConfig `json:"isolation"`
 		Runtime                 RuntimeConfig   `json:"runtime"`
 		Exercise                ExerciseConfig  `json:"exercise"`
+		Redirect                RedirectConfig  `json:"redirect"`
 		Limits                  LimitsConfig    `json:"limits"`
 	}{
 		CaptureProtocolRevision: protocolRevision,
@@ -335,6 +340,7 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 		Isolation:               config.Isolation,
 		Runtime:                 config.Runtime,
 		Exercise:                config.Exercise,
+		Redirect:                config.Redirect,
 		Limits:                  config.Limits,
 	}
 	data, err := json.Marshal(binding)
@@ -392,6 +398,14 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err != nil {
 		return fmt.Errorf("generate private canary markers: %w", err)
 	}
+	redirectMarkers, err := newRedirectMarkers()
+	if err != nil {
+		return fmt.Errorf("generate synthetic redirect markers: %w", err)
+	}
+	redirectSeedFiles, err := redirectSeeds(redirectMarkers)
+	if err != nil {
+		return fmt.Errorf("render synthetic redirect seeds: %w", err)
+	}
 	runtime := map[string]any{
 		"runId":               runID,
 		"targetSha256":        target.SHA256,
@@ -411,6 +425,8 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"mockEgress":          mockEgressRuntime(config.Runtime.MockEgress, config.Runtime.TimeoutSeconds),
 		"firewallTable":       "observatory_" + runID,
 		"canaries":            canaries,
+		"redirects":           redirectMarkers,
+		"redirectSeeds":       redirectSeedFiles,
 		"model": map[string]any{
 			"provider":      config.Runtime.Model.Provider,
 			"baseUrl":       config.Runtime.Model.BaseURL,
