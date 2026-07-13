@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -27,6 +28,23 @@ type CommandExecutor interface {
 }
 
 type OSCommandExecutor struct{}
+
+func writeExclusiveFile(path string, data []byte, mode os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	written, err := file.Write(data)
+	if err != nil {
+		file.Close()
+		return err
+	}
+	if written != len(data) {
+		file.Close()
+		return io.ErrShortWrite
+	}
+	return file.Close()
+}
 
 func (OSCommandExecutor) Run(ctx context.Context, command string, args []string, cwd string, env map[string]string, timeout time.Duration) (CommandResult, error) {
 	runCtx := ctx
@@ -90,6 +108,9 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("resolve artifactsDir: %w", err)
 	}
+	if err := validateTLSArtifactsPath(artifactsRoot); err != nil {
+		return ScanResult{}, err
+	}
 	targetRoot, err := filepath.EvalSymlinks(targetPath)
 	if err != nil {
 		return ScanResult{}, fmt.Errorf("resolve behavior target root: %w", err)
@@ -104,7 +125,7 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err != nil {
 		return ScanResult{}, err
 	}
-	runDir := filepath.Join(config.ArtifactsDir, runID)
+	runDir := filepath.Join(artifactsRoot, runID)
 	if err := os.MkdirAll(filepath.Dir(runDir), 0o700); err != nil {
 		return ScanResult{}, fmt.Errorf("create artifacts parent: %w", err)
 	}
@@ -123,6 +144,19 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err != nil {
 		return ScanResult{}, err
 	}
+	pinnedCAFile := filepath.Join(runDir, "proxmox-ca.pem")
+	caData, _, err := readAndValidateTLSCAFile(effectiveConfig.Executor.TLSCAFile, proxmoxAPIHostname(effectiveConfig.Executor.CrabboxConfig))
+	if err != nil {
+		return ScanResult{}, err
+	}
+	if err := writeExclusiveFile(pinnedCAFile, caData, 0o600); err != nil {
+		return ScanResult{}, fmt.Errorf("pin Proxmox TLS CA for run: %w", err)
+	}
+	pinnedCADirectory := filepath.Join(runDir, "proxmox-ca.d")
+	if err := os.Mkdir(pinnedCADirectory, 0o500); err != nil {
+		return ScanResult{}, fmt.Errorf("create empty Proxmox TLS CA directory: %w", err)
+	}
+	effectiveConfig.Executor.TLSCAFile = pinnedCAFile
 	if err := writeRuntimeFiles(stageDir, effectiveConfig, runID, staged.Evidence); err != nil {
 		return ScanResult{}, err
 	}
@@ -146,9 +180,19 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 		"--download", ".observatory/raw.tar.gz=" + bundlePath,
 	}
 	timeout := time.Duration(effectiveConfig.Runtime.TimeoutSeconds*2+300) * time.Second
-	commandEnvironment := map[string]string{"CRABBOX_CONFIG": effectiveConfig.Executor.CrabboxConfig}
+	commandEnvironment := map[string]string{
+		"CRABBOX_CONFIG": effectiveConfig.Executor.CrabboxConfig,
+	}
 	if effectiveConfig.Executor.CrabboxBinary != "" {
-		commandEnvironment["CRABBOX_BIN"] = effectiveConfig.Executor.CrabboxBinary
+		shimPath := filepath.Join(runDir, "crabbox-tls-shim")
+		if err := writeCrabboxTLSShim(shimPath, effectiveConfig.Executor.CrabboxBinary, effectiveConfig.Executor.TLSCAFile, pinnedCADirectory); err != nil {
+			return ScanResult{RunDirectory: runDir}, err
+		}
+		commandEnvironment["CRABBOX_BIN"] = shimPath
+	} else {
+		commandEnvironment["CRABBOX_PROXMOX_INSECURE_TLS"] = "0"
+		commandEnvironment["SSL_CERT_FILE"] = effectiveConfig.Executor.TLSCAFile
+		commandEnvironment["SSL_CERT_DIR"] = pinnedCADirectory
 	}
 	commandResult, runErr := executor.Run(ctx, effectiveConfig.Executor.Command, args, stageDir, commandEnvironment, timeout)
 	if err := os.WriteFile(filepath.Join(runDir, "crabbox.stdout"), []byte(commandResult.Stdout), 0o600); err != nil {
@@ -173,7 +217,10 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
-	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	evidence, err := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	if err != nil {
+		return ScanResult{RunDirectory: runDir}, err
+	}
 	if err := ValidateEvidence(evidence); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
@@ -193,6 +240,22 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 		return result, errors.Join(completionErrors...)
 	}
 	return result, nil
+}
+
+func writeCrabboxTLSShim(path string, crabboxBinary string, caFile string, caDirectory string) error {
+	script := "#!/bin/sh\n" +
+		"export CRABBOX_PROXMOX_INSECURE_TLS=0\n" +
+		"export SSL_CERT_FILE=" + shellSingleQuote(caFile) + "\n" +
+		"export SSL_CERT_DIR=" + shellSingleQuote(caDirectory) + "\n" +
+		"exec " + shellSingleQuote(crabboxBinary) + " \"$@\"\n"
+	if err := writeExclusiveFile(path, []byte(script), 0o700); err != nil {
+		return fmt.Errorf("write process-local Crabbox TLS shim: %w", err)
+	}
+	return nil
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func resolvePathWithExistingAncestor(value string) (string, error) {
@@ -249,7 +312,10 @@ func AnalyzeBundle(target string, config Config, bundlePath string) (Evidence, e
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return Evidence{}, err
 	}
-	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	evidence, err := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	if err != nil {
+		return Evidence{}, err
+	}
 	if err := ValidateEvidence(evidence); err != nil {
 		return Evidence{}, err
 	}
@@ -274,7 +340,10 @@ func verifyCaptureTarget(metadata CaptureMetadata, target TargetEvidence) error 
 }
 
 func verifyCaptureConfig(metadata CaptureMetadata, config Config) error {
-	expected := captureConfigSHA256(config)
+	expected, err := captureConfigSHA256(config)
+	if err != nil {
+		return err
+	}
 	if metadata.CaptureConfigSHA != expected {
 		return fmt.Errorf("capture configuration digest mismatch: bundle records %q, analysis config is %q", metadata.CaptureConfigSHA, expected)
 	}
@@ -305,17 +374,26 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v14"
+const CaptureProtocolRevision = "observatory.capture-protocol.v15"
 
-func captureConfigSHA256(config Config) string {
+func captureConfigSHA256(config Config) (string, error) {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
 }
 
-func captureConfigSHA256ForProtocol(config Config, protocolRevision string) string {
+func captureConfigSHA256ForProtocol(config Config, protocolRevision string) (string, error) {
+	_, tlsCASHA256, err := readAndValidateTLSCAFile(config.Executor.TLSCAFile, proxmoxAPIHostname(config.Executor.CrabboxConfig))
+	if err != nil {
+		return "", err
+	}
+	return captureConfigSHA256WithTLSCA(config, protocolRevision, tlsCASHA256)
+}
+
+func captureConfigSHA256WithTLSCA(config Config, protocolRevision string, tlsCASHA256 string) (string, error) {
 	binding := struct {
 		CaptureProtocolRevision string          `json:"captureProtocolRevision"`
 		TargetLineage           string          `json:"targetLineage"`
 		ExecutorKind            string          `json:"executorKind"`
+		ProxmoxTLSCASHA256      string          `json:"proxmoxTlsCaSha256"`
 		Isolation               IsolationConfig `json:"isolation"`
 		Runtime                 RuntimeConfig   `json:"runtime"`
 		Exercise                ExerciseConfig  `json:"exercise"`
@@ -324,6 +402,7 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 		CaptureProtocolRevision: protocolRevision,
 		TargetLineage:           config.TargetLineage,
 		ExecutorKind:            config.Executor.Kind,
+		ProxmoxTLSCASHA256:      tlsCASHA256,
 		Isolation:               config.Isolation,
 		Runtime:                 config.Runtime,
 		Exercise:                config.Exercise,
@@ -331,9 +410,9 @@ func captureConfigSHA256ForProtocol(config Config, protocolRevision string) stri
 	}
 	data, err := json.Marshal(binding)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-	return digestBytes(data)
+	return digestBytes(data), nil
 }
 
 func initializeStageRepository(ctx context.Context, stageDir string) error {
@@ -384,12 +463,16 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err != nil {
 		return fmt.Errorf("generate private canary markers: %w", err)
 	}
+	captureConfigSHA, err := captureConfigSHA256(config)
+	if err != nil {
+		return err
+	}
 	runtime := map[string]any{
 		"runId":               runID,
 		"targetSha256":        target.SHA256,
 		"targetKind":          target.Kind,
 		"targetId":            target.ID,
-		"captureConfigSha256": captureConfigSHA256(config),
+		"captureConfigSha256": captureConfigSHA,
 		"openclawCommand":     config.Runtime.OpenClawCommand,
 		"agentUser":           config.Runtime.AgentUser,
 		"timeoutSeconds":      config.Runtime.TimeoutSeconds,

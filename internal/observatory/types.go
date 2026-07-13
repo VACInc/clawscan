@@ -9,7 +9,8 @@ import (
 	"time"
 )
 
-const EvidenceSchemaVersion = "observatory.behavior.v1"
+const LegacyEvidenceSchemaVersion = "observatory.behavior.v1"
+const EvidenceSchemaVersion = "observatory.behavior.v2"
 const MaxEvidenceBytes = 64 << 20
 
 type Evidence struct {
@@ -73,6 +74,7 @@ type IsolationEvidence struct {
 	ContainmentProfile        string `json:"containmentProfile"`
 	GuestFirewallSHA256       string `json:"guestFirewallSha256"`
 	GuestFirewallPolicySHA256 string `json:"guestFirewallPolicySha256"`
+	ProxmoxTLSCASHA256        string `json:"proxmoxTlsCaSha256,omitempty"`
 	Verification              string `json:"verification"`
 }
 
@@ -154,7 +156,7 @@ type CanaryDefinition struct {
 }
 
 func ValidateEvidence(evidence Evidence) error {
-	if evidence.SchemaVersion != EvidenceSchemaVersion {
+	if evidence.SchemaVersion != EvidenceSchemaVersion && evidence.SchemaVersion != LegacyEvidenceSchemaVersion {
 		return fmt.Errorf("unsupported evidence schema: %s", evidence.SchemaVersion)
 	}
 	if !isSHA256Digest(evidence.CaptureConfigSHA256) {
@@ -209,6 +211,9 @@ func ValidateEvidence(evidence Evidence) error {
 	}
 	if strings.TrimSpace(evidence.Run.Isolation.Substrate) == "" || strings.TrimSpace(evidence.Run.Isolation.NetworkMode) == "" || strings.TrimSpace(evidence.Run.Isolation.ContainmentProfile) == "" || !isSHA256Digest(evidence.Run.Isolation.GuestFirewallSHA256) || !isSHA256Digest(evidence.Run.Isolation.GuestFirewallPolicySHA256) || strings.TrimSpace(evidence.Run.Isolation.Verification) == "" {
 		return errors.New("evidence isolation receipt is incomplete")
+	}
+	if evidence.SchemaVersion == EvidenceSchemaVersion && !isSHA256Digest(evidence.Run.Isolation.ProxmoxTLSCASHA256) {
+		return errors.New("evidence verified TLS receipt is incomplete")
 	}
 	if strings.TrimSpace(evidence.Run.Runtime.OpenClawVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.StraceVersion) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelProvider) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelID) == "" || strings.TrimSpace(evidence.Run.Runtime.ModelEndpoint) == "" {
 		return errors.New("evidence runtime receipt is incomplete")

@@ -5,9 +5,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +60,7 @@ runtime:
 	config.Isolation = validIsolationConfig()
 	config.Runtime.ControlPlaneAddresses = []string{"10.0.0.2:8000"}
 	config.Executor.CrabboxConfig = filepath.Join(dir, "crabbox.yml")
+	config.Executor.TLSCAFile = writeTestCA(t, dir, "proxmox-ca.pem")
 	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(testCrabboxConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -69,10 +76,10 @@ runtime:
 	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(testCrabboxConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(strings.Replace(testCrabboxConfig, "  node:", "  insecureTLS: true\n  node:", 1)), 0o600); err != nil {
+	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(strings.Replace(testCrabboxConfig, "  insecureTLS: false", "  insecureTLS: true", 1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "insecureTLS must be false") {
+	if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "insecureTLS: false") {
 		t.Fatalf("insecure Proxmox TLS err = %v", err)
 	}
 	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(testCrabboxConfig), 0o600); err != nil {
@@ -192,11 +199,13 @@ executor:
   command: ./wrapper
   crabboxBinary: ./crabbox-bin
   crabboxConfig: ./crabbox.yml
+  tlsCAFile: ./proxmox-ca.pem
 runtime:
   model:
     baseUrl: http://127.0.0.1:8000/v1
     id: fixture
 `
+	writeTestCA(t, dir, "proxmox-ca.pem")
 	if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +218,7 @@ runtime:
 		"command":   config.Executor.Command,
 		"binary":    config.Executor.CrabboxBinary,
 		"config":    config.Executor.CrabboxConfig,
+		"tls ca":    config.Executor.TLSCAFile,
 	} {
 		if !filepath.IsAbs(got) || filepath.Dir(got) != dir {
 			t.Fatalf("%s path = %q", name, got)
@@ -217,7 +227,7 @@ runtime:
 }
 
 func TestExecutorEnvironmentDropsAmbientCredentials(t *testing.T) {
-	for _, key := range []string{"AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "CRABBOX_PROXMOX_TOKEN_SECRET", "OPENAI_API_KEY"} {
+	for _, key := range []string{"AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "CRABBOX_PROXMOX_TOKEN_SECRET", "CRABBOX_PROXMOX_INSECURE_TLS", "SSL_CERT_FILE", "SSL_CERT_DIR", "GODEBUG", "OPENAI_API_KEY"} {
 		if commandEnvironmentAllowed(key) {
 			t.Fatalf("ambient credential %s was allowed", key)
 		}
@@ -226,6 +236,176 @@ func TestExecutorEnvironmentDropsAmbientCredentials(t *testing.T) {
 		if !commandEnvironmentAllowed(key) {
 			t.Fatalf("required local control-plane variable %s was blocked", key)
 		}
+	}
+}
+
+func TestOSExecutorForcesPinnedTLSAgainstAmbientOverrides(t *testing.T) {
+	t.Setenv("CRABBOX_PROXMOX_INSECURE_TLS", "1")
+	t.Setenv("SSL_CERT_FILE", "/ambient/ca.pem")
+	t.Setenv("SSL_CERT_DIR", "/ambient/certs")
+	command, err := exec.LookPath("env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := (OSCommandExecutor{}).Run(context.Background(), command, nil, t.TempDir(), map[string]string{
+		"CRABBOX_PROXMOX_INSECURE_TLS": "0",
+		"SSL_CERT_FILE":                "/run/observatory/proxmox-ca.pem",
+		"SSL_CERT_DIR":                 "/run/observatory/proxmox-ca.d",
+	}, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"CRABBOX_PROXMOX_INSECURE_TLS=0", "SSL_CERT_FILE=/run/observatory/proxmox-ca.pem", "SSL_CERT_DIR=/run/observatory/proxmox-ca.d"} {
+		if !strings.Contains(result.Stdout, required+"\n") {
+			t.Fatalf("executor environment missing %q:\n%s", required, result.Stdout)
+		}
+	}
+	for _, forbidden := range []string{"CRABBOX_PROXMOX_INSECURE_TLS=1", "SSL_CERT_FILE=/ambient/ca.pem", "SSL_CERT_DIR=/ambient/certs"} {
+		if strings.Contains(result.Stdout, forbidden) {
+			t.Fatalf("executor environment retained ambient override %q:\n%s", forbidden, result.Stdout)
+		}
+	}
+}
+
+func TestLiveTLSCAValidationFailsClosed(t *testing.T) {
+	requireLinuxControlHost(t)
+
+	t.Run("missing", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		config.Executor.TLSCAFile = ""
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "executor.tlsCAFile") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		config := validTestConfig(t, dir)
+		target := writeTestCA(t, dir, "target-ca.pem")
+		link := filepath.Join(dir, "linked-ca.pem")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		config.Executor.TLSCAFile = link
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "regular non-symlink") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("group writable", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		if err := os.Chmod(config.Executor.TLSCAFile, 0o620); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "writable by group/other") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("invalid PEM", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		if err := os.WriteFile(config.Executor.TLSCAFile, []byte("not a CA\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "PEM CERTIFICATE") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("leaf certificate", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		if err := os.WriteFile(config.Executor.TLSCAFile, testCertificatePEM(t, "leaf", false), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "must be a CA certificate") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("oversized", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		if err := os.WriteFile(config.Executor.TLSCAFile, bytes.Repeat([]byte("x"), maxTLSCAFileBytes+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "between 1 and") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("non verifiable API hostname", func(t *testing.T) {
+		config := validTestConfig(t, t.TempDir())
+		data := strings.Replace(testCrabboxConfig, "pve.fixture.invalid", "bad_host.invalid", 1)
+		if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "certificate-verifiable") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestLiveConfigRequiresPVEBridgeAndExplicitSecureTLS(t *testing.T) {
+	requireLinuxControlHost(t)
+	config := validTestConfig(t, t.TempDir())
+	config.Isolation.NetworkBridge = "vmbr-observatory"
+	if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "vmbr0 through vmbr9999") {
+		t.Fatalf("invalid bridge err = %v", err)
+	}
+
+	config = validTestConfig(t, t.TempDir())
+	withoutTLSSetting := strings.Replace(testCrabboxConfig, "  insecureTLS: false\n", "", 1)
+	if err := os.WriteFile(config.Executor.CrabboxConfig, []byte(withoutTLSSetting), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.ValidateLive(); err == nil || !strings.Contains(err.Error(), "insecureTLS: false") {
+		t.Fatalf("implicit TLS setting err = %v", err)
+	}
+}
+
+func TestPVEBridgeGrammar(t *testing.T) {
+	for name, valid := range map[string]bool{
+		"vmbr0": true, "vmbr1": true, "vmbr4094": true, "vmbr9999": true,
+		"vmbr": false, "vmbr00": false, "vmbr10000": false,
+		"vmbr-observatory": false, "br0": false,
+	} {
+		if got := validPVEBridge(name); got != valid {
+			t.Errorf("validPVEBridge(%q) = %v, want %v", name, got, valid)
+		}
+	}
+}
+
+func TestTLSCADigestBindsBytesNotPrivatePath(t *testing.T) {
+	dir := t.TempDir()
+	config := validTestConfig(t, dir)
+	originalData, err := os.ReadFile(config.Executor.TLSCAFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath := filepath.Join(dir, "same-ca-different-path.pem")
+	if err := os.WriteFile(secondPath, originalData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Executor.TLSCAFile = secondPath
+	sameBytes, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameBytes != original {
+		t.Fatal("capture digest binds private CA path instead of only its content digest")
+	}
+	if err := os.WriteFile(secondPath, testCAPEM(t, "rotated-ca"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated == original {
+		t.Fatal("capture digest does not bind CA bytes")
 	}
 }
 
@@ -823,7 +1003,37 @@ func TestScanStagesAndConsumesFixtureExecutorBundle(t *testing.T) {
 	if result.Evidence.Run.Status != "completed" || len(result.Evidence.Observations) == 0 {
 		t.Fatalf("evidence = %#v", result.Evidence)
 	}
+	if !isSHA256Digest(result.Evidence.Run.Isolation.ProxmoxTLSCASHA256) {
+		t.Fatalf("TLS CA receipt = %q", result.Evidence.Run.Isolation.ProxmoxTLSCASHA256)
+	}
+	evidenceJSON, err := json.Marshal(result.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caData, err := os.ReadFile(config.Executor.TLSCAFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, privateValue := range []string{config.Executor.TLSCAFile, string(caData)} {
+		if bytes.Contains(evidenceJSON, []byte(privateValue)) {
+			t.Fatal("evidence leaked the private TLS CA path or PEM bytes")
+		}
+	}
 	if _, err := os.Stat(filepath.Join(result.RunDirectory, "evidence.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScanScopesTLSOverridesToPinnedCrabboxChild(t *testing.T) {
+	requireLinuxControlHost(t)
+	command, err := exec.LookPath("env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := validTestConfig(t, t.TempDir())
+	config.Executor.CrabboxBinary = command
+	executor := &fixtureExecutor{t: t, expectWrapperShim: true}
+	if _, err := Scan(context.Background(), filepath.Join("..", "..", "testdata", "fixtures", "probe-skill"), config, executor); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -929,6 +1139,24 @@ func TestScanRejectsArtifactsDirectoryInsideTargetBeforeCreatingIt(t *testing.T)
 	}
 }
 
+func TestScanRejectsPathListSeparatorInResolvedArtifactsDirectory(t *testing.T) {
+	requireLinuxControlHost(t)
+	target := filepath.Join("..", "..", "testdata", "fixtures", "probe-skill")
+	config := validTestConfig(t, t.TempDir())
+	unsafeArtifactsDir := filepath.Join(t.TempDir(), "runs"+string(os.PathListSeparator)+"unrecorded-ca-directory")
+	config.ArtifactsDir = unsafeArtifactsDir
+	executor := &fixtureExecutor{t: t}
+	if _, err := Scan(context.Background(), target, config, executor); err == nil || !strings.Contains(err.Error(), "path-list separator") {
+		t.Fatalf("err = %v", err)
+	}
+	if executor.command != "" {
+		t.Fatalf("executor was called: %#v", executor)
+	}
+	if _, err := os.Stat(unsafeArtifactsDir); !os.IsNotExist(err) {
+		t.Fatalf("artifacts directory was created: %v", err)
+	}
+}
+
 func TestRenderSiteIsDarkAndShowsVersionDelta(t *testing.T) {
 	requireLinuxControlHost(t)
 	previous := fixtureEvidence()
@@ -1012,6 +1240,26 @@ func TestValidateEvidenceRejectsCompletedRunWithoutCompleteLanes(t *testing.T) {
 	evidence.Coverage.BaselinePaired = false
 	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "inconsistent with lane exits") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLegacyV1EvidenceRemainsReadableWithoutTLSReceipt(t *testing.T) {
+	evidence := fixtureEvidence()
+	evidence.SchemaVersion = LegacyEvidenceSchemaVersion
+	evidence.Run.Isolation.ProxmoxTLSCASHA256 = ""
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeEvidence(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SchemaVersion != LegacyEvidenceSchemaVersion {
+		t.Fatalf("legacy schema = %q", decoded.SchemaVersion)
 	}
 }
 
@@ -1222,7 +1470,11 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 
 func TestCaptureConfigurationBindingAndPluginPrompt(t *testing.T) {
 	config := validTestConfig(t, t.TempDir())
-	metadata := CaptureMetadata{CaptureConfigSHA: captureConfigSHA256(config)}
+	configSHA, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := CaptureMetadata{CaptureConfigSHA: configSHA}
 	if err := verifyCaptureConfig(metadata, config); err != nil {
 		t.Fatal(err)
 	}
@@ -1231,7 +1483,11 @@ func TestCaptureConfigurationBindingAndPluginPrompt(t *testing.T) {
 	if err := verifyCaptureConfig(metadata, changed); err == nil || !strings.Contains(err.Error(), "configuration digest mismatch") {
 		t.Fatalf("err = %v", err)
 	}
-	if captureConfigSHA256ForProtocol(config, CaptureProtocolRevision+"-changed") == metadata.CaptureConfigSHA {
+	changedProtocolSHA, err := captureConfigSHA256ForProtocol(config, CaptureProtocolRevision+"-changed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedProtocolSHA == metadata.CaptureConfigSHA {
 		t.Fatal("capture protocol revision is not bound into the configuration receipt")
 	}
 	pluginTarget := TargetEvidence{Kind: "plugin", ID: "observatory-probe", DeclaredTools: []string{"observatory_probe"}}
@@ -1280,7 +1536,7 @@ func validTestConfig(t *testing.T, artifactsDir string) Config {
 		Version:      1,
 		Live:         true,
 		ArtifactsDir: artifactsDir,
-		Executor:     ExecutorConfig{Kind: "crabbox", Command: "fake-crabbox", CrabboxConfig: crabboxConfig},
+		Executor:     ExecutorConfig{Kind: "crabbox", Command: "fake-crabbox", CrabboxConfig: crabboxConfig, TLSCAFile: writeTestCA(t, artifactsDir, "proxmox-ca.pem")},
 		Isolation:    validIsolationConfig(),
 		Runtime: RuntimeConfig{
 			OpenClawCommand: "openclaw", AgentUser: "observatory", TimeoutSeconds: 10,
@@ -1296,33 +1552,73 @@ func validTestConfig(t *testing.T, artifactsDir string) Config {
 	return config
 }
 
+func writeTestCA(t *testing.T, dir string, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, testCAPEM(t, name), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func testCAPEM(t *testing.T, commonName string) []byte {
+	return testCertificatePEM(t, commonName, true)
+}
+
+func testCertificatePEM(t *testing.T, commonName string, isCA bool) []byte {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Unix(0, 0),
+		NotAfter:              time.Unix(4102444800, 0),
+		IsCA:                  isCA,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+	}
+	if isCA {
+		template.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate})
+}
+
 const testCrabboxConfig = `provider: proxmox
 target: linux
 proxmox:
   apiUrl: https://pve.fixture.invalid:8006
   node: pve-fixture
   templateId: 9400
-  bridge: vmbr-observatory
+  bridge: vmbr1
   user: crabbox
   workRoot: /work/observatory
   fullClone: true
+  insecureTLS: false
 `
 
 func validIsolationConfig() IsolationConfig {
 	return IsolationConfig{
 		Substrate: "proxmox-vm", NetworkMode: "deny-except-model", Verified: true, Verification: "fixture-network-proof",
-		VMTemplateID: 9400, NetworkBridge: "vmbr-observatory", FreshVM: true, DedicatedNetwork: true,
+		VMTemplateID: 9400, NetworkBridge: "vmbr1", FreshVM: true, DedicatedNetwork: true,
 		DefaultDenyEgress: true, NoHostMounts: true, NoRuntimeSockets: true, SyntheticIdentityOnly: true,
 	}
 }
 
 type fixtureExecutor struct {
-	t            *testing.T
-	command      string
-	args         []string
-	err          error
-	baselineExit int
-	exerciseExit int
+	t                 *testing.T
+	command           string
+	args              []string
+	err               error
+	baselineExit      int
+	exerciseExit      int
+	expectWrapperShim bool
 }
 
 func (executor *fixtureExecutor) Run(_ context.Context, command string, args []string, cwd string, env map[string]string, _ time.Duration) (CommandResult, error) {
@@ -1331,8 +1627,41 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 	if env["CRABBOX_CONFIG"] == "" {
 		executor.t.Fatal("missing CRABBOX_CONFIG")
 	}
+	tlsEnvironment := env
+	if executor.expectWrapperShim {
+		for _, key := range []string{"CRABBOX_PROXMOX_INSECURE_TLS", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
+			if _, present := env[key]; present {
+				executor.t.Fatalf("credential wrapper received Crabbox-only %s", key)
+			}
+		}
+		shim := env["CRABBOX_BIN"]
+		if info, err := os.Lstat(shim); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o700 {
+			executor.t.Fatalf("Crabbox TLS shim mode: %v %v", info, err)
+		}
+		output, err := exec.Command(shim).Output()
+		if err != nil {
+			executor.t.Fatal(err)
+		}
+		tlsEnvironment = parseEnvironmentOutput(output)
+	}
+	if tlsEnvironment["CRABBOX_PROXMOX_INSECURE_TLS"] != "0" {
+		executor.t.Fatalf("insecure TLS override = %q", tlsEnvironment["CRABBOX_PROXMOX_INSECURE_TLS"])
+	}
+	if tlsEnvironment["SSL_CERT_FILE"] == "" || filepath.Base(tlsEnvironment["SSL_CERT_FILE"]) != "proxmox-ca.pem" {
+		executor.t.Fatalf("pinned SSL_CERT_FILE = %q", tlsEnvironment["SSL_CERT_FILE"])
+	}
+	if info, err := os.Lstat(tlsEnvironment["SSL_CERT_FILE"]); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		executor.t.Fatalf("pinned CA mode: %v %v", info, err)
+	}
+	caDirectoryInfo, err := os.Lstat(tlsEnvironment["SSL_CERT_DIR"])
+	if err != nil || !caDirectoryInfo.IsDir() || caDirectoryInfo.Mode().Perm() != 0o500 {
+		executor.t.Fatalf("pinned CA directory mode: %v %v", caDirectoryInfo, err)
+	}
+	if entries, err := os.ReadDir(tlsEnvironment["SSL_CERT_DIR"]); err != nil || len(entries) != 0 {
+		executor.t.Fatalf("pinned CA directory is not empty: %v %v", entries, err)
+	}
 	joinedArgs := strings.Join(args, " ")
-	for _, required := range []string{"run --provider proxmox --target linux", "--proxmox-template-id 9400", "--proxmox-bridge vmbr-observatory", "--proxmox-full-clone=true", "--stop-after always"} {
+	for _, required := range []string{"run --provider proxmox --target linux", "--proxmox-template-id 9400", "--proxmox-bridge vmbr1", "--proxmox-full-clone=true", "--stop-after always"} {
 		if !strings.Contains(joinedArgs, required) {
 			executor.t.Fatalf("Crabbox args missing %q: %s", required, joinedArgs)
 		}
@@ -1374,6 +1703,16 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 		executor.t.Fatal(err)
 	}
 	return CommandResult{Stdout: "fixture run\n"}, executor.err
+}
+
+func parseEnvironmentOutput(output []byte) map[string]string {
+	environment := map[string]string{}
+	for _, line := range strings.Split(string(output), "\n") {
+		if key, value, ok := strings.Cut(line, "="); ok {
+			environment[key] = value
+		}
+	}
+	return environment
 }
 
 func fixtureBundleEntries(runID string, targetSHA256 string, captureConfigSHA string, targetKind string, targetID string) map[string]string {
@@ -1471,7 +1810,7 @@ func fixtureEvidence() Evidence {
 		},
 		Run: RunEvidence{
 			ID: "obs_fixture", Status: "completed", StartedAt: "2026-07-10T11:59:59Z", CompletedAt: "2026-07-10T12:00:00Z", Executor: "fixture",
-			Isolation: IsolationEvidence{Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture", GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), Verification: "fixture"},
+			Isolation: IsolationEvidence{Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture", GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), ProxmoxTLSCASHA256: "sha256:" + strings.Repeat("a", 64), Verification: "fixture"},
 			Runtime:   RuntimeEvidence{OpenClawVersion: "OpenClaw fixture", StraceVersion: "strace fixture", ModelProvider: "local", ModelID: "fixture", ModelEndpoint: "private"},
 		},
 		Exercise:     ExerciseEvidence{PromptSHA256: "sha256:" + strings.Repeat("c", 64), TurnLimit: 1},

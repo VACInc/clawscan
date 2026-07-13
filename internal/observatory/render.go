@@ -40,7 +40,7 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 		return Evidence{}, fmt.Errorf("Clawscan artifact input exceeds %d bytes", MaxClawscanArtifactBytes)
 	}
 	var evidence Evidence
-	if err := json.Unmarshal(data, &evidence); err == nil && evidence.SchemaVersion == EvidenceSchemaVersion {
+	if err := json.Unmarshal(data, &evidence); err == nil && supportedEvidenceSchema(evidence.SchemaVersion) {
 		if err := ValidateEvidence(evidence); err != nil {
 			return Evidence{}, err
 		}
@@ -56,7 +56,7 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 	}
 	behavior, ok := artifact.Scanners["behavior"]
 	if !ok || len(behavior.Raw) == 0 {
-		return Evidence{}, errors.New("input is neither observatory.behavior.v1 nor a Clawscan artifact containing scanner behavior")
+		return Evidence{}, errors.New("input is neither supported Observatory behavior evidence nor a Clawscan artifact containing scanner behavior")
 	}
 	if err := json.Unmarshal(behavior.Raw, &evidence); err != nil {
 		return Evidence{}, fmt.Errorf("parse Clawscan behavior evidence: %w", err)
@@ -65,6 +65,10 @@ func DecodeEvidence(reader io.Reader) (Evidence, error) {
 		return Evidence{}, err
 	}
 	return evidence, nil
+}
+
+func supportedEvidenceSchema(version string) bool {
+	return version == EvidenceSchemaVersion || version == LegacyEvidenceSchemaVersion
 }
 
 func LoadEvidence(path string) (Evidence, error) {
@@ -175,7 +179,8 @@ func validateEvidenceComparison(previous Evidence, current Evidence) error {
 func comparableIsolation(previous IsolationEvidence, current IsolationEvidence) bool {
 	return previous.Substrate == current.Substrate && previous.NetworkMode == current.NetworkMode &&
 		previous.ContainmentProfile == current.ContainmentProfile && previous.Verification == current.Verification &&
-		previous.GuestFirewallPolicySHA256 == current.GuestFirewallPolicySHA256
+		previous.GuestFirewallPolicySHA256 == current.GuestFirewallPolicySHA256 &&
+		previous.ProxmoxTLSCASHA256 == current.ProxmoxTLSCASHA256
 }
 
 func comparisonIdentity(evidence Evidence) (string, error) {

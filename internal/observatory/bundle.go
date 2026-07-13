@@ -270,7 +270,18 @@ func safeVersion(value string) string {
 	return value
 }
 
-func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) Evidence {
+func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (Evidence, error) {
+	_, tlsCASHA256, err := readAndValidateTLSCAFile(config.Executor.TLSCAFile, proxmoxAPIHostname(config.Executor.CrabboxConfig))
+	if err != nil {
+		return Evidence{}, err
+	}
+	expectedCaptureConfig, err := captureConfigSHA256WithTLSCA(config, CaptureProtocolRevision, tlsCASHA256)
+	if err != nil {
+		return Evidence{}, err
+	}
+	if bundle.Metadata.CaptureConfigSHA != expectedCaptureConfig {
+		return Evidence{}, errors.New("TLS CA changed after capture configuration verification")
+	}
 	target.Lineage = config.TargetLineage
 	analysis := AnalyzeTraces(AnalysisInput{
 		BaselineTraces:        bundle.BaselineTraces,
@@ -302,6 +313,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 				ContainmentProfile:        "proxmox-vm+nftables+systemd-cgroup",
 				GuestFirewallSHA256:       "sha256:" + bundle.Metadata.FirewallSHA256,
 				GuestFirewallPolicySHA256: digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses))),
+				ProxmoxTLSCASHA256:        tlsCASHA256,
 				Verification:              config.Isolation.Verification,
 			},
 			Runtime: RuntimeEvidence{
@@ -325,7 +337,7 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Observations: analysis.Observations,
 		Canaries:     analysis.Canaries,
 		Coverage:     analysis.Coverage,
-	}
+	}, nil
 }
 
 func canaryDefinitions(markers map[string]string) ([]CanaryDefinition, error) {

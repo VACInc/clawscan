@@ -11,7 +11,7 @@ Build the missing dynamic scanner lane for `openclaw/clawscan`, plus the smalles
 1. `clawscan --scanner behavior` invokes the Observatory CLI and preserves its JSON evidence.
 2. The Observatory runs the same synthetic task twice in a disposable OpenClaw environment: once without the target (baseline), then with the skill or plugin installed (exercise).
 3. `strace` captures successful and attempted file, process, and network activity across the agent process tree.
-4. The analyzer subtracts baseline runtime noise, normalizes private paths/endpoints, records honeytoken interaction without publishing token values, and emits `observatory.behavior.v1`.
+4. The analyzer subtracts baseline runtime noise, normalizes private paths/endpoints, records honeytoken interaction without publishing token values, and emits `observatory.behavior.v2`.
 5. A zero-dependency dark static page renders the evidence and an optional previous-version diff.
 
 The MVP is one owned skill fixture and one owned plugin fixture end to end, not a premature Hub watcher or top-100 batch service. No ClawHub package is executed during development.
@@ -87,11 +87,11 @@ Crabbox’s own trust model says it is a developer execution tool, not hostile m
 - bounded runtime and artifact-size limits.
 - per-lane bounded tmpfs storage, preventing target writes from exhausting the guest disk.
 
-Live validation also requires an explicit full-clone template ID, dedicated bridge, six affirmative isolation controls, a `0600` Crabbox config pinned to Proxmox/Linux/full-clone, and a non-root `/work/...` provisioner root. User-supplied Crabbox arguments and ambient `CRABBOX_*` overrides are rejected or stripped.
+Live validation also requires an explicit full-clone template ID, a dedicated PVE `vmbr0` through `vmbr9999` bridge, six affirmative isolation controls, a `0600` Crabbox config pinned to Proxmox/Linux/full-clone with insecure TLS explicitly disabled, a bounded validated PEM CA bundle used as the exclusive trust anchor, and a non-root `/work/...` provisioner root. The exact CA digest is bound into the capture and isolation receipts. User-supplied Crabbox arguments and ambient TLS or `CRABBOX_*` overrides are rejected or stripped.
 
 The example config leaves live mode disabled. This build will not run a real VM until those controls are independently verified.
 
-## Evidence schema: `observatory.behavior.v1`
+## Evidence schema: `observatory.behavior.v2`
 
 Top-level sections:
 
