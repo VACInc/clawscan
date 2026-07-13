@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -34,6 +34,11 @@ const defaultHistoryMaxPerIdentity = 1000
 // maxHistoryMaxPerIdentity bounds the configurable cap.
 const maxHistoryMaxPerIdentity = 100000
 
+// historyWriterLockTimeout bounds contention on the cross-process history
+// writer lock. Readers do not take the lock because the index is replaced
+// atomically only after its referenced snapshot is durable.
+const historyWriterLockTimeout = 2 * time.Second
+
 // ErrHistoryNoStableIdentity is returned when evidence has no stable
 // lineage/plugin identity to index by. Such captures cannot participate in
 // version diffs and are simply not recorded.
@@ -47,7 +52,8 @@ var ErrHistoryIncompleteCapture = errors.New("history: incomplete capture is not
 // snapshots keyed by stable target identity. It lives under the operator's
 // artifacts directory and never contains raw traces or transcripts.
 type HistoryStore struct {
-	root string
+	root        string
+	lockTimeout time.Duration
 }
 
 // HistoryEntry is the indexed metadata retained for one recorded capture. It is
@@ -111,10 +117,10 @@ func OpenHistoryStore(artifactsDir string) (*HistoryStore, error) {
 		return nil, errors.New("history store requires an artifacts directory")
 	}
 	root := filepath.Join(trimmed, "history")
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := prepareSecureHistoryRoot(root); err != nil {
 		return nil, fmt.Errorf("create history store: %w", err)
 	}
-	return &HistoryStore{root: root}, nil
+	return &HistoryStore{root: root, lockTimeout: historyWriterLockTimeout}, nil
 }
 
 func (store *HistoryStore) indexPath() string {
@@ -133,8 +139,17 @@ func (store *HistoryStore) resolve(rel string) (string, error) {
 }
 
 func (store *HistoryStore) loadIndex() (historyIndex, error) {
-	data, err := os.ReadFile(store.indexPath())
-	if errors.Is(err, os.ErrNotExist) {
+	root, err := openSecureHistoryRoot(store.root)
+	if err != nil {
+		return historyIndex{}, err
+	}
+	defer root.close()
+	return store.loadIndexFrom(root)
+}
+
+func (store *HistoryStore) loadIndexFrom(root *secureHistoryRoot) (historyIndex, error) {
+	data, err := root.readRegularFile("index.json", MaxHistoryIndexBytes, historyFileMode)
+	if errors.Is(err, errHistoryPathNotExist) {
 		return historyIndex{SchemaVersion: HistorySchemaVersion}, nil
 	}
 	if err != nil {
@@ -144,33 +159,103 @@ func (store *HistoryStore) loadIndex() (historyIndex, error) {
 		return historyIndex{}, errors.New("corrupt history: index exceeds size bound")
 	}
 	var index historyIndex
-	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&index); err != nil {
+		return historyIndex{}, fmt.Errorf("corrupt history: parse index: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
 		return historyIndex{}, fmt.Errorf("corrupt history: parse index: %w", err)
 	}
 	if index.SchemaVersion != HistorySchemaVersion {
 		return historyIndex{}, fmt.Errorf("corrupt history: unsupported index schema %q", index.SchemaVersion)
 	}
+	if err := store.validateIndex(root, index); err != nil {
+		return historyIndex{}, err
+	}
 	return index, nil
 }
 
-func (store *HistoryStore) writeIndex(index historyIndex) error {
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+// validateIndex verifies every evidence-backed field before the index is used
+// for selection, duplicate detection, or per-identity bounds. This prevents a
+// modified index from hiding snapshots under a false identity or redirecting a
+// record to unrelated evidence.
+func (store *HistoryStore) validateIndex(root *secureHistoryRoot, index historyIndex) error {
+	seenRuns := make(map[string]string, len(index.Entries))
+	seenSnapshots := make(map[string]struct{}, len(index.Entries))
+	for _, entry := range index.Entries {
+		recordedAt, err := time.Parse(time.RFC3339Nano, entry.RecordedAt)
+		if err != nil || recordedAt.UTC().Format(time.RFC3339Nano) != entry.RecordedAt {
+			return fmt.Errorf("corrupt history: run %q has invalid recordedAt metadata", entry.RunID)
+		}
+		if prior, ok := seenRuns[entry.RunID]; ok {
+			return fmt.Errorf("corrupt history: duplicate run %q in snapshots %q and %q", entry.RunID, prior, entry.SnapshotPath)
+		}
+		if _, ok := seenSnapshots[entry.SnapshotPath]; ok {
+			return fmt.Errorf("corrupt history: duplicate snapshot path %q", entry.SnapshotPath)
+		}
+
+		evidence, err := store.loadHistorySnapshot(root, entry.SnapshotPath)
+		if err != nil {
+			return err
+		}
+		if evidence.Run.Status != "completed" {
+			return fmt.Errorf("corrupt history: snapshot %s is not a completed capture", filepath.Base(entry.SnapshotPath))
+		}
+		identity, ok := stableIdentity(evidence)
+		if !ok {
+			return fmt.Errorf("corrupt history: snapshot %s has no stable identity", filepath.Base(entry.SnapshotPath))
+		}
+		expectedRel := store.snapshotRelativePath(identity, evidence)
+		expected := historyEntryForEvidence(evidence, entry.RecordedAt, expectedRel)
+		if entry != expected {
+			return fmt.Errorf("corrupt history: index metadata for snapshot %s does not exactly match its evidence", filepath.Base(entry.SnapshotPath))
+		}
+		seenRuns[entry.RunID] = entry.SnapshotPath
+		seenSnapshots[entry.SnapshotPath] = struct{}{}
+	}
+	return nil
+}
+
+func historyEntryForEvidence(evidence Evidence, recordedAt string, snapshotPath string) HistoryEntry {
+	identity, _ := stableIdentity(evidence)
+	return HistoryEntry{
+		Identity:            identity,
+		Kind:                evidence.Target.Kind,
+		Lineage:             evidence.Target.Lineage,
+		PluginID:            pluginIdentityID(evidence),
+		RunID:               evidence.Run.ID,
+		TargetSHA256:        evidence.Target.SHA256,
+		CaptureConfigSHA256: evidence.CaptureConfigSHA256,
+		CompletedAt:         evidence.Run.CompletedAt,
+		RecordedAt:          recordedAt,
+		Status:              evidence.Run.Status,
+		SnapshotPath:        snapshotPath,
+	}
+}
+
+func (store *HistoryStore) writeIndex(root *secureHistoryRoot, index historyIndex) error {
 	index.SchemaVersion = HistorySchemaVersion
 	data, err := json.MarshalIndent(index, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	temp := store.indexPath() + ".tmp"
-	if err := os.WriteFile(temp, data, 0o600); err != nil {
-		return err
+	if len(data) > MaxHistoryIndexBytes {
+		return errors.New("history: updated index exceeds size bound")
 	}
-	if err := os.Rename(temp, store.indexPath()); err != nil {
-		os.Remove(temp)
-		return err
-	}
-	return nil
+	return root.writeIndexAtomic(data)
 }
 
 // Record appends completed evidence to the append-only history under a bounded
@@ -193,7 +278,18 @@ func (store *HistoryStore) Record(evidence Evidence, maxPerIdentity int) error {
 	if maxPerIdentity < 1 {
 		maxPerIdentity = defaultHistoryMaxPerIdentity
 	}
-	index, err := store.loadIndex()
+	root, err := openSecureHistoryRoot(store.root)
+	if err != nil {
+		return err
+	}
+	defer root.close()
+	release, err := root.acquireWriterLock(store.lockTimeout)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	index, err := store.loadIndexFrom(root)
 	if err != nil {
 		return err
 	}
@@ -201,9 +297,7 @@ func (store *HistoryStore) Record(evidence Evidence, maxPerIdentity int) error {
 	if err != nil {
 		return err
 	}
-	dir := store.snapshotDir(identity)
-	name := historySortKey(evidence) + "-" + shortToken(evidence.Run.ID) + ".json"
-	rel := filepath.Join("snapshots", filepath.Base(dir), name)
+	rel := store.snapshotRelativePath(identity, evidence)
 
 	count := 0
 	for i := range index.Entries {
@@ -215,46 +309,34 @@ func (store *HistoryStore) Record(evidence Evidence, maxPerIdentity int) error {
 			// Re-recording a run is idempotent only when the preserved snapshot
 			// is valid and byte-identical; conflicting reuse is rejected and the
 			// existing snapshot is left untouched.
-			return store.verifyIdenticalRecord(index.Entries[i], payload)
+			return store.verifyIdenticalRecord(root, index.Entries[i], payload)
 		}
 	}
 	if count >= maxPerIdentity {
 		return fmt.Errorf("history: %s already has %d recorded snapshots at the maxPerIdentity bound of %d; history is append-only, so prune it manually before adding more", identity, count, maxPerIdentity)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := root.ensureDirectory(filepath.Dir(rel), historyDirectoryMode); err != nil {
 		return err
 	}
-	if err := writeSnapshotNoClobber(filepath.Join(store.root, rel), payload); err != nil {
+	if err := writeSnapshotNoClobber(root, rel, payload); err != nil {
 		return err
 	}
-	index.Entries = append(index.Entries, HistoryEntry{
-		Identity:            identity,
-		Kind:                evidence.Target.Kind,
-		Lineage:             evidence.Target.Lineage,
-		PluginID:            pluginIdentityID(evidence),
-		RunID:               evidence.Run.ID,
-		TargetSHA256:        evidence.Target.SHA256,
-		CaptureConfigSHA256: evidence.CaptureConfigSHA256,
-		CompletedAt:         evidence.Run.CompletedAt,
-		RecordedAt:          time.Now().UTC().Format(time.RFC3339Nano),
-		Status:              evidence.Run.Status,
-		SnapshotPath:        rel,
-	})
-	return store.writeIndex(index)
+	index.Entries = append(index.Entries, historyEntryForEvidence(
+		evidence,
+		time.Now().UTC().Format(time.RFC3339Nano),
+		rel,
+	))
+	return store.writeIndex(root, index)
 }
 
 // verifyIdenticalRecord accepts a re-record of an existing run only when its
 // preserved snapshot is valid and byte-identical to the new payload. It never
 // modifies the stored snapshot.
-func (store *HistoryStore) verifyIdenticalRecord(entry HistoryEntry, payload []byte) error {
-	path, err := store.resolve(entry.SnapshotPath)
-	if err != nil {
+func (store *HistoryStore) verifyIdenticalRecord(root *secureHistoryRoot, entry HistoryEntry, payload []byte) error {
+	if _, err := store.loadHistorySnapshot(root, entry.SnapshotPath); err != nil {
 		return err
 	}
-	if _, err := loadHistorySnapshot(path); err != nil {
-		return err
-	}
-	stored, err := os.ReadFile(path)
+	stored, err := root.readRegularFile(entry.SnapshotPath, MaxEvidenceBytes, historyFileMode)
 	if err != nil {
 		return fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(entry.SnapshotPath), err)
 	}
@@ -266,32 +348,26 @@ func (store *HistoryStore) verifyIdenticalRecord(entry HistoryEntry, payload []b
 
 // writeSnapshotNoClobber writes a new snapshot without clobbering an existing
 // one. If the target already exists it must be byte-identical; a different
-// existing snapshot is preserved and reported as an error. Only a newly created
-// file that fails mid-write is removed.
-func writeSnapshotNoClobber(path string, payload []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		existing, readErr := os.ReadFile(path)
+// existing snapshot is preserved and reported as an error. A failed write is
+// left unindexed so no cleanup path can race another writer; a retry fails
+// closed unless the complete canonical payload is present.
+func writeSnapshotNoClobber(root *secureHistoryRoot, rel string, payload []byte) error {
+	created, err := root.writeRegularFileExclusive(rel, payload, historyFileMode)
+	if errors.Is(err, errHistoryPathExist) {
+		existing, readErr := root.readRegularFile(rel, MaxEvidenceBytes, historyFileMode)
 		if readErr != nil {
-			return fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(path), readErr)
+			return fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(rel), readErr)
 		}
 		if !bytes.Equal(existing, payload) {
-			return fmt.Errorf("history: refusing to overwrite existing snapshot %s with different content", filepath.Base(path))
+			return fmt.Errorf("history: refusing to overwrite existing snapshot %s with different content", filepath.Base(rel))
 		}
-		return nil
+		return root.syncRegularFile(rel, historyFileMode)
 	}
 	if err != nil {
 		return err
 	}
-	_, writeErr := file.Write(payload)
-	closeErr := file.Close()
-	if writeErr != nil {
-		os.Remove(path) // clean up only this newly created, failed snapshot
-		return writeErr
-	}
-	if closeErr != nil {
-		os.Remove(path) // clean up only this newly created, failed snapshot
-		return closeErr
+	if !created {
+		return errors.New("history: snapshot writer returned no result")
 	}
 	return nil
 }
@@ -318,7 +394,12 @@ func (store *HistoryStore) LatestComparable(current Evidence) (*Evidence, error)
 	if !ok {
 		return nil, nil
 	}
-	index, err := store.loadIndex()
+	root, err := openSecureHistoryRoot(store.root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.close()
+	index, err := store.loadIndexFrom(root)
 	if err != nil {
 		return nil, err
 	}
@@ -332,11 +413,7 @@ func (store *HistoryStore) LatestComparable(current Evidence) (*Evidence, error)
 		return historyEntryBefore(candidates[j], candidates[i]) // newest first
 	})
 	for _, entry := range candidates {
-		path, err := store.resolve(entry.SnapshotPath)
-		if err != nil {
-			return nil, err
-		}
-		evidence, err := loadHistorySnapshot(path)
+		evidence, err := store.loadHistorySnapshot(root, entry.SnapshotPath)
 		if err != nil {
 			return nil, err
 		}
@@ -361,27 +438,31 @@ func (store *HistoryStore) snapshotDir(identity string) string {
 	return filepath.Join(store.root, "snapshots", hex.EncodeToString(sum[:]))
 }
 
-func loadHistorySnapshot(path string) (Evidence, error) {
-	info, err := os.Lstat(path)
+func (store *HistoryStore) snapshotRelativePath(identity string, evidence Evidence) string {
+	dir := store.snapshotDir(identity)
+	name := historySortKey(evidence) + "-" + shortToken(evidence.Run.ID) + ".json"
+	return filepath.Join("snapshots", filepath.Base(dir), name)
+}
+
+func (store *HistoryStore) loadHistorySnapshot(root *secureHistoryRoot, rel string) (Evidence, error) {
+	if _, err := store.resolve(rel); err != nil {
+		return Evidence{}, err
+	}
+	data, err := root.readRegularFile(rel, MaxEvidenceBytes, historyFileMode)
 	if err != nil {
-		return Evidence{}, fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(path), err)
-	}
-	if !info.Mode().IsRegular() {
-		return Evidence{}, fmt.Errorf("corrupt history: snapshot %s is not a regular file", filepath.Base(path))
-	}
-	if info.Size() > MaxEvidenceBytes {
-		return Evidence{}, fmt.Errorf("corrupt history: snapshot %s exceeds the evidence size bound", filepath.Base(path))
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Evidence{}, fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(path), err)
+		return Evidence{}, fmt.Errorf("corrupt history: read snapshot %s: %w", filepath.Base(rel), err)
 	}
 	var evidence Evidence
-	if err := json.Unmarshal(data, &evidence); err != nil {
-		return Evidence{}, fmt.Errorf("corrupt history: parse snapshot %s: %w", filepath.Base(path), err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&evidence); err != nil {
+		return Evidence{}, fmt.Errorf("corrupt history: parse snapshot %s: %w", filepath.Base(rel), err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return Evidence{}, fmt.Errorf("corrupt history: parse snapshot %s: %w", filepath.Base(rel), err)
 	}
 	if err := ValidateEvidence(evidence); err != nil {
-		return Evidence{}, fmt.Errorf("corrupt history: invalid snapshot %s: %w", filepath.Base(path), err)
+		return Evidence{}, fmt.Errorf("corrupt history: invalid snapshot %s: %w", filepath.Base(rel), err)
 	}
 	return evidence, nil
 }

@@ -162,6 +162,14 @@ owner-only permissions and contain only the public evidence projection,
 preserving the private/public artifact boundary. Use `--no-history` to skip
 recording and diffing for a single run.
 
+History storage is fail-closed on Linux. The store, index, writer lock,
+snapshot directories, snapshots, and temporary index must be owned by the
+current user with exact owner-only modes; symbolic links and other file types
+are rejected. Writers take a bounded cross-process lock. Each snapshot is
+synced before an atomically replaced and directory-synced index can reference
+it, and every index field derived from evidence is revalidated against the
+canonical snapshot before the index is trusted.
+
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
 capture. Their canonical digest
