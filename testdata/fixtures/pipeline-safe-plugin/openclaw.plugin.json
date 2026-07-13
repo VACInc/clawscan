@@ -1,0 +1,12 @@
+{
+  "id": "observatory-pipeline-safe",
+  "name": "Observatory Pipeline-Safe Plugin",
+  "description": "Owned local-only fixture proving a plugin can pass the gated Observatory pipeline.",
+  "activation": { "onStartup": true },
+  "contracts": { "tools": ["observatory_pipeline_safe"] },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

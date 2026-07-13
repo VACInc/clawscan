@@ -145,6 +145,31 @@ func commandRunnerForOptions(opts Options, ctx RunContext, env map[string]string
 	}, metadata, nil
 }
 
+func hostJudgeCommandRunner(opts Options, ctx RunContext, env map[string]string) CommandRunner {
+	if ctx.HostCommandRunner != nil {
+		return ctx.HostCommandRunner
+	}
+	if ctx.CommandRunner != nil {
+		return ctx.CommandRunner
+	}
+	return defaultCommandRunner{Env: sanitizedJudgeEnv(opts, env)}
+}
+
+func sanitizedJudgeEnv(opts Options, env map[string]string) map[string]string {
+	blocked := map[string]bool{}
+	for _, name := range sandboxEnvNames(opts, env) {
+		blocked[name] = true
+	}
+	out := make(map[string]string, len(env))
+	for name, value := range env {
+		if blocked[name] || isSecretEnvKey(name) {
+			continue
+		}
+		out[name] = value
+	}
+	return out
+}
+
 func dockerAvailable() error {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return err
@@ -250,7 +275,7 @@ func sandboxEnvNames(opts Options, env map[string]string) []string {
 }
 
 func requiresCommandExecution(opts Options) bool {
-	if opts.Judge != nil {
+	if opts.Judge != nil && opts.Judge.Execution != JudgeExecutionHost {
 		return true
 	}
 	for _, scanner := range opts.Scanners {

@@ -41,6 +41,32 @@ func TestParseArgs(t *testing.T) {
 	}
 }
 
+func TestParseArgsSupportsHostJudgeExecution(t *testing.T) {
+	opts, err := ParseArgs([]string{
+		"./my-skill",
+		"--scanner", "clawscan-static",
+		"--judge", "judge --output {{ output }}",
+		"--judge-execution", "host",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Judge == nil || opts.Judge.Execution != JudgeExecutionHost {
+		t.Fatalf("judge = %#v", opts.Judge)
+	}
+}
+
+func TestParseArgsRejectsInvalidOrUnboundJudgeExecution(t *testing.T) {
+	for _, args := range [][]string{
+		{"./my-skill", "--scanner", "clawscan-static", "--judge-execution", "host"},
+		{"./my-skill", "--scanner", "clawscan-static", "--judge", "judge", "--judge-execution", "container"},
+	} {
+		if _, err := ParseArgs(args); err == nil {
+			t.Fatalf("ParseArgs(%v) succeeded", args)
+		}
+	}
+}
+
 func TestParseArgsAcceptsAgentVerusScanner(t *testing.T) {
 	opts, err := ParseArgs([]string{"./my-skill", "--scanner", "agentverus"})
 	if err != nil {
@@ -1257,6 +1283,79 @@ func TestRunUsesDockerSandboxForCommandBackedScannersByDefault(t *testing.T) {
 	imageIndex := indexOfArg(call.args, DefaultSandboxImage)
 	if imageIndex < 0 || imageIndex+1 >= len(call.args) || call.args[imageIndex+1] != "skillspector" {
 		t.Fatalf("missing scanner command after image: %#v", call.args)
+	}
+}
+
+func TestRunKeepsScannersInDockerAndRunsHostJudgeSeparately(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "skill")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	host := &recordingCommandRunner{writeOutput: `{"verdict":"benign"}`}
+	opts, err := ParseArgs([]string{
+		target,
+		"--scanner", "skillspector",
+		"--judge", "judge --output-last-message {{ output }}",
+		"--judge-execution", "host",
+		"--sandbox-env", "VIRUSTOTAL_API_KEY",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Run(opts, RunContext{
+		Env: map[string]string{
+			"CODEX_HOME":                "/home/example/.codex",
+			"VIRUSTOTAL_API_KEY":        "scanner-secret",
+			"CLAWSCAN_SKILLSPECTOR_LLM": "false",
+		},
+		HostCommandRunner:  host,
+		DockerAvailability: func() error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Judge == nil || artifact.Judge.Execution != JudgeExecutionHost || artifact.Judge.Status != "completed" {
+		t.Fatalf("judge = %#v", artifact.Judge)
+	}
+	if len(host.calls) != 2 {
+		t.Fatalf("calls = %#v", host.calls)
+	}
+	if host.calls[0].command != "docker" {
+		t.Fatalf("scanner command = %#v", host.calls[0])
+	}
+	if host.calls[1].command != "/bin/sh" {
+		t.Fatalf("judge command = %#v", host.calls[1])
+	}
+	joinedDockerArgs := strings.Join(host.calls[0].args, "\x00")
+	if strings.Contains(joinedDockerArgs, "CODEX_HOME") || strings.Contains(joinedDockerArgs, ".codex") {
+		t.Fatalf("Docker scanner received Codex auth location: %#v", host.calls[0].args)
+	}
+}
+
+func TestSanitizedJudgeEnvKeepsOAuthLocationAndRemovesScannerSecrets(t *testing.T) {
+	opts := Options{
+		Scanners: []string{"virustotal", "skillspector"},
+		Sandbox:  SandboxOptions{Env: []string{"VIRUSTOTAL_API_KEY"}},
+	}
+	got := sanitizedJudgeEnv(opts, map[string]string{
+		"HOME":                    "/home/example",
+		"PATH":                    "/usr/bin",
+		"CODEX_HOME":              "/home/example/.codex",
+		"VIRUSTOTAL_API_KEY":      "vt-secret",
+		"OPENAI_API_KEY":          "api-secret",
+		"SKILLSPECTOR_PROVIDER":   "openai",
+		"CLAWSCAN_UNRELATED_FLAG": "safe",
+	})
+	for _, name := range []string{"HOME", "PATH", "CODEX_HOME", "CLAWSCAN_UNRELATED_FLAG"} {
+		if got[name] == "" {
+			t.Fatalf("missing safe env %s: %#v", name, got)
+		}
+	}
+	for _, name := range []string{"VIRUSTOTAL_API_KEY", "OPENAI_API_KEY", "SKILLSPECTOR_PROVIDER"} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("judge env retained %s", name)
+		}
 	}
 }
 

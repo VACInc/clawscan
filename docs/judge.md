@@ -10,6 +10,18 @@ clawscan ./my-skill \
   --judge 'codex exec --cd {{ workspace }} --output-last-message {{ output }} - < {{ prompt:./prompt.md }}'
 ```
 
+Judges run in the selected Docker sandbox by default. `--judge-execution host`
+is an explicit escape hatch for commands that must reuse host-only
+authentication, such as an existing Codex ChatGPT OAuth login. Host judge
+commands are trusted configuration; do not use this flag with commands sourced
+from the scanned target.
+
+The built-in `clawhub-oauth` profile uses this split safely: scanners remain in
+Docker, while an ephemeral Codex judge runs on the host with read-only access
+only to its staged workspace and no network. ClawScan removes scanner/API
+secrets from that judge's environment and never mounts the Codex auth file into
+Docker.
+
 Supported `--judge` placeholders:
 
 | Placeholder | Meaning |

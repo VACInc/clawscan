@@ -43,6 +43,14 @@ func TestDefaultProfileRegistryContainsEmbeddedBuiltIns(t *testing.T) {
 	if string(clawhub.files["clawhub/output.schema.json"]) == "" {
 		t.Fatal("missing clawhub embedded output schema")
 	}
+
+	oauth, ok := registry.Profile("clawhub-oauth")
+	if !ok {
+		t.Fatal("missing clawhub-oauth profile")
+	}
+	if oauth.profile.Judge == nil || oauth.profile.Judge.Execution != "host" {
+		t.Fatalf("clawhub-oauth judge = %#v", oauth.profile.Judge)
+	}
 }
 
 func TestProfileRegistryRejectsUnknownScannerReferences(t *testing.T) {
@@ -74,7 +82,7 @@ profiles:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(catalog.IDs(), ","); got != "clawhub,local" {
+	if got := strings.Join(catalog.IDs(), ","); got != "clawhub,clawhub-oauth,local" {
 		t.Fatalf("profile ids = %q", got)
 	}
 

@@ -52,6 +52,44 @@ func TestResolveArgsUsesEmbeddedClawHubProfile(t *testing.T) {
 	}
 }
 
+func TestResolveArgsUsesEmbeddedClawHubOAuthProfile(t *testing.T) {
+	opts, err := ResolveArgs([]string{"./skill", "--profile", "clawhub-oauth"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Judge == nil || opts.Judge.Execution != runner.JudgeExecutionHost {
+		t.Fatalf("judge = %#v", opts.Judge)
+	}
+	if !strings.Contains(opts.Judge.Command, "--ignore-user-config") || !strings.Contains(opts.Judge.Command, "features.shell_tool=true") {
+		t.Fatalf("OAuth judge is not hardened: %q", opts.Judge.Command)
+	}
+	joinedEnv := strings.Join(opts.Sandbox.Env, ",")
+	if strings.Contains(joinedEnv, "OPENAI_API_KEY") || strings.Contains(joinedEnv, "CODEX_API_KEY") {
+		t.Fatalf("OAuth profile passes API-key auth into Docker: %#v", opts.Sandbox.Env)
+	}
+	if joinedEnv != "VIRUSTOTAL_API_KEY" {
+		t.Fatalf("sandbox env = %q", joinedEnv)
+	}
+}
+
+func TestResolveArgsRejectsUnknownJudgeExecution(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, ".clawscan.yml")
+	writeFile(t, config, `version: 1
+profiles:
+  unsafe:
+    scanners:
+      - clawscan-static
+    judge:
+      execution: somewhere
+      command: judge
+`)
+	_, err := ResolveArgs([]string{"./skill", "--profile", "unsafe"}, dir)
+	if err == nil || !strings.Contains(err.Error(), "Unsupported judge execution mode") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestResolveArgsRejectsMissingExplicitSelection(t *testing.T) {
 	dir := t.TempDir()
 

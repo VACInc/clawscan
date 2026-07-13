@@ -1,0 +1,24 @@
+# shellcheck shell=sh
+# Pinned inputs for the ClawScan Observatory Proxmox runner image.
+OBSERVATORY_RUNNER_SCHEMA=1
+
+UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/releases/noble/release-20260518/ubuntu-24.04-server-cloudimg-amd64.img
+UBUNTU_IMAGE_SHA256=53fdde898feed8b027d94baa9cfe8229867f330a1d9c49dc7d84465ee7f229f7
+
+NODE_VERSION=24.18.0
+NODE_LINUX_X64_SHA256=55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
+OPENCLAW_VERSION=2026.6.11
+OPENCLAW_DIST_INTEGRITY=sha512-T+P/g19IheeT1ckXMoPN61dYuE8vBF4MderI+kWkvpuFYxPkJxn8AXLpu9IXCnN9g36Acpm9+mMD/V+lsvOkyA==
+
+# Multi-architecture index plus the exact linux/amd64 child used by Proxmox.
+CLAWSCAN_RUNTIME_INDEX_DIGEST=sha256:03fbdbe866669355ff4c45c63ebd70c2531bbe2e6b4741dca6f84194a48c4dfb
+CLAWSCAN_RUNTIME_AMD64_DIGEST=sha256:921b20dd645df768d4b96c1f242b7e209d72ff0f127d3fff2c72e9b99af5d62c
+CLAWSCAN_RUNTIME_INDEX_IMAGE=ghcr.io/openclaw/clawscan-runtime@sha256:03fbdbe866669355ff4c45c63ebd70c2531bbe2e6b4741dca6f84194a48c4dfb
+CLAWSCAN_RUNTIME_IMAGE=ghcr.io/openclaw/clawscan-runtime@sha256:921b20dd645df768d4b96c1f242b7e209d72ff0f127d3fff2c72e9b99af5d62c
+CLAWSCAN_RUNTIME_LOCAL_IMAGE=ghcr.io/openclaw/clawscan-runtime:observatory-pinned
+CLAWSCAN_RUNTIME_OCI_TAG=observatory-pinned
+
+# Human-readable contents of the digest-pinned ClawScan runtime.
+SKILLSPECTOR_REF=78be329a7ea9749842e335598132ce171b8717d4
+CISCO_AI_SKILL_SCANNER_VERSION=2.0.12
+AGENTVERUS_SCANNER_VERSION=0.8.1

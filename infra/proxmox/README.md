@@ -1,0 +1,133 @@
+# Proxmox runner template
+
+This directory builds the site-local, secret-free VM template used by both:
+
+- a ClawScan `local-free` pass inside ClawScan's Docker sandbox; and
+- Observatory's separate paired behavior pass inside its hardened systemd lane.
+
+Do not combine `behavior` with the free scanners in one ClawScan invocation.
+The behavior adapter requires global `--sandbox off`; combining them would also
+disable Docker for the command-backed scanners.
+
+## Immutable inputs
+
+`template.lock` pins the dated Ubuntu image, Node archive, OpenClaw release, and
+the multi-architecture ClawScan runtime image digest. The build also records
+the resolved npm lock and complete installed Debian package manifest. Apt
+packages are recorded, not reproducibly pinned to an Ubuntu snapshot, so the
+guest release receipt is mandatory build evidence. The template contains no
+model credential, Proxmox token, scanner API key, target, repository checkout,
+or OpenClaw state.
+
+The runtime image is stored as a digest-preserving OCI archive. Every clone
+verifies the archive manifest, imports the exact image into Docker under the
+site-local `observatory-pinned` tag, and verifies the loaded config digest
+before ClawScan can use it.
+
+The Proxmox VMID is a site-local generation identifier, not a cryptographic
+content identity. Use a new VMID/name for every rebuild and never replace an
+existing template. Bind the checked-in lock digest and resulting guest release
+receipt into Observatory evidence before claiming cryptographic image lineage.
+
+## Build contract
+
+Run `build-observatory-template.sh` on the Proxmox node as root. Its defaults
+create VMID `9403`, name `clawscan-observatory-runner-v1`, 4 vCPUs, 8 GiB RAM,
+and a 64 GiB disk on `local-lvm`. It refuses an existing VMID and never destroys
+one. Public dependencies are baked by `virt-customize` through the build host;
+the resulting VM NIC is attached only to the dedicated `vmbr2` quarantine
+bridge. The builder refuses `vmbr0` and `vmbr1`.
+
+`vmbr2` is local to the selected Proxmox node, has no physical or cluster
+uplink, and is not an SDN/VNet shared across nodes. Its host firewall permits
+only controller-to-guest SSH, DHCP, established replies, and the guest control
+UID's exact model-relay destination. Guest access to the Proxmox host, LAN,
+Internet, other Proxmox nodes, and other quarantine guests is denied.
+
+Clones use DHCP (`ip=dhcp`); addresses are intentionally dynamic. The build
+seals cloud-init and resets `/etc/machine-id`, so each clone generates a unique
+machine/DHCP identity on first boot instead of reusing the template's lease.
+
+The build requires `qm`, `pvesm`, `qemu-img`, `virt-customize`, and `curl`.
+After creation, copy `crabbox-observatory.example.yml` outside the repository,
+set the real site-local values, and keep that config mode 0600. Its reviewed
+shape is:
+
+```yaml
+provider: proxmox
+target: linux
+proxmox:
+  node: pve-node
+  templateId: 9403
+  storage: local-lvm
+  pool: crabbox
+  bridge: vmbr2
+  fullClone: true
+  user: crabbox
+  workRoot: /work/crabbox
+  insecureTLS: false
+```
+
+Supply Proxmox credentials only through the audited local credential wrapper.
+Pin a CA file in Observatory; never enable insecure TLS. The Proxmox user and
+separated token both need the same narrow `SDN.Use` grant for `vmbr2`.
+
+## Fail-closed security gate
+
+`run-security-gate.sh` is the mandatory first phase. It runs ClawScan Static,
+SkillSpector without an LLM, Cisco's base analyzers, and AgentVerus inside the
+pinned Docker runtime. It removes optional provider credentials before launch
+and applies `evaluate-local-free-scan.jq` to the complete artifact.
+
+Any scanner error, unexpected skip, incomplete/omitted evidence, changed output
+contract, or material finding returns exit `42` with:
+
+```json
+{"status":"failed","stage":"security-scan","reason":"failed due to security scan"}
+```
+
+The model relay must not be started and the behavior phase must not be
+provisioned unless this gate returns `passed`. Plugins require a clean Static
+result; the three skill-only scanners must return their exact documented plugin
+skip result. The owned smoke proves a benign skill and plugin pass while the
+owned hostile probe is rejected.
+
+## MiniMax secret relay
+
+The disposable VM never receives the MiniMax key. Observatory's existing
+guest-local bounded relay forwards only to `minimax-secret-relay.mjs` on the
+controller. That outer relay accepts only `POST /v1/chat/completions`, the exact
+`MiniMax-M3` model, `Authorization: Bearer local`, bounded bodies/concurrency,
+and injects the real key only for `https://api.minimax.io`. The Proxmox host
+firewall is the outer allowlist: the quarantine subnet can reach only the
+controller's one relay IP and port.
+
+## Validation
+
+In a fresh full clone, run:
+
+```sh
+sudo /opt/observatory-template/validate-observatory-template.sh
+```
+
+Sync a current ClawScan binary plus this repository and run the owned fixtures:
+
+```sh
+infra/proxmox/run-owned-fixture-smoke.sh /work/results
+```
+
+Expected behavior:
+
+- owned skill: all four free scanners complete;
+- owned plugin: static completes and skill-only scanners explicitly skip;
+- behavior: run separately through Observatory with `--sandbox off`;
+- no ClawHub download or external scanner/model credential is used.
+
+The smoke script explicitly forces Docker mode, scrubs optional provider
+credentials, pins the baked local runtime tag, and checks that the artifacts
+record that sandbox. It is the free-scanner half of the E2E, not proof of the
+separate Observatory behavior lane by itself.
+
+Final E2E must export the artifacts, verify the pinned runtime digest and guest
+release receipt, release only the newly created disposable clones, and prove
+that retained Field Fleet VMID 116 was never touched.

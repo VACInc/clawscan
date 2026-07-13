@@ -1,0 +1,11 @@
+version: 1
+
+profiles:
+  local-free:
+    sandbox:
+      mode: docker
+    scanners:
+      - clawscan-static
+      - skillspector
+      - cisco
+      - agentverus

@@ -573,6 +573,7 @@ Core flags:
                               Explicit .json paths keep the artifact file and write scanner JSON beside it.
   --json                      Print the full artifact JSON to stdout and skip default file writes unless --output is passed.
   --judge <cmd>               Optional external judge harness command.
+  --judge-execution <mode>    Run the judge in the Docker sandbox (default) or on the host.
   --sandbox <docker|off>      Command sandbox mode. Defaults to docker.
   --sandbox-image <image>     Docker runtime image. Defaults to %s or CLAWSCAN_SANDBOX_IMAGE.
   --sandbox-env <name>        Allow an env var through the Docker sandbox. Repeat for multiple vars.

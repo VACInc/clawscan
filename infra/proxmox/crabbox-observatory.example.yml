@@ -1,0 +1,31 @@
+profile: observatory-proxmox
+provider: proxmox
+target: linux
+
+lease:
+  idleTimeout: 30m
+  ttl: 2h
+
+proxmox:
+  node: pve-node
+  templateId: 9403
+  storage: local-lvm
+  pool: crabbox
+  bridge: vmbr2
+  fullClone: true
+  insecureTLS: false
+  user: crabbox
+
+ssh:
+  port: "22"
+  fallbackPorts: []
+
+sync:
+  delete: true
+  checksum: true
+  gitSeed: true
+  fingerprint: true
+  timeout: 10m
+
+env:
+  allow: []
