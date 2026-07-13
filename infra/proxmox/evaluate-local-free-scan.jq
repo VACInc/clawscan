@@ -50,7 +50,7 @@ def expected_plugin_skip($id):
     if clean_cisco then empty else "cisco did not return complete clean evidence" end,
     if clean_agentverus then empty else "agentverus did not return complete clean evidence" end
   elif $kind == "plugin" then
-    if expected_plugin_skip("skillspector") then empty else "skillspector plugin skip contract changed" end,
+    if clean_skillspector then empty else "skillspector did not return complete clean plugin evidence" end,
     if expected_plugin_skip("cisco") then empty else "cisco plugin skip contract changed" end,
     if expected_plugin_skip("agentverus") then empty else "agentverus plugin skip contract changed" end
   else empty end

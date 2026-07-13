@@ -292,11 +292,12 @@ func defaultScannerAdapters() []ScannerAdapter {
 			run: ExternalScannerRunner.runCisco,
 		},
 		scannerAdapter{
-			id: "clawscan-static",
+			id:              "clawscan-static",
+			supportsPlugins: true,
 			info: ScannerInfo{
 				DisplayName:   "ClawScan Static",
 				RepositoryURL: "https://github.com/openclaw/clawscan",
-				Description:   "Built-in deterministic text scanner for high-signal risky skill patterns.",
+				Description:   "Built-in deterministic text scanner for high-signal risky skill and plugin patterns.",
 			},
 			installPlan: InstallPlan{
 				ScannerID:       "clawscan-static",
@@ -306,12 +307,13 @@ func defaultScannerAdapters() []ScannerAdapter {
 			run: ExternalScannerRunner.runStatic,
 		},
 		scannerAdapter{
-			id:            "skillspector",
-			commandBacked: true,
+			id:              "skillspector",
+			commandBacked:   true,
+			supportsPlugins: true,
 			info: ScannerInfo{
 				DisplayName:   "NVIDIA SkillSpector",
 				RepositoryURL: "https://github.com/NVIDIA/skillspector",
-				Description:   "Local file or directory scanner. Uses SkillSpector LLM mode when provider env vars are set; otherwise runs with --no-llm.",
+				Description:   "Local skill or OpenClaw plugin file/directory scanner. Uses SkillSpector LLM mode when provider env vars are set; otherwise runs with --no-llm.",
 				OptionalEnv: []string{
 					"SKILLSPECTOR_PROVIDER",
 					"SKILLSPECTOR_MODEL",
@@ -375,12 +377,13 @@ func defaultScannerAdapters() []ScannerAdapter {
 			run: ExternalScannerRunner.runSocket,
 		},
 		scannerAdapter{
-			id:           "virustotal",
-			requirements: staticEnvRequirements("scanner virustotal", "VIRUSTOTAL_API_KEY"),
+			id:              "virustotal",
+			requirements:    staticEnvRequirements("scanner virustotal", "VIRUSTOTAL_API_KEY"),
+			supportsPlugins: true,
 			info: ScannerInfo{
 				DisplayName:   "VirusTotal API",
 				RepositoryURL: "https://docs.virustotal.com/reference/file",
-				Description:   "API-backed single local file hash lookup. Directories return a skipped result.",
+				Description:   "API-backed local file hash lookup. Skill and OpenClaw plugin directories are scanned as deterministic ZIP archives.",
 			},
 			installPlan: InstallPlan{
 				ScannerID:       "virustotal",

@@ -122,7 +122,7 @@ infra/proxmox/run-owned-fixture-smoke.sh /work/results
 Expected behavior:
 
 - owned skill: all four free scanners complete;
-- owned plugin: static completes and skill-only scanners explicitly skip;
+- owned plugin: Static and SkillSpector complete; Cisco and AgentVerus explicitly skip;
 - behavior: run separately through Observatory with `--sandbox off`;
 - no ClawHub download or external scanner/model credential is used.
 

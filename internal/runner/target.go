@@ -169,6 +169,16 @@ func isURLTarget(input string) bool {
 	return err == nil && parsed.Scheme != "" && parsed.Host != "" && (parsed.Scheme == "http" || parsed.Scheme == "https")
 }
 
+func runnableScanners(opts Options, kind string) []string {
+	var scanners []string
+	for _, scanner := range opts.Scanners {
+		if opts.ScannerResultPaths[scanner] != "" || scannerSupportsTargetKind(scanner, kind) {
+			scanners = append(scanners, scanner)
+		}
+	}
+	return scanners
+}
+
 // scannerSupportsTargetKind reports whether a built-in scanner can run against a
 // target of the given kind. Unknown scanner IDs are permitted here so the
 // scanner runner can still emit its own skipped result for them.
@@ -187,6 +197,6 @@ func unsupportedTargetKindResult(scanner string, kind string, startedAt string) 
 		Status:      "skipped",
 		StartedAt:   startedAt,
 		CompletedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Error:       fmt.Sprintf("Scanner %s does not support %s targets; use the behavior scanner to exercise native OpenClaw plugins.", scanner, kind),
+		Error:       fmt.Sprintf("Scanner %s does not support %s targets.", scanner, kind),
 	}
 }

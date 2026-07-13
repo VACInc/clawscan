@@ -458,7 +458,13 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 		env = EnvMap(os.Environ())
 	}
 	applyRuntimeEnvDefaults(opts, env)
-	if err := ValidateRequirements(opts, env); err != nil {
+	target, err := resolveTarget(opts.Target)
+	if err != nil {
+		return Artifact{}, err
+	}
+	gatingOpts := opts
+	gatingOpts.Scanners = runnableScanners(opts, target.kind)
+	if err := ValidateRequirements(gatingOpts, env); err != nil {
 		return Artifact{}, err
 	}
 	if opts.Judge != nil {
@@ -473,11 +479,7 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 		now = time.Now
 	}
 	startedAt := now().UTC().Format(time.RFC3339Nano)
-	target, err := resolveTarget(opts.Target)
-	if err != nil {
-		return Artifact{}, err
-	}
-	commandRunner, sandbox, err := commandRunnerForOptions(opts, ctx, env)
+	commandRunner, sandbox, err := commandRunnerForOptions(gatingOpts, ctx, env)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -498,6 +500,7 @@ func Run(opts Options, ctx RunContext) (Artifact, error) {
 		}
 	}
 	artifact := NewArtifact(opts, target.resolvedPath, startedAt, startedAt, env)
+	artifact.Env = envPresence(gatingOpts, env)
 	artifact.Sandbox = sandbox
 	artifact.Target.Kind = target.kind
 	artifact.Target.ID = target.id
@@ -1157,7 +1160,8 @@ func targetFilePriority(root string, path string) int {
 	if err != nil {
 		rel = path
 	}
-	if strings.EqualFold(filepath.ToSlash(rel), "SKILL.md") {
+	normalized := filepath.ToSlash(rel)
+	if strings.EqualFold(normalized, skillManifestName) || strings.EqualFold(normalized, pluginManifestName) {
 		return 0
 	}
 	return 1
@@ -1469,7 +1473,7 @@ func clawHubSystemPrompt(source string) string {
 }
 
 func clawHubPromptJob(artifact Artifact) clawhubprompt.Job {
-	return clawhubprompt.Job{
+	job := clawhubprompt.Job{
 		Job: clawhubprompt.JobMetadata{
 			TargetKind:         "skillVersion",
 			Source:             "publish",
@@ -1477,12 +1481,19 @@ func clawHubPromptJob(artifact Artifact) clawhubprompt.Job {
 		},
 		Target: clawhubprompt.Target{
 			TrustedOpenClawPlugin: false,
-			Version: &clawhubprompt.Version{
-				VTAnalysis:           clawHubVirusTotalAnalysis(artifact),
-				SkillSpectorAnalysis: scannerRawOrNil(artifact, "skillspector"),
-			},
 		},
 	}
+	evidence := &clawhubprompt.Version{
+		VTAnalysis:           clawHubVirusTotalAnalysis(artifact),
+		SkillSpectorAnalysis: scannerRawOrNil(artifact, "skillspector"),
+	}
+	if artifact.Target.Kind == targetKindPlugin {
+		job.Job.TargetKind = "packageRelease"
+		job.Target.Release = evidence
+	} else {
+		job.Target.Version = evidence
+	}
+	return job
 }
 
 func clawHubVirusTotalAnalysis(artifact Artifact) any {
