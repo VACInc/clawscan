@@ -143,9 +143,13 @@ fi
 # Reuse the exact local evidence accepted by the gate. The OAuth profile
 # refreshes VirusTotal immediately before Codex, without duplicate upload or
 # redundant local scans.
-jq -e '.scanners.virustotal.raw' "$virustotal_dir/initial.json" > "$review_dir/virustotal.json"
-jq -e '.scanners.skillspector.raw' "$security_dir/free-scan.json" > "$review_dir/skillspector.json"
-jq -e '.scanners["clawscan-static"].raw' "$security_dir/free-scan.json" > "$review_dir/clawscan-static.json"
+if ! jq -e '.scanners.virustotal.raw' "$virustotal_dir/initial.json" > "$review_dir/virustotal.json" ||
+   ! jq -e '.scanners.skillspector.raw' "$security_dir/free-scan.json" > "$review_dir/skillspector.json" ||
+   ! jq -e '.scanners["clawscan-static"].raw' "$security_dir/free-scan.json" > "$review_dir/clawscan-static.json"; then
+  write_failure "clawhub-review" "accepted scanner artifacts are missing required evidence"
+  echo "$result"
+  exit 44
+fi
 
 review_status=0
 "$clawscan_bin" "$stage/target" \
@@ -166,6 +170,7 @@ if [[ "$review_status" -ne 0 || "$review_judge_status" != "completed" ]] ||
   echo "$result"
   exit 44
 fi
+unset VIRUSTOTAL_API_KEY
 
 # The model credential is requested only after the controller has independently
 # accepted the free/static evidence and ClawHub review. It is inherited by only
