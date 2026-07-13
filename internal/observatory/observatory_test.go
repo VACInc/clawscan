@@ -882,6 +882,7 @@ func TestCanaryAgentOutputStageIsNotToolAndToolStaysLimited(t *testing.T) {
 		Metadata:       CaptureMetadata{TargetKind: "skill"},
 		Canaries:       testCanaries(),
 		// This is the agent command's final stdout, not a tool ledger.
+		BaselineAgentOutputs: [][]byte{{}},
 		ExerciseAgentOutputs: [][]byte{[]byte("final answer mentions " + marker + " and again " + marker + "\n")},
 	})
 	memory := findCanary(result.Canaries, "workspace-memory")
@@ -911,28 +912,33 @@ func TestCanaryAgentOutputStageIsNotToolAndToolStaysLimited(t *testing.T) {
 	}
 }
 
-func TestCanaryTypedToolLedgerAndSinkReceiptSeams(t *testing.T) {
+func TestCanaryVerifiedSinkPayloadsAugmentOutboundButToolStaysLimited(t *testing.T) {
 	marker := testCanaryMarkers()["cloud-credentials"]
+	privatePayload := []byte("sink received: " + marker + "\n")
+	extractedPayload := clonePrivateSinkPayloads(privatePayload)
+	privatePayload[0] = 'X'
 	sendLine := `sendto(5<TCP:[10.0.0.3:5000->93.184.216.34:443]>, "` + marker + `", 61, 0, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}, 16) = 61`
 	result := AnalyzeTraces(AnalysisInput{
-		BaselineTraces:       []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
-		ExerciseTraces:       []string{"execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" + sendLine + "\n"},
-		Metadata:             CaptureMetadata{TargetKind: "skill"},
-		Canaries:             testCanaries(),
-		ExerciseToolLedger:   [][]byte{[]byte(`{"tool":"read_file","result_contains":"` + marker + `"}`)},
-		ExerciseSinkReceipts: [][]byte{[]byte("sink received: " + marker + "\n")},
+		BaselineTraces:              []string{`execve("/usr/bin/node", ["node"], 0x0) = 0`},
+		ExerciseTraces:              []string{"execve(\"/usr/bin/node\", [\"node\"], 0x0) = 0\n" + sendLine + "\n"},
+		Metadata:                    CaptureMetadata{TargetKind: "skill"},
+		Canaries:                    testCanaries(),
+		BaselineSinkPayloadsPresent: true,
+		ExerciseSinkPayloadsPresent: true,
+		BaselineSinkPayloads:        clonePrivateSinkPayloads(nil),
+		ExerciseSinkPayloads:        extractedPayload,
 	})
 	cloud := findCanary(result.Canaries, "cloud-credentials")
 	// Trace send (1) plus one sink receipt confirming delivery.
 	if stage := findStage(cloud.Stages, "outbound"); stage.ExerciseInteractions != 2 || stage.DeltaInteractions != 2 {
 		t.Fatalf("outbound stage = %#v", cloud.Stages)
 	}
-	// The typed tool ledger populates the tool stage and flips its coverage.
-	if stage := findStage(cloud.Stages, "tool"); stage.ExerciseInteractions != 1 || stage.DeltaInteractions != 1 {
+	// Lane-owned audit metadata cannot authoritatively populate tool activity.
+	if stage := findStage(cloud.Stages, "tool"); stage.Stage != "" {
 		t.Fatalf("tool stage = %#v", cloud.Stages)
 	}
-	if state := coverageState(result.Coverage.CanaryStages, "tool"); state != "observed" {
-		t.Fatalf("tool coverage with ledger = %q", state)
+	if state := coverageState(result.Coverage.CanaryStages, "tool"); state != "limited" {
+		t.Fatalf("tool coverage = %q", state)
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -940,6 +946,35 @@ func TestCanaryTypedToolLedgerAndSinkReceiptSeams(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "OBS-CANARY") {
 		t.Fatalf("seam scan leaked the canary value: %s", encoded)
+	}
+	if bytes.Contains(encoded, extractedPayload[0]) {
+		t.Fatalf("seam scan leaked the raw sink payload: %s", encoded)
+	}
+}
+
+func TestCanarySinkPayloadCoverageRequiresPairedVerifiedChannels(t *testing.T) {
+	marker := testCanaryMarkers()["workspace-memory"]
+	input := AnalysisInput{
+		Metadata:                    CaptureMetadata{TargetKind: "skill"},
+		Canaries:                    testCanaries(),
+		ExerciseSinkPayloadsPresent: true,
+		ExerciseSinkPayloads:        clonePrivateSinkPayloads([]byte(marker)),
+	}
+	result := AnalyzeTraces(input)
+	if got := coverageState(result.Coverage.CanaryStages, CanaryStageOutbound); got != "limited" {
+		t.Fatalf("unpaired outbound coverage = %q", got)
+	}
+	if got := coverageSource(result.Coverage.CanaryStages, CanaryStageOutbound); got != "unavailable-or-unpaired" {
+		t.Fatalf("unpaired outbound source = %q", got)
+	}
+	input.BaselineSinkPayloadsPresent = true
+	input.BaselineSinkPayloads = clonePrivateSinkPayloads(nil)
+	result = AnalyzeTraces(input)
+	if got := coverageState(result.Coverage.CanaryStages, CanaryStageOutbound); got != "observed" {
+		t.Fatalf("paired outbound coverage = %q", got)
+	}
+	if got := coverageSource(result.Coverage.CanaryStages, CanaryStageOutbound); got != "typed-sink-receipt" {
+		t.Fatalf("paired outbound source = %q", got)
 	}
 }
 
@@ -954,8 +989,12 @@ func TestCanaryStageCountsAreBoundedAgainstLargeInput(t *testing.T) {
 		ExerciseAgentOutputs: [][]byte{[]byte(flood)},
 	})
 	stage := findStage(findCanary(result.Canaries, "cloud-credentials").Stages, "agent-output")
-	if stage.ExerciseInteractions != maxCanaryInteractionCount || stage.DeltaInteractions != maxCanaryInteractionCount {
+	want := bytes.Count([]byte(flood[:maxCanaryScanBytes]), []byte(marker))
+	if stage.ExerciseInteractions != want || stage.DeltaInteractions != want {
 		t.Fatalf("bounded agent-output stage = %#v", stage)
+	}
+	if state := coverageState(result.Coverage.CanaryStages, CanaryStageAgentOutput); state != "limited" {
+		t.Fatalf("truncated agent-output coverage = %q", state)
 	}
 }
 
@@ -1002,6 +1041,21 @@ func TestValidateEvidenceRejectsInvalidCanaryStagesAndCoverage(t *testing.T) {
 	evidence.Canaries[0].Class = ""
 	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "canary class") {
 		t.Fatalf("empty class err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Coverage.CanaryStages[5].Coverage = "observed"
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "cannot be authoritative") {
+		t.Fatalf("forged tool coverage err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Coverage.CanaryStages[4].Source = "agent-command-stdout-unpaired-or-truncated"
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "agent-output coverage is inconsistent") {
+		t.Fatalf("forged agent-output source err = %v", err)
+	}
+	evidence = fixtureEvidence()
+	evidence.Coverage.CanaryStages[3].Source = "unavailable-or-unpaired"
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "outbound coverage is inconsistent") {
+		t.Fatalf("forged outbound source err = %v", err)
 	}
 }
 
@@ -1208,7 +1262,7 @@ func TestValidateEvidenceRejectsCompletedRunWithoutCompleteLanes(t *testing.T) {
 	}
 	evidence = fixtureEvidence()
 	evidence.Coverage.BaselinePaired = false
-	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "inconsistent with lane exits") {
+	if err := ValidateEvidence(evidence); err == nil || !strings.Contains(err.Error(), "paired-trace coverage is inconsistent") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -1359,6 +1413,23 @@ func TestReadCaptureBundleRequiresLaneAndRuntimeReceipts(t *testing.T) {
 	}
 }
 
+func TestBuildEvidencePrivacyGateRejectsPrivateMaterialInPublicFields(t *testing.T) {
+	entries := fixtureBundleEntries("obs_privacy_gate", "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64), "skill", "")
+	marker := testCanaryMarkers()["workspace-memory"]
+	entries["meta/openclaw-version"] = "OpenClaw " + marker + "\n"
+	bundlePath := filepath.Join(t.TempDir(), "capture.tar.gz")
+	if err := writeTestBundle(bundlePath, entries); err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := ReadCaptureBundle(bundlePath, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildEvidence(fixtureEvidence().Target, validTestConfig(t, t.TempDir()), bundle); err == nil || !strings.Contains(err.Error(), "private capture material") {
+		t.Fatalf("privacy gate err = %v", err)
+	}
+}
+
 func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 	requireLinuxControlHost(t)
 	if err := verifyCaptureRun(CaptureMetadata{RunID: "obs_old"}, "obs_current"); err == nil || !strings.Contains(err.Error(), "run ID mismatch") {
@@ -1472,6 +1543,15 @@ func coverageState(coverage []CanaryStageCoverage, stage string) string {
 	for _, entry := range coverage {
 		if entry.Stage == stage {
 			return entry.Coverage
+		}
+	}
+	return ""
+}
+
+func coverageSource(coverage []CanaryStageCoverage, stage string) string {
+	for _, entry := range coverage {
+		if entry.Stage == stage {
+			return entry.Source
 		}
 	}
 	return ""
@@ -1695,7 +1775,7 @@ func fixtureEvidence() Evidence {
 		Canaries:     []CanaryObservation{{ID: "cloud-credentials", Surface: "home file", Class: "credential"}},
 		Coverage: CoverageEvidence{
 			SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true,
-			CanaryStages: canaryStageCoverage(true, true, false), Limitations: []string{"Fixture limitation."},
+			CanaryStages: canaryStageCoverage(canaryCoverageInputs{PairedTrace: true, PairedAgentOutput: true, AgentOutputComplete: true}), Limitations: []string{"Fixture limitation."},
 		},
 	}
 }

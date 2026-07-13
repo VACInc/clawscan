@@ -173,7 +173,10 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
-	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	evidence, err := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	if err != nil {
+		return ScanResult{RunDirectory: runDir}, err
+	}
 	if err := ValidateEvidence(evidence); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
@@ -249,7 +252,10 @@ func AnalyzeBundle(target string, config Config, bundlePath string) (Evidence, e
 	if err := verifyCaptureConfig(bundle.Metadata, effectiveConfig); err != nil {
 		return Evidence{}, err
 	}
-	evidence := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	evidence, err := BuildEvidence(staged.Evidence, effectiveConfig, bundle)
+	if err != nil {
+		return Evidence{}, err
+	}
 	if err := ValidateEvidence(evidence); err != nil {
 		return Evidence{}, err
 	}
@@ -305,7 +311,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // CaptureProtocolRevision identifies the capture, isolation orchestration, and
 // trace-analysis semantics. Bump it whenever any of those semantics change so
 // version comparisons cannot mix evidence produced by different protocols.
-const CaptureProtocolRevision = "observatory.capture-protocol.v16"
+const CaptureProtocolRevision = "observatory.capture-protocol.v17"
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)

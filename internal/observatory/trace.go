@@ -1,6 +1,7 @@
 package observatory
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	pathpkg "path"
@@ -22,18 +23,17 @@ type AnalysisInput struct {
 	// not a tool-call ledger and never populates the tool stage.
 	BaselineAgentOutputs [][]byte
 	ExerciseAgentOutputs [][]byte
-	// BaselineToolLedger and ExerciseToolLedger are the optional bounded seam for
-	// the audit/trajectory-backed tool ledger (enhancement 1). Only these typed
-	// inputs populate the tool stage; while they are absent, tool coverage is
-	// limited (unavailable) and tool use is never inferred from agent stdout.
-	BaselineToolLedger [][]byte
-	ExerciseToolLedger [][]byte
-	// BaselineSinkReceipts and ExerciseSinkReceipts are the optional bounded seam
-	// for controlled outbound-payload sink receipts (enhancement 3). When
-	// present they augment the trace-derived outbound stage with confirmed sink
-	// deliveries.
-	BaselineSinkReceipts [][]byte
-	ExerciseSinkReceipts [][]byte
+	// Local OpenClaw audit records do not expose bounded tool arguments/results.
+	// They are lane-owned, so this analyzer never treats them as authoritative
+	// tool-stage proof. The tool stage remains explicitly limited.
+	//
+	// These are private payload slices extracted only after the canonical typed
+	// controlled-sink receipt has been parsed and verified. Presence is tracked
+	// separately so a valid empty per-lane receipt remains observable.
+	BaselineSinkPayloads        [][]byte
+	ExerciseSinkPayloads        [][]byte
+	BaselineSinkPayloadsPresent bool
+	ExerciseSinkPayloadsPresent bool
 }
 
 type analysisResult struct {
@@ -100,6 +100,8 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	observationsByKey := map[string]traceObservation{}
 	baselineCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
 	exerciseCanaries := make(map[string]*canaryLaneCounts, len(input.Canaries))
+	agentOutputScanComplete := streamsScannable(input.BaselineAgentOutputs) && streamsScannable(input.ExerciseAgentOutputs)
+	sinkPayloadScanComplete := streamsScannable(input.BaselineSinkPayloads) && streamsScannable(input.ExerciseSinkPayloads)
 	for _, canary := range input.Canaries {
 		baselineCanaries[canary.ID] = newCanaryLaneCounts()
 		exerciseCanaries[canary.ID] = newCanaryLaneCounts()
@@ -198,14 +200,11 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 			exerciseStage := clampCanaryCount(exercise.stages[stage])
 			switch stage {
 			case CanaryStageOutbound:
-				baselineStage = clampCanaryCount(baselineStage + countCanaryInStreams(input.BaselineSinkReceipts, canary.Marker))
-				exerciseStage = clampCanaryCount(exerciseStage + countCanaryInStreams(input.ExerciseSinkReceipts, canary.Marker))
+				baselineStage = clampCanaryCount(baselineStage + countCanaryInStreams(input.BaselineSinkPayloads, canary.Marker))
+				exerciseStage = clampCanaryCount(exerciseStage + countCanaryInStreams(input.ExerciseSinkPayloads, canary.Marker))
 			case CanaryStageAgentOutput:
 				baselineStage = clampCanaryCount(countCanaryInStreams(input.BaselineAgentOutputs, canary.Marker))
 				exerciseStage = clampCanaryCount(countCanaryInStreams(input.ExerciseAgentOutputs, canary.Marker))
-			case CanaryStageTool:
-				baselineStage = clampCanaryCount(countCanaryInStreams(input.BaselineToolLedger, canary.Marker))
-				exerciseStage = clampCanaryCount(countCanaryInStreams(input.ExerciseToolLedger, canary.Marker))
 			}
 			if baselineStage == 0 && exerciseStage == 0 {
 				continue
@@ -232,15 +231,22 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 	sort.Slice(result.Canaries, func(i, j int) bool { return result.Canaries[i].ID < result.Canaries[j].ID })
 
 	pairedTraceReceipts := traceLaneHasCompleteSyscall(input.BaselineTraces) && traceLaneHasCompleteSyscall(input.ExerciseTraces)
-	agentOutputChannel := len(input.BaselineAgentOutputs) > 0 || len(input.ExerciseAgentOutputs) > 0
-	toolLedgerChannel := len(input.BaselineToolLedger) > 0 || len(input.ExerciseToolLedger) > 0
+	agentOutputChannel := len(input.BaselineAgentOutputs) > 0 && len(input.ExerciseAgentOutputs) > 0
+	sinkReceiptChannel := (input.BaselineSinkPayloadsPresent || len(input.BaselineSinkPayloads) > 0) &&
+		(input.ExerciseSinkPayloadsPresent || len(input.ExerciseSinkPayloads) > 0)
 	result.Coverage = CoverageEvidence{
 		SyscallScope:    "selected-mvp-syscalls",
 		FileSyscalls:    pairedTraceReceipts,
 		ProcessSyscalls: pairedTraceReceipts,
 		NetworkSyscalls: pairedTraceReceipts,
 		BaselinePaired:  pairedTraceReceipts,
-		CanaryStages:    canaryStageCoverage(pairedTraceReceipts, agentOutputChannel, toolLedgerChannel),
+		CanaryStages: canaryStageCoverage(canaryCoverageInputs{
+			PairedTrace:          pairedTraceReceipts,
+			PairedAgentOutput:    agentOutputChannel,
+			AgentOutputComplete:  agentOutputScanComplete,
+			PairedSinkReceipts:   sinkReceiptChannel,
+			SinkReceiptsComplete: sinkPayloadScanComplete,
+		}),
 		Limitations: []string{
 			"Coverage booleans confirm paired trace receipts for selected MVP syscall families; they do not claim an exhaustive Linux syscall audit.",
 			"Observed behavior is input- and model-dependent; unexercised branches remain invisible.",
@@ -249,7 +255,8 @@ func AnalyzeTraces(input AnalysisInput) analysisResult {
 			"MVP coverage is limited to one bounded OpenClaw " + input.Metadata.TargetKind + " exercise; browser automation is not exercised.",
 			"Canary correlation classifies interactions into read, write, execute, outbound, agent-output, and tool stages; the read stage reflects read-intent file opens, not individual read() syscalls, which are outside the selected scope.",
 			"The capture retains send-payload bytes privately (bounded by the trace file limit) so outbound correlation matches canary values in socket sends; raw payloads are never published and public subjects stay redacted.",
-			"The tool stage is populated only from a typed audit/trajectory tool ledger; while that seam is absent its coverage is limited and tool use is never inferred from agent stdout. A zero count on a stage whose channel is present is limited coverage, not proof of non-use.",
+			"The local OpenClaw audit metadata lacks bounded tool arguments and results and is lane-owned, so tool coverage is explicitly limited and tool use is never inferred from stdout.",
+			"Typed controlled-sink receipts augment outbound correlation when both lane channels are present; missing, unpaired, malformed, oversized, or truncated channels never claim observed coverage.",
 		},
 	}
 	return result
@@ -268,17 +275,41 @@ func newCanaryLaneCounts() *canaryLaneCounts {
 // positively confirm it. The value is a stable function of the protocol, capture
 // completeness, and which typed input channels are present, so two runs of the
 // same protocol and inputs compare as equal. read/write/execute/outbound are
-// confirmed by paired syscall traces (the capture retains send payloads);
-// agent-output is confirmed when the agent command stdout is captured; tool is
-// confirmed only when the typed tool-ledger seam is supplied.
-func canaryStageCoverage(pairedTraceReceipts bool, agentOutputChannel bool, toolLedgerChannel bool) []CanaryStageCoverage {
+// confirmed by paired syscall traces (the capture retains send payloads), with
+// typed controlled-sink receipts augmenting outbound confirmation. Agent-output
+// requires paired, fully scanned stdout. Tool stays limited because the local
+// audit source does not provide authoritative bounded arguments/results.
+type canaryCoverageInputs struct {
+	PairedTrace          bool
+	PairedAgentOutput    bool
+	AgentOutputComplete  bool
+	PairedSinkReceipts   bool
+	SinkReceiptsComplete bool
+}
+
+func canaryStageCoverage(input canaryCoverageInputs) []CanaryStageCoverage {
+	outboundObserved := input.PairedTrace || (input.PairedSinkReceipts && input.SinkReceiptsComplete)
+	outboundSource := "unavailable-or-unpaired"
+	switch {
+	case input.PairedTrace && input.PairedSinkReceipts && input.SinkReceiptsComplete:
+		outboundSource = "socket-send-syscall-payload+typed-sink-receipt"
+	case input.PairedTrace:
+		outboundSource = "socket-send-syscall-payload"
+	case input.PairedSinkReceipts && input.SinkReceiptsComplete:
+		outboundSource = "typed-sink-receipt"
+	}
+	agentOutputObserved := input.PairedAgentOutput && input.AgentOutputComplete
+	agentOutputSource := "agent-command-stdout-unpaired-or-truncated"
+	if agentOutputObserved {
+		agentOutputSource = "agent-command-stdout"
+	}
 	return []CanaryStageCoverage{
-		{Stage: CanaryStageRead, Coverage: coverageLabel(pairedTraceReceipts), Source: "file-open-and-descriptor-syscall-trace"},
-		{Stage: CanaryStageWrite, Coverage: coverageLabel(pairedTraceReceipts), Source: "file-mutation-syscall-trace"},
-		{Stage: CanaryStageExecute, Coverage: coverageLabel(pairedTraceReceipts), Source: "exec-syscall-trace"},
-		{Stage: CanaryStageOutbound, Coverage: coverageLabel(pairedTraceReceipts), Source: "socket-send-syscall-payload"},
-		{Stage: CanaryStageAgentOutput, Coverage: coverageLabel(agentOutputChannel), Source: "agent-command-stdout"},
-		{Stage: CanaryStageTool, Coverage: coverageLabel(toolLedgerChannel), Source: "audit-tool-ledger"},
+		{Stage: CanaryStageRead, Coverage: coverageLabel(input.PairedTrace), Source: "file-open-and-descriptor-syscall-trace"},
+		{Stage: CanaryStageWrite, Coverage: coverageLabel(input.PairedTrace), Source: "file-mutation-syscall-trace"},
+		{Stage: CanaryStageExecute, Coverage: coverageLabel(input.PairedTrace), Source: "exec-syscall-trace"},
+		{Stage: CanaryStageOutbound, Coverage: coverageLabel(outboundObserved), Source: outboundSource},
+		{Stage: CanaryStageAgentOutput, Coverage: coverageLabel(agentOutputObserved), Source: agentOutputSource},
+		{Stage: CanaryStageTool, Coverage: "limited", Source: "openclaw-audit-metadata-no-bounded-args-results"},
 	}
 }
 
@@ -289,16 +320,43 @@ func coverageLabel(available bool) string {
 	return "limited"
 }
 
+const (
+	maxCanaryScanStreams = 64
+	maxCanaryScanBytes   = 8 << 20
+)
+
+func streamsScannable(streams [][]byte) bool {
+	if len(streams) > maxCanaryScanStreams {
+		return false
+	}
+	total := 0
+	for _, stream := range streams {
+		if len(stream) > maxCanaryScanBytes-total {
+			return false
+		}
+		total += len(stream)
+	}
+	return true
+}
+
 func countCanaryInStreams(streams [][]byte, marker string) int {
 	if marker == "" {
 		return 0
 	}
 	total := 0
-	for _, stream := range streams {
+	remaining := maxCanaryScanBytes
+	for index, stream := range streams {
+		if index >= maxCanaryScanStreams || remaining == 0 {
+			break
+		}
 		if len(stream) == 0 {
 			continue
 		}
-		total += strings.Count(string(stream), marker)
+		if len(stream) > remaining {
+			stream = stream[:remaining]
+		}
+		remaining -= len(stream)
+		total += bytes.Count(stream, []byte(marker))
 		if total >= maxCanaryInteractionCount {
 			return maxCanaryInteractionCount
 		}

@@ -126,7 +126,7 @@ Every canary observation carries a stable `class` (`identity`, `memory`, or
   controlled sink receipt confirmed delivery;
 - `agent-output` — the canary value surfaced in the OpenClaw agent command stdout
   / final JSON;
-- `tool` — the canary value appeared in the typed audit/trajectory tool ledger.
+- `tool` — reserved for authoritative control-plane tool-call correlation.
 
 `read`, `write`, `execute`, and `outbound` come from the paired syscall trace.
 The capture retains bounded send-payload and `argv` bytes (`strace -s 4096`), so
@@ -135,19 +135,36 @@ root-owned and private, and public subjects/values are always redacted.
 Correlation never inspects `argv` or payload bytes for a bare path string, so
 spoofing a canary path in an unrelated argument cannot forge an interaction.
 
-`agent-output` scans the agent command's own stdout — it is honestly its own
-signal, never a substitute for tool-call evidence. The `tool` stage is reserved
-for the audit/trajectory-backed tool ledger and is populated only from that typed
-seam; tool use is never inferred from final stdout. Controlled outbound sink
-receipts feed the `outbound` stage through their own typed seam.
+`agent-output` scans the agent command's own stdout. It is its own signal, never
+a substitute for tool-call evidence. Local OpenClaw audit metadata does not
+contain bounded tool arguments/results and is written inside the lane, so this
+capture protocol never treats it as authoritative. The `tool` stage therefore
+stays explicitly `limited`; tool use is never inferred from final stdout.
+
+Controlled outbound correlation consumes only the private payload bytes from
+the canonical, already verified `baseline/mock-egress.json` and
+`exercise/mock-egress.json` receipts. The controlled mock-egress parser owns
+schema, lane, sink identity, request and byte cap, base64, counter, and unknown
+field validation. Both lane receipts must be present for the receipt source to
+claim observed coverage. Only extracted decoded payload bytes are scanned, so
+receipt metadata cannot spoof a hit. Missing, malformed, oversized, unpaired, or
+truncated inputs fail closed or downgrade coverage.
 
 `coverage.canaryStages` records, per stage, whether the capture can positively
 confirm it. `read`/`write`/`execute`/`outbound` are `observed` when paired traces
-exist; `agent-output` is `observed` when the agent stdout is captured; `tool` is
-`limited` until the typed tool-ledger seam is supplied. A `limited` stage only
-weakens a negative: a zero count is limited coverage, not proof of non-use, while
-any nonzero interaction is a real observation. Interaction counters are bounded so
-an adversarially large capture cannot inflate the evidence.
+exist; paired controlled-sink receipts can also confirm `outbound`.
+`agent-output` is `observed` only when both lane streams are present and fully
+scanned. `tool` is always `limited` for this protocol. A `limited` stage only
+weakens a negative: a zero count is not proof of non-use, while any nonzero
+interaction is a real observation. Stream counts, scanned bytes, receipt sizes,
+and published counters are bounded so an adversarial capture cannot inflate
+work or evidence.
+
+Raw traces, stdout, receipt identifiers, decoded payloads, arguments, private
+paths, and private/control-plane addresses remain in the private capture only.
+Before publishing, Observatory checks the complete encoded evidence for capture
+markers and private receipt or runtime material. Rendering, diffing, and any
+history persistence operate only on that validated public evidence.
 
 Re-analysis requires the same effective prompt, model, endpoint allowlist,
 capture-protocol revision, isolation receipt, and resource limits used for
@@ -229,9 +246,9 @@ no declared tools require an operator-supplied `exercise.prompt`.
 - Results depend on model/tool behavior and synthetic inputs.
 - `strace` provides endpoint addresses, not complete DNS attribution; send
   payloads are retained only up to the bounded `strace -s` size.
-- The canary `tool` stage stays `limited` until the typed audit/trajectory
-  tool-ledger seam is wired; a zero count on any stage whose channel is present is
-  limited coverage, not proof the token was unused.
+- The canary `tool` stage stays `limited` because the available local OpenClaw
+  audit metadata is not authoritative bounded tool-call evidence. A zero count on
+  a limited stage is not proof the token was unused.
 - Skills and native tool plugins are covered; browser/GUI and channel plugins
   are not exercised deeply.
 - Behavioral correlation is not author intent and is never a safety verdict.

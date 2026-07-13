@@ -21,9 +21,10 @@ const MaxEvidenceBytes = 64 << 20
 //   - agent-output records the canary value surfacing in the OpenClaw agent
 //     command stdout / final JSON. It is honestly its own signal, not a
 //     tool-call ledger.
-//   - tool is reserved for the audit/trajectory-backed tool ledger and is only
-//     populated from a typed tool-ledger seam. Until that typed input exists,
-//     tool coverage is limited; tool use is never inferred from agent stdout.
+//   - tool is reserved for a future authoritative control-plane ledger. Local
+//     OpenClaw audit metadata lacks bounded arguments/results and is lane-owned,
+//     so this protocol always reports tool coverage as limited. Tool use is
+//     never inferred from agent stdout.
 //
 // Absence of a value on a stage whose channel is present is limited coverage,
 // not proof the token went unused.
@@ -283,6 +284,15 @@ func ValidateEvidence(evidence Evidence) error {
 	if err := validateCanaryStageCoverage(evidence.Coverage.CanaryStages); err != nil {
 		return err
 	}
+	pairedTraceCoverage := evidence.Coverage.BaselinePaired && evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
+	if evidence.Coverage.BaselinePaired != evidence.Coverage.FileSyscalls || evidence.Coverage.BaselinePaired != evidence.Coverage.ProcessSyscalls || evidence.Coverage.BaselinePaired != evidence.Coverage.NetworkSyscalls {
+		return errors.New("evidence syscall and paired-trace coverage is inconsistent")
+	}
+	for _, index := range []int{0, 1, 2} {
+		if (evidence.Coverage.CanaryStages[index].Coverage == "observed") != pairedTraceCoverage {
+			return errors.New("evidence canary trace-stage coverage is inconsistent")
+		}
+	}
 	completeCapture := evidence.Run.LaneExitCode == (LaneExitCodes{}) && evidence.Coverage.BaselinePaired &&
 		evidence.Coverage.FileSyscalls && evidence.Coverage.ProcessSyscalls && evidence.Coverage.NetworkSyscalls
 	if (evidence.Run.Status == "completed") != completeCapture {
@@ -348,6 +358,22 @@ func validateCanaryStageCoverage(coverage []CanaryStageCoverage) error {
 	if len(coverage) != len(canaryStageSequence) {
 		return errors.New("evidence canary stage coverage is incomplete")
 	}
+	expectedSources := map[string]map[string]bool{
+		CanaryStageRead:    {"file-open-and-descriptor-syscall-trace": true},
+		CanaryStageWrite:   {"file-mutation-syscall-trace": true},
+		CanaryStageExecute: {"exec-syscall-trace": true},
+		CanaryStageOutbound: {
+			"socket-send-syscall-payload":                    true,
+			"typed-sink-receipt":                             true,
+			"socket-send-syscall-payload+typed-sink-receipt": true,
+			"unavailable-or-unpaired":                        true,
+		},
+		CanaryStageAgentOutput: {
+			"agent-command-stdout":                       true,
+			"agent-command-stdout-unpaired-or-truncated": true,
+		},
+		CanaryStageTool: {"openclaw-audit-metadata-no-bounded-args-results": true},
+	}
 	for i, entry := range coverage {
 		if entry.Stage != canaryStageSequence[i] {
 			return errors.New("evidence canary stage coverage is missing or out of order")
@@ -355,8 +381,20 @@ func validateCanaryStageCoverage(coverage []CanaryStageCoverage) error {
 		if entry.Coverage != "observed" && entry.Coverage != "limited" {
 			return errors.New("evidence canary stage coverage state is invalid")
 		}
-		if strings.TrimSpace(entry.Source) == "" || len(entry.Source) > 80 || strings.ContainsAny(entry.Source, "\x00\r\n") {
+		if !expectedSources[entry.Stage][entry.Source] {
 			return errors.New("evidence canary stage coverage source is invalid")
+		}
+		if entry.Stage == CanaryStageTool && entry.Coverage != "limited" {
+			return errors.New("evidence tool-stage coverage cannot be authoritative for this capture protocol")
+		}
+		if entry.Stage == CanaryStageOutbound && entry.Source == "unavailable-or-unpaired" && entry.Coverage != "limited" {
+			return errors.New("evidence outbound coverage is inconsistent with its source")
+		}
+		if entry.Stage == CanaryStageOutbound && entry.Source != "unavailable-or-unpaired" && entry.Coverage != "observed" {
+			return errors.New("evidence outbound coverage is inconsistent with its source")
+		}
+		if entry.Stage == CanaryStageAgentOutput && (entry.Source == "agent-command-stdout") != (entry.Coverage == "observed") {
+			return errors.New("evidence agent-output coverage is inconsistent with its source")
 		}
 	}
 	return nil

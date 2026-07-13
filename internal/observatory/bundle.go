@@ -2,6 +2,7 @@ package observatory
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,11 +21,13 @@ import (
 )
 
 type CaptureBundle struct {
-	Metadata       CaptureMetadata
-	BaselineTraces []string
-	ExerciseTraces []string
-	BaselineOutput []byte
-	ExerciseOutput []byte
+	Metadata              CaptureMetadata
+	BaselineTraces        []string
+	ExerciseTraces        []string
+	BaselineOutput        []byte
+	ExerciseOutput        []byte
+	BaselineOutputPresent bool
+	ExerciseOutputPresent bool
 }
 
 func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error) {
@@ -87,6 +90,9 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 		if int64(len(data)) != header.Size {
 			return CaptureBundle{}, fmt.Errorf("capture entry size mismatch: %s", name)
 		}
+		if _, exists := entries[name]; exists {
+			return CaptureBundle{}, fmt.Errorf("capture bundle contains duplicate entry: %s", name)
+		}
 		entries[name] = data
 	}
 	if _, err := io.Copy(io.Discard, decompressed); err != nil {
@@ -109,8 +115,10 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 			bundle.ExerciseTraces = append(bundle.ExerciseTraces, string(data))
 		case name == "baseline/agent.stdout":
 			bundle.BaselineOutput = append([]byte(nil), data...)
+			bundle.BaselineOutputPresent = true
 		case name == "exercise/agent.stdout":
 			bundle.ExerciseOutput = append([]byte(nil), data...)
+			bundle.ExerciseOutputPresent = true
 		}
 	}
 	if !traceLaneHasCompleteSyscall(bundle.BaselineTraces) {
@@ -270,28 +278,36 @@ func safeVersion(value string) string {
 	return value
 }
 
-func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) Evidence {
+func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) (Evidence, error) {
 	target.Lineage = config.TargetLineage
-	analysis := AnalyzeTraces(AnalysisInput{
+	baselineAgentOutputs := [][]byte(nil)
+	exerciseAgentOutputs := [][]byte(nil)
+	if bundle.BaselineOutputPresent {
+		baselineAgentOutputs = [][]byte{bundle.BaselineOutput}
+	}
+	if bundle.ExerciseOutputPresent {
+		exerciseAgentOutputs = [][]byte{bundle.ExerciseOutput}
+	}
+	analysisInput := AnalysisInput{
 		BaselineTraces:        bundle.BaselineTraces,
 		ExerciseTraces:        bundle.ExerciseTraces,
 		Metadata:              bundle.Metadata,
 		Canaries:              bundle.Metadata.Canaries,
 		ControlPlaneAddresses: config.Runtime.ControlPlaneAddresses,
-		// The captured agent command stdout feeds the agent-output stage only.
-		// The tool ledger (enhancement 1) and sink-receipt (enhancement 3) seams
-		// are left unwired here, so their stages stay limited until those typed
-		// inputs exist.
-		BaselineAgentOutputs: [][]byte{bundle.BaselineOutput},
-		ExerciseAgentOutputs: [][]byte{bundle.ExerciseOutput},
-	})
+		// Agent stdout feeds agent-output only. Controlled, typed receipts feed
+		// outbound only. Local OpenClaw audit metadata lacks bounded arguments and
+		// results, so it is intentionally not treated as authoritative tool proof.
+		BaselineAgentOutputs: baselineAgentOutputs,
+		ExerciseAgentOutputs: exerciseAgentOutputs,
+	}
+	analysis := AnalyzeTraces(analysisInput)
 	started := bundle.Metadata.StartedAt
 	completed := bundle.Metadata.CompletedAt
 	status := "completed"
 	if bundle.Metadata.BaselineExitCode != 0 || bundle.Metadata.ExerciseExitCode != 0 || !analysis.Coverage.BaselinePaired {
 		status = "incomplete"
 	}
-	return Evidence{
+	evidence := Evidence{
 		SchemaVersion:       EvidenceSchemaVersion,
 		CaptureConfigSHA256: bundle.Metadata.CaptureConfigSHA,
 		Target:              target,
@@ -332,6 +348,38 @@ func BuildEvidence(target TargetEvidence, config Config, bundle CaptureBundle) E
 		Canaries:     analysis.Canaries,
 		Coverage:     analysis.Coverage,
 	}
+	if err := validateBuiltEvidencePrivacy(evidence, bundle, config); err != nil {
+		return Evidence{}, err
+	}
+	return evidence, nil
+}
+
+func validateBuiltEvidencePrivacy(evidence Evidence, bundle CaptureBundle, config Config) error {
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return fmt.Errorf("encode evidence for privacy validation: %w", err)
+	}
+	privateValues := []string{
+		bundle.Metadata.BaselineWorkspace, bundle.Metadata.ExerciseWorkspace,
+		bundle.Metadata.BaselineState, bundle.Metadata.ExerciseState,
+		bundle.Metadata.BaselineHome, bundle.Metadata.ExerciseHome,
+		bundle.Metadata.TargetRoot,
+	}
+	for _, canary := range bundle.Metadata.Canaries {
+		privateValues = append(privateValues, canary.Marker)
+	}
+	for _, address := range config.Runtime.ControlPlaneAddresses {
+		privateValues = append(privateValues, address)
+		if host, _, splitErr := net.SplitHostPort(address); splitErr == nil {
+			privateValues = append(privateValues, host)
+		}
+	}
+	for _, value := range privateValues {
+		if value != "" && bytes.Contains(encoded, []byte(value)) {
+			return errors.New("refusing to publish evidence containing private capture material")
+		}
+	}
+	return nil
 }
 
 func canaryDefinitions(markers map[string]string) ([]CanaryDefinition, error) {
