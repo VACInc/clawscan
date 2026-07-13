@@ -170,6 +170,15 @@ clean result. `residual: unavailable` is reserved for read-only system locations
 that cannot be inventoried (for example `/etc/cron.d`), where a denied attempt is
 still recorded from the syscall trace.
 
+Each before/after inventory runs in its own transient systemd unit as the
+unprivileged agent user. The lane is mounted read-only to the unit; systemd owns
+the receipt stream. The unit has no capabilities or network, hides unrelated
+lane/repository paths, and enforces fixed time, memory, swap, CPU, task, file
+descriptor, output-size, namespace, and syscall bounds. Traversal also caps entry
+count, depth, path length, hashed-file size, and serialized output. Reaching any
+bound marks the receipt incomplete or fails the unit, and bundle parsing rejects
+the scan.
+
 `persistence.surfaces` publishes the monitored catalog so coverage is explicit.
 The section never claims exhaustive host persistence detection, carries no
 verdict, and a persistence-surface write is a behavioral observation, not proof
@@ -242,7 +251,12 @@ inside the guest, and non-agent (control-plane), model, and management traffic a
 untouched. This entry is kept separate from the exact model control-plane
 allowlist; everything else stays default-deny. The sink applies strict request,
 per-request byte, total byte, and wall-clock caps, and returns an optional
-deterministic canned response.
+deterministic canned response. The sink itself runs in a separate transient
+systemd unit with no capabilities, a read-only system, an exact bind-port rule,
+write access only to its receipt directory, and fixed time, memory, swap, CPU,
+task, file descriptor, and output-size limits. A preallocated capture buffer plus
+bounded concurrent sockets and data-event counters prevents request/chunk object
+overhead from growing independently of the configured byte limits.
 
 So the exercised target can actually use the sink, an enabled scan exposes a
 clearly synthetic `OBSERVATORY_MOCK_EGRESS_URL` in the otherwise-empty child
@@ -261,10 +275,12 @@ evidence never pretends opaque traffic was read. Connect/send observations to th
 sink are labeled `controlled-sink:<port>`; the raw loopback address is redacted.
 
 The system fails closed: when the sink is enabled the bundle must contain a
-per-lane receipt whose recorded sink identity matches the configured address, and
-a receipt present while the sink is disabled is rejected. The applied guest
-firewall receipt remains required, and the sink is pinned into the stable
-firewall-policy digest so the receipt changes when the sink configuration does.
+per-lane receipt whose recorded sink identity matches the configured address.
+Receipt request, aggregate byte, per-request byte, chunk, and peak-socket counters
+must remain within the effective configuration and protocol caps. A receipt
+present while the sink is disabled is rejected. The applied guest firewall
+receipt remains required, and the sink is pinned into the stable firewall-policy
+digest so the receipt changes when the sink configuration does.
 
 Sizing: `limits.maxBundleBytes` must leave room for both per-lane receipts, at
 least `mockEgress.maxTotalBytes * 2 + 1 MiB`.

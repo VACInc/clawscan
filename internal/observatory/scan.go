@@ -317,7 +317,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // version comparisons cannot mix evidence produced by different protocols. It
 // embeds PersistenceProtocolRevision so a change to the persistence surface
 // catalog or before/after inventory semantics also invalidates stale receipts.
-const CaptureProtocolRevision = "observatory.capture-protocol.v16+" + PersistenceProtocolRevision
+const CaptureProtocolRevision = "observatory.capture-protocol.v17+" + PersistenceProtocolRevision
 
 func captureConfigSHA256(config Config) string {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)

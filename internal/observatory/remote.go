@@ -116,6 +116,9 @@ if (!process.argv[2] || !output) throw new Error("usage: inventory.mjs LANE_ROOT
 
 const MAX_ENTRIES = 20000;
 const MAX_HASH_BYTES = 1 << 20;
+const MAX_OUTPUT_BYTES = 8 << 20;
+const MAX_PATH_BYTES = 4096;
+const MAX_DEPTH = 64;
 
 const roots = [
   "state",
@@ -127,33 +130,52 @@ const roots = [
 
 const lines = [];
 let truncated = false;
+let outputBytes = 0;
 
 function modeOf(stat) {
   return (stat.mode & 0o7777).toString(8).padStart(4, "0");
 }
 
-function record(absolute, relative) {
+function absent(error) {
+  return error && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+function recordLine(line) {
+  const bytes = Buffer.byteLength(line + "\n");
+  if (outputBytes + bytes > MAX_OUTPUT_BYTES) {
+    truncated = true;
+    return false;
+  }
+  lines.push(line);
+  outputBytes += bytes;
+  return true;
+}
+
+function record(absolute, relative, depth) {
   // Reject control characters so a target-controlled filename cannot forge or
-  // split an inventory line. Such names are never legitimate persistence surfaces.
-  if (/[\u0000-\u001f]/.test(relative)) {
+  // split an inventory line. An unrepresentable path makes the inventory
+  // incomplete and therefore fail closed during bundle parsing.
+  if (/[\u0000-\u001f]/.test(relative) || Buffer.byteLength(relative) > MAX_PATH_BYTES || depth > MAX_DEPTH) {
+    truncated = true;
     return;
   }
   let stat;
   try {
     stat = fs.lstatSync(absolute);
-  } catch {
+  } catch (error) {
+    if (!absent(error)) truncated = true;
     return;
   }
   if (stat.isSymbolicLink()) {
-    lines.push(modeOf(stat) + "\tsymlink\t" + relative);
+    recordLine(modeOf(stat) + "\tsymlink\t" + relative);
     return;
   }
   if (stat.isDirectory()) {
-    walk(absolute, relative);
+    walk(absolute, relative, depth);
     return;
   }
   if (!stat.isFile()) {
-    lines.push(modeOf(stat) + "\tspecial\t" + relative);
+    recordLine(modeOf(stat) + "\tspecial\t" + relative);
     return;
   }
   let digest;
@@ -162,45 +184,49 @@ function record(absolute, relative) {
   } else {
     try {
       digest = crypto.createHash("sha256").update(fs.readFileSync(absolute)).digest("hex");
-    } catch {
+    } catch (error) {
+      if (!absent(error)) truncated = true;
       return;
     }
   }
-  lines.push(modeOf(stat) + "\t" + digest + "\t" + relative);
+  recordLine(modeOf(stat) + "\t" + digest + "\t" + relative);
 }
 
-function walk(absolute, relative) {
-  if (lines.length >= MAX_ENTRIES) {
+function walk(absolute, relative, depth) {
+  if (truncated || lines.length >= MAX_ENTRIES || depth >= MAX_DEPTH) {
     truncated = true;
     return;
   }
   let entries;
   try {
     entries = fs.readdirSync(absolute, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    if (!absent(error)) truncated = true;
     return;
   }
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   for (const entry of entries) {
-    if (lines.length >= MAX_ENTRIES) {
+    if (truncated || lines.length >= MAX_ENTRIES) {
       truncated = true;
       return;
     }
-    record(path.join(absolute, entry.name), relative + "/" + entry.name);
+    record(path.join(absolute, entry.name), relative + "/" + entry.name, depth + 1);
   }
 }
 
 for (const rel of roots) {
-  if (lines.length >= MAX_ENTRIES) {
+  if (truncated || lines.length >= MAX_ENTRIES) {
     truncated = true;
     break;
   }
-  record(path.join(root, rel), rel);
+  record(path.join(root, rel), rel, 0);
 }
 
 lines.sort();
 if (truncated) lines.push("# truncated");
-fs.writeFileSync(output, lines.join("\n") + "\n", { mode: 0o600 });
+const rendered = lines.join("\n") + "\n";
+if (output === "-") process.stdout.write(rendered);
+else fs.writeFileSync(output, rendered, { mode: 0o600 });
 `
 
 const applyTargetModesScript = `import fs from "node:fs";
@@ -329,6 +355,7 @@ command -v runuser >/dev/null 2>&1 || fail "runuser is required in the Observato
 command -v nft >/dev/null 2>&1 || fail "nftables is required in the Observatory VM template"
 command -v mount >/dev/null 2>&1 || fail "mount is required in the Observatory VM template"
 command -v findmnt >/dev/null 2>&1 || fail "findmnt is required in the Observatory VM template"
+command -v systemctl >/dev/null 2>&1 || fail "systemctl is required in the Observatory VM template"
 command -v "$OPENCLAW_COMMAND" >/dev/null 2>&1 || fail "OpenClaw is required in the Observatory VM template"
 id "$AGENT_USER" >/dev/null 2>&1 || fail "dedicated Observatory agent user is missing"
 as_root true >/dev/null 2>&1 || fail "passwordless root instrumentation is required"
@@ -341,19 +368,30 @@ if as_root runuser -u "$AGENT_USER" -- sudo -n true >/dev/null 2>&1; then
   fail "Observatory agent user must not have passwordless sudo"
 fi
 
+CONTROL_UID=$(id -u)
+CONTROL_GID=$(id -g)
+CONTROL_USER=$(id -un)
 as_root install -d -m 0711 "$WORK_ROOT"
-as_root install -d -m 0700 "$CONTROL"
-as_root install -m 0600 "$STAGED_RUNNER/runtime.json" "$CONTROL/runtime.json"
-as_root install -m 0600 "$STAGED_RUNNER/firewall.nft" "$CONTROL/firewall.nft"
-as_root install -m 0600 "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
-as_root install -m 0600 "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
-as_root install -m 0600 "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
-as_root install -m 0600 "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"
-as_root install -m 0600 "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
-as_root install -m 0600 "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
-as_root install -m 0700 "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
+as_root install -d -m 0711 -o "$CONTROL_UID" -g "$CONTROL_GID" "$CONTROL"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/runtime.json" "$CONTROL/runtime.json"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/firewall.nft" "$CONTROL/firewall.nft"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
+as_root install -m 0555 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/target-modes.json" "$CONTROL/target-modes.json"
+as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
+as_root install -m 0700 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
 RUNTIME_JSON="$CONTROL/runtime.json"
 MOCK_EGRESS_ENABLED=$(node -e 'const r=require(process.argv[1]); process.stdout.write(r.mockEgress && r.mockEgress.enabled ? "1" : "0")' "$RUNTIME_JSON")
+MOCK_DEADLINE_SECONDS=0
+MOCK_RECEIPT_MAX_BYTES=0
+MOCK_SINK_PORT=0
+if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
+  MOCK_DEADLINE_SECONDS=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.mockEgress.deadlineSeconds))' "$RUNTIME_JSON")
+  MOCK_RECEIPT_MAX_BYTES=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.mockEgress.receiptMaxBytes))' "$RUNTIME_JSON")
+  MOCK_SINK_PORT=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.mockEgress.port))' "$RUNTIME_JSON")
+fi
 
 SSH_PEER=${SSH_CONNECTION:-}
 SSH_PEER=${SSH_PEER%% *}
@@ -429,6 +467,72 @@ else
   printf '%s\n' "$EXERCISE/workspace/skills/$TARGET_ID" > "$META/target-root"
 fi
 
+run_inventory() {
+  local lane=$1
+  local root=$2
+  local phase=$3
+  local other_root="$EXERCISE"
+  [ "$lane" = "exercise" ] && other_root="$BASELINE"
+  local receipt="$OUT/$lane/inventory.$phase"
+  local unit="observatory-$RUN_ID-$lane-inventory-$phase"
+  [ ! -e "$receipt" ] || fail "persistence inventory receipt already exists for $lane/$phase"
+  # The inventory runs as the unprivileged agent identity in a read-only mount
+  # namespace. systemd opens the bounded receipt before dropping privileges, so
+  # neither the inventory process nor the target can alter another path.
+  as_root systemd-run --quiet --wait --collect --unit="$unit" \
+    --property="User=$AGENT_USER" \
+    --property="Group=$AGENT_USER" \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property=NoNewPrivileges=yes \
+    --property=PrivateDevices=yes \
+    --property=PrivateMounts=yes \
+    --property=PrivateNetwork=yes \
+    --property=PrivateTmp=yes \
+    --property=ProtectClock=yes \
+    --property=ProtectControlGroups=yes \
+    --property=ProtectHome=yes \
+    --property=ProtectHostname=yes \
+    --property=ProtectKernelLogs=yes \
+    --property=ProtectKernelModules=yes \
+    --property=ProtectKernelTunables=yes \
+    --property=ProtectProc=invisible \
+    --property=ProtectSystem=strict \
+    --property=ProcSubset=pid \
+    --property=RestrictAddressFamilies=AF_UNIX \
+    --property=RestrictNamespaces=yes \
+    --property=RestrictRealtime=yes \
+    --property=RestrictSUIDSGID=yes \
+    --property=LockPersonality=yes \
+    --property=MemoryMax=134217728 \
+    --property=MemorySwapMax=0 \
+    --property=CPUQuota=25% \
+    --property=TasksMax=16 \
+    --property=LimitNOFILE=64 \
+    --property=LimitFSIZE=8388608 \
+    --property=RuntimeMaxSec=15s \
+    --property=TimeoutStopSec=2s \
+    --property=KillMode=control-group \
+    --property=SendSIGKILL=yes \
+    --property=SocketBindDeny=any \
+    --property="ReadOnlyPaths=$root $CONTROL/inventory.mjs" \
+    --property="InaccessiblePaths=$REPO_ROOT $other_root" \
+    --property="WorkingDirectory=$root" \
+    --property="StandardOutput=file:$receipt" \
+    --property=StandardError=null \
+    --property=SystemCallArchitectures=native \
+    --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+    --property=SystemCallErrorNumber=EPERM \
+    --property=UMask=0077 \
+    /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      node "$CONTROL/inventory.mjs" "$root" - \
+    || fail "bounded persistence inventory failed for $lane/$phase"
+  [ -f "$receipt" ] || fail "persistence inventory receipt is missing for $lane/$phase"
+  [ "$(stat -c %s "$receipt")" -le 8388608 ] || fail "persistence inventory receipt exceeded its output cap"
+  as_root chown "$CONTROL_UID:$CONTROL_GID" "$receipt"
+  as_root chmod 0600 "$receipt"
+}
+
 run_lane() {
   local lane=$1
   local root=$2
@@ -451,9 +555,9 @@ run_lane() {
   done < <(node -e 'const r=require(process.argv[1]); for (const value of (r.mockEgressIps||[])) console.log(value)' "$RUNTIME_JSON")
   local code=0
   # Snapshot persistence surfaces after seeding and before the agent runs, then
-  # again after it completes. The analyzer diffs the pair to confirm which
-  # successful persistence writes left a residual on-disk change.
-  as_root node "$CONTROL/inventory.mjs" "$root" "$trace_dir/inventory.before"
+  # again after it completes. Each inventory has its own bounded, read-only,
+  # unprivileged transient unit.
+  run_inventory "$lane" "$root" before
   as_root systemd-run --quiet --wait --collect --unit="$unit" \
     --property=KillMode=control-group \
     --property=SendSIGKILL=yes \
@@ -494,36 +598,86 @@ run_lane() {
     /bin/bash "$CONTROL/run-agent.sh" "$root" "$trace_dir" "$session" \
       "$RUNTIME_JSON" "$root/prompt.txt" || code=$?
   printf '%s\n' "$code" > "$META/$lane-exit"
-  as_root node "$CONTROL/inventory.mjs" "$root" "$trace_dir/inventory.after"
-  as_root chown "$(id -u):$(id -g)" "$trace_dir/inventory.before" "$trace_dir/inventory.after"
+  run_inventory "$lane" "$root" after
 }
 
-# run_lane_and_capture brackets each lane with the bounded controlled mock egress
-# sink. The sink runs outside the untrusted agent cgroup, self-terminates on its
-# own caps/deadline, and always leaves a private per-lane receipt behind.
+# run_lane_and_capture brackets each lane with a dedicated hardened sink unit.
+# The sink stays outside the untrusted agent cgroup but has no capabilities,
+# write access only to its lane receipt directory, and strict resource limits.
 run_lane_and_capture() {
   local lane=$1
   local root=$2
-  local sink_pid=""
+  local sink_wait_pid=""
+  local sink_unit="observatory-$RUN_ID-$lane-mock-egress"
+  local receipt="$OUT/$lane/mock-egress.json"
   if [ "$MOCK_EGRESS_ENABLED" = "1" ]; then
-    rm -f "$OUT/$lane/mock-egress.json" "$OUT/$lane/mock-egress.json.ready"
-    node "$CONTROL/mock-egress-sink.mjs" "$RUNTIME_JSON" "$OUT/$lane/mock-egress.json" "$lane" &
-    sink_pid=$!
+    [ ! -e "$receipt" ] && [ ! -e "$receipt.ready" ] || fail "controlled mock egress receipt path already exists for $lane lane"
+    as_root systemd-run --quiet --wait --collect --unit="$sink_unit" \
+      --property="User=$CONTROL_USER" \
+      --property="Group=$(id -gn)" \
+      --property=CapabilityBoundingSet= \
+      --property=AmbientCapabilities= \
+      --property=NoNewPrivileges=yes \
+      --property=PrivateDevices=yes \
+      --property=PrivateMounts=yes \
+      --property=PrivateTmp=yes \
+      --property=ProtectClock=yes \
+      --property=ProtectControlGroups=yes \
+      --property=ProtectHome=yes \
+      --property=ProtectHostname=yes \
+      --property=ProtectKernelLogs=yes \
+      --property=ProtectKernelModules=yes \
+      --property=ProtectKernelTunables=yes \
+      --property=ProtectProc=invisible \
+      --property=ProtectSystem=strict \
+      --property=ProcSubset=pid \
+      --property="RestrictAddressFamilies=AF_UNIX AF_INET" \
+      --property=RestrictNamespaces=yes \
+      --property=RestrictRealtime=yes \
+      --property=RestrictSUIDSGID=yes \
+      --property=LockPersonality=yes \
+      --property=MemoryMax=134217728 \
+      --property=MemorySwapMax=0 \
+      --property=CPUQuota=25% \
+      --property=TasksMax=16 \
+      --property=LimitNOFILE=64 \
+      --property="LimitFSIZE=$MOCK_RECEIPT_MAX_BYTES" \
+      --property="RuntimeMaxSec=$((MOCK_DEADLINE_SECONDS + 5))s" \
+      --property=TimeoutStopSec=2s \
+      --property=KillMode=control-group \
+      --property=SendSIGKILL=yes \
+      --property="SocketBindAllow=tcp:ipv4:$MOCK_SINK_PORT" \
+      --property=SocketBindDeny=any \
+      --property="ReadOnlyPaths=$CONTROL/runtime.json $CONTROL/mock-egress-sink.mjs" \
+      --property="ReadWritePaths=$OUT/$lane" \
+      --property="InaccessiblePaths=$REPO_ROOT $BASELINE $EXERCISE" \
+      --property="WorkingDirectory=$OUT/$lane" \
+      --property=StandardOutput=null \
+      --property=StandardError=null \
+      --property=SystemCallArchitectures=native \
+      --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+      --property=SystemCallErrorNumber=EPERM \
+      --property=UMask=0077 \
+      /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        node "$CONTROL/mock-egress-sink.mjs" "$RUNTIME_JSON" "$receipt" "$lane" &
+    sink_wait_pid=$!
     local waited=0
     while [ "$waited" -lt 100 ]; do
-      [ -f "$OUT/$lane/mock-egress.json.ready" ] && break
-      kill -0 "$sink_pid" 2>/dev/null || break
+      [ -f "$receipt.ready" ] && break
+      kill -0 "$sink_wait_pid" 2>/dev/null || break
       sleep 0.1
       waited=$((waited + 1))
     done
-    [ -f "$OUT/$lane/mock-egress.json.ready" ] || fail "controlled mock egress sink did not bind for $lane lane"
+    [ -f "$receipt.ready" ] || fail "controlled mock egress sink did not bind for $lane lane"
   fi
   run_lane "$lane" "$root"
-  if [ -n "$sink_pid" ]; then
-    kill -TERM "$sink_pid" 2>/dev/null || true
-    wait "$sink_pid" 2>/dev/null || true
-    rm -f "$OUT/$lane/mock-egress.json.ready"
-    [ -f "$OUT/$lane/mock-egress.json" ] || fail "controlled mock egress receipt is missing for $lane lane"
+  if [ -n "$sink_wait_pid" ]; then
+    if [ ! -f "$receipt" ]; then
+      as_root systemctl kill --kill-who=main --signal=SIGTERM "$sink_unit" || fail "failed to stop controlled mock egress sink for $lane lane"
+    fi
+    wait "$sink_wait_pid" || fail "controlled mock egress sink unit failed for $lane lane"
+    [ -f "$receipt" ] || fail "controlled mock egress receipt is missing for $lane lane"
+    [ "$(stat -c %s "$receipt")" -le "$MOCK_RECEIPT_MAX_BYTES" ] || fail "controlled mock egress receipt exceeded its output cap"
   fi
 }
 

@@ -24,7 +24,16 @@ func mockEgressReceiptJSON(host string, port int, lane string, accepted int, pay
 		"capturedBytes":    len(payload),
 		"truncated":        false,
 		"deadlineHit":      false,
+		"observedChunks":   0,
+		"peakOpenSockets":  0,
+		"rejectedRequests": 0,
 		"payloadBase64":    base64.StdEncoding.EncodeToString(payload),
+	}
+	if len(payload) > 0 {
+		receipt["observedChunks"] = 1
+	}
+	if accepted > 0 {
+		receipt["peakOpenSockets"] = 1
 	}
 	data, err := json.Marshal(receipt)
 	if err != nil {
@@ -57,6 +66,7 @@ func TestMockEgressConfigValidation(t *testing.T) {
 	}{
 		{"missing address", func(c *MockEgressConfig) { c.Address = "" }, "mockEgress.address"},
 		{"non-ipv4", func(c *MockEgressConfig) { c.Address = "example.invalid:9009" }, "literal IPv4"},
+		{"privileged port", func(c *MockEgressConfig) { c.Address = "127.0.0.9:443" }, "invalid mockEgress.address port"},
 		{"bad requests", func(c *MockEgressConfig) { c.MaxRequests = 0 }, "maxRequests"},
 		{"total below per-request", func(c *MockEgressConfig) { c.MaxTotalBytes = 100 }, "maxTotalBytes"},
 		{"bad canned", func(c *MockEgressConfig) { c.CannedResponseBase64 = "!!not-base64!!" }, "cannedResponseBase64"},
@@ -186,6 +196,30 @@ func TestRemoteRunnerSubstitutesAgentUIDAndExposesSink(t *testing.T) {
 	}
 }
 
+func TestRemoteRunnerHardensControlledSinkUnit(t *testing.T) {
+	for _, required := range []string{
+		`local sink_unit="observatory-$RUN_ID-$lane-mock-egress"`,
+		`--property=CapabilityBoundingSet=`,
+		`--property=NoNewPrivileges=yes`,
+		`--property=ProtectSystem=strict`,
+		`--property=MemoryMax=134217728`,
+		`--property=MemorySwapMax=0`,
+		`--property=TasksMax=16`,
+		`--property="LimitFSIZE=$MOCK_RECEIPT_MAX_BYTES"`,
+		`--property="SocketBindAllow=tcp:ipv4:$MOCK_SINK_PORT"`,
+		`--property=SocketBindDeny=any`,
+		`--property="ReadWritePaths=$OUT/$lane"`,
+		`systemctl kill --kill-who=main --signal=SIGTERM "$sink_unit"`,
+	} {
+		if !strings.Contains(remoteRunScript, required) {
+			t.Fatalf("remote runner missing hardened sink control %q", required)
+		}
+	}
+	if strings.Contains(remoteRunScript, `node "$CONTROL/mock-egress-sink.mjs" "$RUNTIME_JSON" "$OUT/$lane/mock-egress.json" "$lane" &`) {
+		t.Fatal("remote runner still launches the sink as an unconstrained background Node process")
+	}
+}
+
 func TestClassifyControlledSinkTrafficRedactsRawAddress(t *testing.T) {
 	metadata := CaptureMetadata{TargetKind: "skill", BaselineWorkspace: "/run/baseline/workspace", ExerciseWorkspace: "/run/exercise/workspace"}
 	baseline := `execve("/usr/bin/node", ["node"], 0x0) = 0` + "\n"
@@ -250,7 +284,7 @@ func TestParseMockEgressReceiptFailsClosed(t *testing.T) {
 }
 
 func TestVerifyCaptureMockEgressFailsClosed(t *testing.T) {
-	enabled := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009"}
+	enabled := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009", MaxRequests: 8, MaxBytesPerRequest: 4096, MaxTotalBytes: 8192, DeadlineSeconds: 5}
 	good := CaptureBundle{
 		MockEgressBaseline: mustReceipt(t, "127.0.0.9", 9009, "baseline", 0, nil),
 		MockEgressExercise: mustReceipt(t, "127.0.0.9", 9009, "exercise", 1, []byte("x")),
@@ -277,6 +311,37 @@ func TestVerifyCaptureMockEgressFailsClosed(t *testing.T) {
 	}
 	if err := verifyCaptureMockEgress(laneSwap, enabled); err == nil || !strings.Contains(err.Error(), "lane mismatch") {
 		t.Fatalf("lane err = %v", err)
+	}
+}
+
+func TestVerifyCaptureMockEgressRejectsConfiguredCapViolations(t *testing.T) {
+	config := MockEgressConfig{Enabled: true, Address: "127.0.0.9:9009", MaxRequests: 2, MaxBytesPerRequest: 4, MaxTotalBytes: 8, DeadlineSeconds: 5}
+	baseline := mustReceipt(t, "127.0.0.9", 9009, "baseline", 0, nil)
+	for _, test := range []struct {
+		name    string
+		receipt *MockEgressReceipt
+		want    string
+	}{
+		{"request cap", mustReceipt(t, "127.0.0.9", 9009, "exercise", 3, []byte("x")), "request cap"},
+		{"total-byte cap", mustReceipt(t, "127.0.0.9", 9009, "exercise", 2, []byte("123456789")), "total-byte cap"},
+		{"per-request cap", mustReceipt(t, "127.0.0.9", 9009, "exercise", 1, []byte("12345")), "per-request byte cap"},
+		{"chunk cap", func() *MockEgressReceipt {
+			receipt := mustReceipt(t, "127.0.0.9", 9009, "exercise", 1, []byte("x"))
+			receipt.ObservedChunks = mockEgressMaxDataChunks + 1
+			return receipt
+		}(), "data-chunk cap"},
+		{"socket cap", func() *MockEgressReceipt {
+			receipt := mustReceipt(t, "127.0.0.9", 9009, "exercise", 1, []byte("x"))
+			receipt.PeakOpenSockets = mockEgressMaxConcurrentSockets + 1
+			return receipt
+		}(), "concurrent-socket cap"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bundle := CaptureBundle{MockEgressBaseline: baseline, MockEgressExercise: test.receipt}
+			if err := verifyCaptureMockEgress(bundle, config); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -521,6 +586,7 @@ func runControlledSink(t *testing.T, maxBytesPerRequest int64, maxTotalBytes int
 		"mockEgress": map[string]any{
 			"enabled": true, "host": "127.0.0.1", "port": port,
 			"maxRequests": 8, "maxBytesPerRequest": maxBytesPerRequest, "maxTotalBytes": maxTotalBytes, "deadlineSeconds": 20,
+			"maxDataChunks": mockEgressMaxDataChunks, "maxConcurrentSockets": mockEgressMaxConcurrentSockets,
 			"cannedResponseBase64": base64.StdEncoding.EncodeToString([]byte("OK\n")),
 		},
 	}
@@ -617,6 +683,29 @@ func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
 	}
 	if string(receipt.payload) != "01234567" || receipt.Sink.Port != sink.port {
 		t.Fatalf("captured payload = %q port = %d", receipt.payload, receipt.Sink.Port)
+	}
+}
+
+func TestMockEgressSinkBoundsRequestAndObjectOverhead(t *testing.T) {
+	sink := runControlledSink(t, 32, 256)
+	for index := 0; index < 24; index++ {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", sink.port), time.Second)
+		if err != nil {
+			continue
+		}
+		_, _ = conn.Write([]byte{byte(index)})
+		_ = conn.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+	receipt := sink.collect()
+	if receipt.AcceptedRequests > 8 || receipt.CapturedBytes > 256 {
+		t.Fatalf("sink exceeded request/byte bounds: %#v", receipt)
+	}
+	if receipt.ObservedChunks > mockEgressMaxDataChunks || receipt.PeakOpenSockets > mockEgressMaxConcurrentSockets {
+		t.Fatalf("sink exceeded object-overhead bounds: %#v", receipt)
+	}
+	if !receipt.Truncated || receipt.RejectedRequests < 1 {
+		t.Fatalf("sink did not record rejected excess requests: %#v", receipt)
 	}
 }
 

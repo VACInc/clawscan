@@ -27,6 +27,8 @@ const (
 	// reachability, is the enforcement gate.
 	mockEgressCannedResponseMaxBytes = 4096
 	mockEgressReceiptRawCapBytes     = 1 << 20
+	mockEgressMaxDataChunks          = 4096
+	mockEgressMaxConcurrentSockets   = 64
 )
 
 var mockEgressCanaryIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
@@ -71,6 +73,9 @@ type MockEgressReceipt struct {
 	CapturedBytes    int64  `json:"capturedBytes"`
 	Truncated        bool   `json:"truncated"`
 	DeadlineHit      bool   `json:"deadlineHit"`
+	ObservedChunks   int    `json:"observedChunks"`
+	PeakOpenSockets  int    `json:"peakOpenSockets"`
+	RejectedRequests int    `json:"rejectedRequests"`
 	PayloadBase64    string `json:"payloadBase64"`
 	payload          []byte
 }
@@ -86,7 +91,7 @@ func mockEgressHostPort(address string) (string, string, error) {
 		return "", "", fmt.Errorf("mockEgress.address must use a literal IPv4 loopback address: %s", address)
 	}
 	number, err := strconv.Atoi(port)
-	if err != nil || number < 1 || number > 65535 {
+	if err != nil || number < 1024 || number > 65535 {
 		return "", "", fmt.Errorf("invalid mockEgress.address port: %s", address)
 	}
 	return ip.String(), port, nil
@@ -211,6 +216,9 @@ func mockEgressRuntime(config MockEgressConfig, timeoutSeconds int) map[string]a
 		"maxTotalBytes":        config.MaxTotalBytes,
 		"deadlineSeconds":      mockEgressEffectiveDeadline(config, timeoutSeconds),
 		"cannedResponseBase64": config.CannedResponseBase64,
+		"maxDataChunks":        mockEgressMaxDataChunks,
+		"maxConcurrentSockets": mockEgressMaxConcurrentSockets,
+		"receiptMaxBytes":      mockEgressReceiptRawCapBytes*2 + 4096,
 	}
 }
 
@@ -230,7 +238,7 @@ func parseMockEgressReceipt(data []byte) (*MockEgressReceipt, error) {
 	if net.ParseIP(strings.Trim(receipt.Sink.Host, "[]")) == nil {
 		return nil, errors.New("controlled mock egress receipt sink host is not an IP literal")
 	}
-	if receipt.AcceptedRequests < 0 || receipt.CapturedBytes < 0 {
+	if receipt.AcceptedRequests < 0 || receipt.CapturedBytes < 0 || receipt.ObservedChunks < 0 || receipt.PeakOpenSockets < 0 || receipt.RejectedRequests < 0 {
 		return nil, errors.New("controlled mock egress receipt has negative counters")
 	}
 	payload, err := base64.StdEncoding.DecodeString(receipt.PayloadBase64)
@@ -259,12 +267,31 @@ func verifyCaptureMockEgress(bundle CaptureBundle, config MockEgressConfig) erro
 	if bundle.MockEgressBaseline == nil || bundle.MockEgressExercise == nil {
 		return errors.New("controlled mock egress is enabled but the capture bundle is missing a per-lane sink receipt")
 	}
+	if err := config.validateShape(); err != nil {
+		return fmt.Errorf("validate controlled mock egress receipt limits: %w", err)
+	}
 	for lane, receipt := range map[string]*MockEgressReceipt{"baseline": bundle.MockEgressBaseline, "exercise": bundle.MockEgressExercise} {
 		if receipt.Lane != lane {
 			return fmt.Errorf("controlled mock egress receipt lane mismatch: expected %q, receipt records %q", lane, receipt.Lane)
 		}
 		if !mockEgressAddressMatches(config, receipt.Sink.Host, receipt.Sink.Port) {
 			return errors.New("controlled mock egress sink identity does not match the configured address")
+		}
+		if receipt.AcceptedRequests > config.MaxRequests {
+			return fmt.Errorf("controlled mock egress %s receipt exceeds configured request cap", lane)
+		}
+		if receipt.CapturedBytes > config.MaxTotalBytes {
+			return fmt.Errorf("controlled mock egress %s receipt exceeds configured total-byte cap", lane)
+		}
+		requestByteCap := int64(receipt.AcceptedRequests) * config.MaxBytesPerRequest
+		if receipt.CapturedBytes > requestByteCap {
+			return fmt.Errorf("controlled mock egress %s receipt exceeds configured per-request byte cap", lane)
+		}
+		if receipt.ObservedChunks > mockEgressMaxDataChunks {
+			return fmt.Errorf("controlled mock egress %s receipt exceeds the data-chunk cap", lane)
+		}
+		if receipt.PeakOpenSockets > mockEgressMaxConcurrentSockets || receipt.PeakOpenSockets > receipt.AcceptedRequests {
+			return fmt.Errorf("controlled mock egress %s receipt exceeds the concurrent-socket cap", lane)
 		}
 	}
 	return nil
@@ -406,20 +433,35 @@ const maxRequests = Number(sink.maxRequests);
 const maxBytesPerRequest = Number(sink.maxBytesPerRequest);
 const maxTotalBytes = Number(sink.maxTotalBytes);
 const deadlineMs = Number(sink.deadlineSeconds) * 1000;
+const maxDataChunks = Number(sink.maxDataChunks);
+const maxConcurrentSockets = Number(sink.maxConcurrentSockets);
 const canned = sink.cannedResponseBase64 ? Buffer.from(sink.cannedResponseBase64, "base64") : Buffer.alloc(0);
+if (!Number.isSafeInteger(maxRequests) || maxRequests < 1 ||
+    !Number.isSafeInteger(maxBytesPerRequest) || maxBytesPerRequest < 1 ||
+    !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < maxBytesPerRequest ||
+    !Number.isSafeInteger(deadlineMs) || deadlineMs < 1000 ||
+    !Number.isSafeInteger(maxDataChunks) || maxDataChunks < 1 ||
+    !Number.isSafeInteger(maxConcurrentSockets) || maxConcurrentSockets < 1) {
+  throw new Error("invalid controlled mock egress bounds");
+}
 
 let accepted = 0;
 let capturedTotal = 0;
+let observedChunks = 0;
+let peakOpenSockets = 0;
+let rejectedRequests = 0;
 let truncated = false;
 let deadlineHit = false;
 let finalized = false;
-const chunks = [];
+const capture = Buffer.allocUnsafe(maxTotalBytes);
+const openSockets = new Set();
 
 function finalize() {
   if (finalized) return;
   finalized = true;
   try { server.close(); } catch {}
-  const payload = Buffer.concat(chunks).subarray(0, maxTotalBytes);
+  for (const socket of openSockets) { try { socket.destroy(); } catch {} }
+  const payload = capture.subarray(0, capturedTotal);
   const receipt = {
     sink: { host, port },
     lane,
@@ -427,6 +469,9 @@ function finalize() {
     capturedBytes: payload.length,
     truncated,
     deadlineHit,
+    observedChunks,
+    peakOpenSockets,
+    rejectedRequests,
     payloadBase64: payload.toString("base64"),
   };
   const tmp = receiptPath + ".tmp";
@@ -437,23 +482,51 @@ function finalize() {
 
 const server = net.createServer((socket) => {
   socket.on("error", () => {});
-  if (accepted >= maxRequests) { truncated = true; socket.destroy(); return; }
+  if (accepted >= maxRequests || openSockets.size >= maxConcurrentSockets) {
+    rejectedRequests += 1;
+    truncated = true;
+    socket.destroy();
+    return;
+  }
   accepted += 1;
+  openSockets.add(socket);
+  if (openSockets.size > peakOpenSockets) peakOpenSockets = openSockets.size;
   let connBytes = 0;
+  let connChunks = 0;
   const respond = () => { try { socket.end(canned.length ? canned : undefined); } catch {} };
+  const release = () => { openSockets.delete(socket); };
+  socket.on("close", release);
   socket.on("data", (data) => {
+    observedChunks += 1;
+    connChunks += 1;
+    if (observedChunks > maxDataChunks || connChunks > maxDataChunks) {
+      observedChunks = Math.min(observedChunks, maxDataChunks);
+      truncated = true;
+      socket.pause();
+      respond();
+      return;
+    }
     let slice = data;
     if (connBytes + slice.length > maxBytesPerRequest) { slice = slice.subarray(0, Math.max(0, maxBytesPerRequest - connBytes)); truncated = true; }
     if (capturedTotal + slice.length > maxTotalBytes) { slice = slice.subarray(0, Math.max(0, maxTotalBytes - capturedTotal)); truncated = true; }
-    if (slice.length > 0) { chunks.push(Buffer.from(slice)); connBytes += slice.length; capturedTotal += slice.length; }
-    if (connBytes >= maxBytesPerRequest) respond();
+    if (slice.length > 0) {
+      slice.copy(capture, capturedTotal);
+      connBytes += slice.length;
+      capturedTotal += slice.length;
+    }
+    if (connBytes >= maxBytesPerRequest || capturedTotal >= maxTotalBytes) {
+      socket.pause();
+      respond();
+    }
   });
   socket.on("end", respond);
   socket.setTimeout(750, respond);
 });
+server.maxConnections = maxConcurrentSockets;
+server.on("drop", () => { rejectedRequests += 1; truncated = true; });
 
 server.on("error", (err) => { process.stderr.write("mock egress sink error: " + err.message + "\n"); process.exit(21); });
-server.listen(port, host, () => {
+server.listen({ port, host, backlog: Math.min(maxRequests, maxConcurrentSockets) }, () => {
   try { fs.writeFileSync(receiptPath + ".ready", "ok\n", { mode: 0o600 }); } catch {}
 });
 const timer = setTimeout(() => { deadlineHit = true; finalize(); }, deadlineMs);

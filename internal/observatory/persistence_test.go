@@ -1,6 +1,7 @@
 package observatory
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -384,13 +385,26 @@ func TestReadCaptureBundleRejectsIncompleteInventory(t *testing.T) {
 
 func TestRemoteRunScriptCapturesBeforeAndAfterInventory(t *testing.T) {
 	for _, required := range []string{
-		`as_root install -m 0600 "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"`,
-		`as_root node "$CONTROL/inventory.mjs" "$root" "$trace_dir/inventory.before"`,
-		`as_root node "$CONTROL/inventory.mjs" "$root" "$trace_dir/inventory.after"`,
+		`as_root install -m 0555 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/inventory.mjs" "$CONTROL/inventory.mjs"`,
+		`run_inventory "$lane" "$root" before`,
+		`run_inventory "$lane" "$root" after`,
+		`--property="User=$AGENT_USER"`,
+		`--property=CapabilityBoundingSet=`,
+		`--property=PrivateNetwork=yes`,
+		`--property=ProtectSystem=strict`,
+		`--property=MemoryMax=134217728`,
+		`--property=MemorySwapMax=0`,
+		`--property=TasksMax=16`,
+		`--property=LimitFSIZE=8388608`,
+		`--property="ReadOnlyPaths=$root $CONTROL/inventory.mjs"`,
+		`node "$CONTROL/inventory.mjs" "$root" -`,
 	} {
 		if !strings.Contains(remoteRunScript, required) {
 			t.Fatalf("remote runner missing inventory wiring %q", required)
 		}
+	}
+	if strings.Contains(remoteRunScript, `as_root node "$CONTROL/inventory.mjs"`) {
+		t.Fatal("remote runner still launches persistence inventory as unconstrained root Node")
 	}
 	path := filepath.Join(t.TempDir(), "run.sh")
 	if err := os.WriteFile(path, []byte(remoteRunScript), 0o700); err != nil {
@@ -422,11 +436,6 @@ func TestInventoryScriptSnapshotsPersistenceSurfaces(t *testing.T) {
 	mustWrite("workspace/SOUL.md", "identity\n")
 	// A file under the staged skill directory must be excluded from the snapshot.
 	mustWrite("workspace/skills/observed/run.sh", "#!/bin/sh\n")
-	// A target-controlled filename with an embedded newline must not forge or split
-	// an inventory line; the control-character guard skips it entirely.
-	injectedName := "home/.config/x\n0600\t" + strings.Repeat("f", 64) + "\t/etc/cron.d/forged"
-	mustWrite(injectedName, "boom\n")
-
 	scriptPath := filepath.Join(t.TempDir(), "inventory.mjs")
 	if err := os.WriteFile(scriptPath, []byte(inventoryScript), 0o600); err != nil {
 		t.Fatal(err)
@@ -442,9 +451,6 @@ func TestInventoryScriptSnapshotsPersistenceSurfaces(t *testing.T) {
 	entries, err := parseInventorySnapshot(data)
 	if err != nil {
 		t.Fatalf("inventory snapshot did not parse: %v: %q", err, data)
-	}
-	if strings.Contains(string(data), "/etc/cron.d/forged") {
-		t.Fatalf("control-character filename forged an inventory line: %q", data)
 	}
 	for _, expected := range []string{"state/openclaw.json", "home/.bashrc", "home/.config/systemd/user/agent.service", "workspace/SOUL.md"} {
 		if _, present := entries[expected]; !present {
@@ -463,6 +469,67 @@ func TestInventoryScriptSnapshotsPersistenceSurfaces(t *testing.T) {
 	}
 	if subject := normalizeInventoryPath("home/.bashrc"); subject != "$HOME/.bashrc" {
 		t.Fatalf("normalizeInventoryPath = %q", subject)
+	}
+}
+
+func TestInventoryScriptFailsClosedOnUnrepresentableTraversal(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for inventory traversal validation")
+	}
+	lane := t.TempDir()
+	configDir := filepath.Join(lane, "home", ".config")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	injectedName := "x\n0600\t" + strings.Repeat("f", 64) + "\tetc-cron-forged"
+	if err := os.WriteFile(filepath.Join(configDir, injectedName), []byte("boom\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(t.TempDir(), "inventory.mjs")
+	if err := os.WriteFile(scriptPath, []byte(inventoryScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(node, scriptPath, lane, "-").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(output, []byte("# truncated\n")) {
+		t.Fatalf("unrepresentable path did not mark inventory incomplete: %q", output)
+	}
+	if _, err := parseInventorySnapshot(output); err == nil || !strings.Contains(err.Error(), "incomplete inventory marker") {
+		t.Fatalf("inventory did not fail closed: %v", err)
+	}
+	if bytes.Contains(output, []byte("etc-cron-forged")) {
+		t.Fatalf("unrepresentable filename leaked into inventory output: %q", output)
+	}
+}
+
+func TestInventoryScriptFailsClosedOnUnreadableSurface(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for inventory permission validation")
+	}
+	lane := t.TempDir()
+	stateDir := filepath.Join(lane, "state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(stateDir, "openclaw.json")
+	if err := os.WriteFile(protected, []byte("{}\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(protected, 0o600) })
+	scriptPath := filepath.Join(t.TempDir(), "inventory.mjs")
+	if err := os.WriteFile(scriptPath, []byte(inventoryScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(node, scriptPath, lane, "-").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseInventorySnapshot(output); err == nil || !strings.Contains(err.Error(), "incomplete inventory marker") {
+		t.Fatalf("unreadable persistence surface did not fail closed: %v, output=%q", err, output)
 	}
 }
 
