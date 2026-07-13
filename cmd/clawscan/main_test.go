@@ -383,6 +383,64 @@ func TestRunCommandWritesArtifact(t *testing.T) {
 	}
 }
 
+func TestRunCommandScansPluginTargetAndSkipsSkillOnlyScanner(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "probe-plugin")
+	writePlugin(t, target, "observatory-probe")
+	out := filepath.Join(dir, "run.json")
+
+	stdout := captureStdout(t, func() {
+		if err := run([]string{target, "--scanner", "clawscan-static", "--output", out}, []string{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stdout, "scanner_skipped: 1") {
+		t.Fatalf("summary missing skipped scanner:\n%s", stdout)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact struct {
+		Target struct {
+			Kind         string `json:"kind"`
+			ID           string `json:"id"`
+			ResolvedPath string `json:"resolvedPath"`
+		} `json:"target"`
+		Scanners map[string]struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		} `json:"scanners"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Target.Kind != "plugin" {
+		t.Fatalf("target kind = %q", artifact.Target.Kind)
+	}
+	if artifact.Target.ID != "observatory-probe" {
+		t.Fatalf("target id = %q", artifact.Target.ID)
+	}
+	static := artifact.Scanners["clawscan-static"]
+	if static.Status != "skipped" || !strings.Contains(static.Error, "does not support plugin targets") {
+		t.Fatalf("clawscan-static result = %#v", static)
+	}
+}
+
+func TestRunCommandDoesNotAutoDiscoverPlugins(t *testing.T) {
+	dir := t.TempDir()
+	// A plugin placed under ./skills without a SKILL.md must not be discovered,
+	// so plugin auto-discovery cannot silently scan arbitrary package dirs.
+	writePlugin(t, filepath.Join(dir, "skills", "probe-plugin"), "observatory-probe")
+	t.Chdir(dir)
+
+	err := run([]string{"--scanner", "clawscan-static"}, []string{})
+	if err == nil || !strings.Contains(err.Error(), "No valid skills found") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestRunCommandWritesDefaultOutputAndPrintsKeyValueSummary(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "skill")
@@ -734,6 +792,20 @@ func writeSkill(t *testing.T, dir string, content string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writePlugin(t *testing.T, dir string, id string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"id":"` + id + `","name":"Probe Plugin","contracts":{"tools":["probe_tool"]}}`
+	if err := os.WriteFile(filepath.Join(dir, "openclaw.plugin.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.js"), []byte("// synthetic probe\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

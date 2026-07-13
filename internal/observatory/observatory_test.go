@@ -130,6 +130,22 @@ func TestReadSkillNameRequiresLeadingBoundedFrontmatter(t *testing.T) {
 	}
 }
 
+func TestExportedManifestIdentityHelpers(t *testing.T) {
+	if SkillManifestName != "SKILL.md" || PluginManifestName != "openclaw.plugin.json" {
+		t.Fatalf("manifest names = %q, %q", SkillManifestName, PluginManifestName)
+	}
+	for _, id := range []string{"observatory-probe", "obs.probe_1", "a"} {
+		if !ValidPluginID(id) {
+			t.Fatalf("ValidPluginID(%q) = false", id)
+		}
+	}
+	for _, id := range []string{"", "Observatory-Probe", "has space", "-leading"} {
+		if ValidPluginID(id) {
+			t.Fatalf("ValidPluginID(%q) = true", id)
+		}
+	}
+}
+
 func TestSkillFrontmatterAcceptsManifestSizedLineAndRejectsUnterminatedBlock(t *testing.T) {
 	manifest := []byte("---\n#" + strings.Repeat("x", 70<<10) + "\nname: long-line-probe\n---\n")
 	name, present, err := parseSkillFrontmatterName(manifest)

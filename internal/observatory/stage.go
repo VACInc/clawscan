@@ -38,6 +38,22 @@ var pluginIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 var pluginToolPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
 var skillIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
 
+// SkillManifestName and PluginManifestName are the manifest files that mark an
+// OpenClaw skill and a native OpenClaw plugin. They are the single source of
+// truth other packages use to classify a target without re-implementing the
+// staging walk.
+const (
+	SkillManifestName  = "SKILL.md"
+	PluginManifestName = "openclaw.plugin.json"
+)
+
+// ValidPluginID reports whether id is a canonical native-plugin identifier.
+// Callers that classify plugin targets before staging use it so the identity
+// they record will still satisfy staging and evidence validation.
+func ValidPluginID(id string) bool {
+	return pluginIDPattern.MatchString(id)
+}
+
 func StageTarget(target string, destination string, limits LimitsConfig) (StagedTarget, error) {
 	return processTarget(target, destination, limits, true)
 }
@@ -141,7 +157,7 @@ func processTarget(target string, destination string, limits LimitsConfig, copyT
 		fileHash := sha256.New()
 		writers := []io.Writer{fileHash}
 		var manifest bytes.Buffer
-		isManifest := rel == "SKILL.md" || rel == "openclaw.plugin.json"
+		isManifest := rel == SkillManifestName || rel == PluginManifestName
 		if isManifest {
 			if info.Size() > 1<<20 {
 				return false, fmt.Errorf("target manifest exceeds 1 MiB: %s", rel)
@@ -179,11 +195,11 @@ func processTarget(target string, destination string, limits LimitsConfig, copyT
 		if len(files)+len(directories)+len(evidence.Omitted) > limits.MaxFiles {
 			return false, fmt.Errorf("target exceeds maxFiles entries (%d)", limits.MaxFiles)
 		}
-		if rel == "SKILL.md" {
+		if rel == SkillManifestName {
 			skillManifest = append([]byte(nil), manifest.Bytes()...)
 			skillManifestFound = true
 		}
-		if rel == "openclaw.plugin.json" {
+		if rel == PluginManifestName {
 			pluginManifest = append([]byte(nil), manifest.Bytes()...)
 			pluginManifestFound = true
 		}
@@ -287,7 +303,7 @@ func targetRootPath(target string) (string, fs.FileInfo, error) {
 	root := abs
 	if !info.IsDir() {
 		base := filepath.Base(abs)
-		if !info.Mode().IsRegular() || (base != "SKILL.md" && base != "openclaw.plugin.json") {
+		if !info.Mode().IsRegular() || (base != SkillManifestName && base != PluginManifestName) {
 			return "", nil, fmt.Errorf("behavior target must be a skill/plugin directory or its manifest: %s", target)
 		}
 		root = filepath.Dir(abs)

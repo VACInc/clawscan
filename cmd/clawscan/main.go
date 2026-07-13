@@ -624,6 +624,9 @@ Target notes:
   No target with --scanner, --profile, or --config scans child skill directories under ./skills.
   Plain clawscan without --scanner, --profile, or --config is invalid.
   Most scanners use a local skill file or directory target.
+  A directory holding openclaw.plugin.json is scanned as a native OpenClaw plugin.
+  Only the behavior scanner exercises plugins; skill-only scanners return a skipped result.
+  Plugins are never auto-discovered; pass the plugin directory explicitly.
   Socket runs the public Socket CLI full-scan path over local dependency manifests.
 
 Judge summary:
