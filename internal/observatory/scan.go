@@ -93,6 +93,7 @@ func commandEnvironmentAllowed(key string) bool {
 
 type ScanResult struct {
 	Evidence     Evidence
+	Grade        Grade
 	RunDirectory string
 }
 
@@ -232,7 +233,14 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err := writeJSON(evidencePath, evidence, 0o600); err != nil {
 		return ScanResult{RunDirectory: runDir}, err
 	}
-	result := ScanResult{Evidence: evidence, RunDirectory: runDir}
+	grade := GradeEvidenceWithSignals(evidence, GradeSignalsFromEvidence(evidence))
+	if err := ValidateGrade(grade); err != nil {
+		return ScanResult{Evidence: evidence, RunDirectory: runDir}, err
+	}
+	if err := writeJSON(filepath.Join(runDir, "grade.json"), grade, 0o600); err != nil {
+		return ScanResult{Evidence: evidence, RunDirectory: runDir}, err
+	}
+	result := ScanResult{Evidence: evidence, Grade: grade, RunDirectory: runDir}
 	var completionErrors []error
 	if runErr != nil {
 		completionErrors = append(completionErrors, fmt.Errorf("crabbox behavior run failed after producing valid evidence: %w", runErr))

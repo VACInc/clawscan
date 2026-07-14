@@ -2078,7 +2078,7 @@ func fixtureEvidence() Evidence {
 			{ID: "workspace-memory", Surface: "workspace file", Class: "memory", Stages: []CanaryStageInteraction{}},
 		},
 		RedirectProbes: []RedirectProbeObservation{{ID: "workspace-note-egress", Surface: "workspace note", Vector: "network", ReadExercise: 1, ReadDelta: 1, Escalation: "read", Attributed: "read", Exercised: true}},
-		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: false, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
+		Persistence:    PersistenceEvidence{Scope: "selected-persistence-surfaces", InventoryPaired: true, Surfaces: persistenceSurfaceCatalog(), Findings: []PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."}},
 		Coverage: CoverageEvidence{
 			SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true,
 			CanaryStages:       canaryStageCoverage(canaryCoverageInputs{PairedTrace: true, PairedAgentOutput: true, AgentOutputComplete: true}),

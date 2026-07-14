@@ -17,9 +17,11 @@ import (
 // skill and url preserve the historical Clawscan behavior; plugin is the
 // first-class native OpenClaw plugin target added alongside them.
 const (
-	targetKindSkill  = "skill"
-	targetKindPlugin = "plugin"
-	targetKindURL    = "url"
+	targetKindSkill    = "skill"
+	targetKindPlugin   = "plugin"
+	targetKindURL      = "url"
+	skillManifestName  = observatory.SkillManifestName
+	pluginManifestName = observatory.PluginManifestName
 )
 
 const maxPluginManifestBytes = 1 << 20
@@ -53,6 +55,9 @@ func resolveTarget(input string) (resolvedTarget, error) {
 	kind, id, err := classifyLocalTarget(resolved, input)
 	if err != nil {
 		return resolvedTarget{}, err
+	}
+	if kind == targetKindPlugin && filepath.Base(resolved) == observatory.PluginManifestName {
+		resolved = filepath.Dir(resolved)
 	}
 	return resolvedTarget{kind: kind, input: input, resolvedPath: resolved, id: id}, nil
 }

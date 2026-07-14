@@ -1517,7 +1517,7 @@ func TestRunUsesSkillSpectorForPluginDirectory(t *testing.T) {
 	if result := artifact.Scanners["skillspector"]; result.Status != "completed" {
 		t.Fatalf("scanner = %#v", result)
 	}
-	if artifact.Target.Kind != targetKindPlugin || artifact.Target.ID != "probe-plugin" {
+	if artifact.Target.Kind != targetKindPlugin || artifact.Target.ID != "observatory-probe" {
 		t.Fatalf("target = %#v", artifact.Target)
 	}
 	if len(commandRunner.calls) != 1 {

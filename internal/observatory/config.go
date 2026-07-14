@@ -483,7 +483,10 @@ func (config Config) validateMatrix() error {
 		if got := matrixInvariantReceipts(effective); got != fixedReceipts {
 			return fmt.Errorf("matrix variant %q changes configuration outside the documented model and endpoint axes", variant.ID)
 		}
-		digest := captureConfigSHA256(effective)
+		digest, err := captureConfigSHA256(effective)
+		if err != nil {
+			return fmt.Errorf("matrix variant %q capture configuration digest: %w", variant.ID, err)
+		}
 		if other, ok := seenDigest[digest]; ok {
 			return fmt.Errorf("matrix variants %q and %q resolve to the same effective configuration; give each a distinct model/runtime override", other, variant.ID)
 		}

@@ -26,10 +26,11 @@ type StagedTarget struct {
 }
 
 type targetDescriptor struct {
-	Kind          string
-	Name          string
-	ID            string
-	DeclaredTools []string
+	Kind                 string
+	Name                 string
+	ID                   string
+	DeclaredTools        []string
+	DeclaredCapabilities *DeclaredCapabilities
 }
 
 type targetWalkFunc func(rel string, info fs.FileInfo, file *os.File) (descend bool, err error)
@@ -220,6 +221,7 @@ func processTarget(target string, destination string, limits LimitsConfig, copyT
 	evidence.Kind = descriptor.Kind
 	evidence.ID = descriptor.ID
 	evidence.DeclaredTools = descriptor.DeclaredTools
+	evidence.DeclaredCapabilities = descriptor.DeclaredCapabilities
 
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 	sort.Slice(directories, func(i, j int) bool { return directories[i].rel < directories[j].rel })
@@ -328,22 +330,24 @@ func descriptorFromManifests(root string, skill []byte, skillFound bool, plugin 
 			return targetDescriptor{}, err
 		}
 		if !present {
-			return targetDescriptor{Kind: "skill", Name: "Unnamed skill", ID: "observed"}, nil
+			return targetDescriptor{Kind: "skill", Name: "Unnamed skill", ID: "observed", DeclaredCapabilities: parseSkillDeclaredCapabilities(skill)}, nil
 		}
 		if !skillIDPattern.MatchString(name) {
 			return targetDescriptor{}, fmt.Errorf("skill manifest has invalid canonical name %q", name)
 		}
-		return targetDescriptor{Kind: "skill", Name: name, ID: name}, nil
+		return targetDescriptor{Kind: "skill", Name: name, ID: name, DeclaredCapabilities: parseSkillDeclaredCapabilities(skill)}, nil
 	}
 	if !pluginFound {
 		return targetDescriptor{}, fmt.Errorf("behavior target is missing a regular SKILL.md or openclaw.plugin.json: %s", root)
 	}
 
 	var manifest struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		Contracts struct {
-			Tools []string `json:"tools"`
+		ID          string   `json:"id"`
+		Name        string   `json:"name"`
+		Permissions []string `json:"permissions"`
+		Contracts   struct {
+			Tools       []string `json:"tools"`
+			Permissions []string `json:"permissions"`
 		} `json:"contracts"`
 	}
 	if err := json.Unmarshal(plugin, &manifest); err != nil {
@@ -372,7 +376,130 @@ func descriptorFromManifests(root string, skill []byte, skillFound bool, plugin 
 		}
 	}
 	sort.Strings(tools)
-	return targetDescriptor{Kind: "plugin", Name: manifest.Name, ID: manifest.ID, DeclaredTools: tools}, nil
+	descriptor := targetDescriptor{Kind: "plugin", Name: manifest.Name, ID: manifest.ID, DeclaredTools: tools}
+	if manifest.Permissions != nil || manifest.Contracts.Permissions != nil {
+		raw := append(append([]string{}, manifest.Permissions...), manifest.Contracts.Permissions...)
+		capabilities, notes := normalizeDeclaredCapabilities(raw)
+		descriptor.DeclaredCapabilities = &DeclaredCapabilities{Source: "plugin-manifest", Declared: true, Capabilities: capabilities, Notes: notes}
+	}
+	return descriptor, nil
+}
+
+var declaredCapabilitySynonyms = map[string]string{
+	"filesystem-read":   "filesystem-read",
+	"fs-read":           "filesystem-read",
+	"read":              "filesystem-read",
+	"files-read":        "filesystem-read",
+	"filesystem-write":  "filesystem-write",
+	"fs-write":          "filesystem-write",
+	"write":             "filesystem-write",
+	"files-write":       "filesystem-write",
+	"credential-access": "credential-access",
+	"credentials":       "credential-access",
+	"secrets":           "credential-access",
+	"network":           "network",
+	"net":               "network",
+	"http":              "network",
+	"outbound":          "network",
+	"process-exec":      "process-exec",
+	"exec":              "process-exec",
+	"process":           "process-exec",
+	"persistence":       "persistence",
+	"autostart":         "persistence",
+}
+
+func normalizeDeclaredCapabilities(raw []string) ([]string, []string) {
+	seen := map[string]bool{}
+	capabilities := []string{}
+	var notes []string
+	unknown := map[string]bool{}
+	for _, token := range raw {
+		normalized := strings.ToLower(strings.TrimSpace(token))
+		if normalized == "" {
+			continue
+		}
+		mapped, ok := declaredCapabilitySynonyms[normalized]
+		if !ok {
+			unknown[normalized] = true
+			continue
+		}
+		if !seen[mapped] {
+			seen[mapped] = true
+			capabilities = append(capabilities, mapped)
+		}
+	}
+	sort.Strings(capabilities)
+	if len(unknown) > 0 {
+		unknownList := make([]string, 0, len(unknown))
+		for token := range unknown {
+			unknownList = append(unknownList, token)
+		}
+		sort.Strings(unknownList)
+		notes = append(notes, "Ignored unrecognized declared permission token(s): "+strings.Join(unknownList, ", ")+".")
+	}
+	return capabilities, notes
+}
+
+func parseSkillDeclaredCapabilities(manifest []byte) *DeclaredCapabilities {
+	mapping, present, err := skillFrontmatterMapping(manifest)
+	if err != nil || !present || mapping == nil {
+		return nil
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		key, value := mapping.Content[index], mapping.Content[index+1]
+		if key.Value != "permissions" {
+			continue
+		}
+		raw := []string{}
+		notes := []string(nil)
+		if value.Kind == yaml.SequenceNode {
+			for _, item := range value.Content {
+				if item.Kind == yaml.ScalarNode {
+					raw = append(raw, item.Value)
+				}
+			}
+		} else {
+			notes = []string{"Skill frontmatter permissions is not a list; no capabilities were parsed from it."}
+		}
+		capabilities, parseNotes := normalizeDeclaredCapabilities(raw)
+		notes = append(notes, parseNotes...)
+		return &DeclaredCapabilities{Source: "skill-frontmatter", Declared: true, Capabilities: capabilities, Notes: notes}
+	}
+	return nil
+}
+
+func skillFrontmatterMapping(manifest []byte) (*yaml.Node, bool, error) {
+	const maxSkillManifestBytes = 1 << 20
+	if len(manifest) > maxSkillManifestBytes {
+		return nil, false, fmt.Errorf("skill manifest exceeds 1 MiB")
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(manifest))
+	scanner.Buffer(make([]byte, 64<<10), maxSkillManifestBytes+1)
+	if !scanner.Scan() {
+		return nil, false, scanner.Err()
+	}
+	if strings.TrimPrefix(scanner.Text(), "\ufeff") != "---" {
+		return nil, false, nil
+	}
+	var frontmatter bytes.Buffer
+	for scanner.Scan() {
+		if scanner.Text() == "---" {
+			var document yaml.Node
+			if err := yaml.Unmarshal(frontmatter.Bytes(), &document); err != nil {
+				return nil, false, err
+			}
+			if len(document.Content) == 0 {
+				return nil, false, nil
+			}
+			if document.Content[0].Kind != yaml.MappingNode {
+				return nil, false, fmt.Errorf("skill manifest frontmatter must be a mapping")
+			}
+			return document.Content[0], true, nil
+		}
+		frontmatter.WriteString(scanner.Text())
+		frontmatter.WriteByte('\n')
+	}
+	return nil, false, scanner.Err()
 }
 
 func readSkillName(manifest []byte) string {

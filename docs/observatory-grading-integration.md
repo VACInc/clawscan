@@ -1,15 +1,15 @@
 # Grading integration for typed evidence channels
 
-This branch deliberately does not copy or merge adjacent evidence-schema work.
-After those branches land, add one adapter in `internal/observatory` and route
-scan, analyze, render, and the standalone grade command through:
+Production scan, analyze, render, and standalone grade paths use one adapter in
+`internal/observatory`:
 
 ```go
 GradeEvidenceWithSignals(evidence, gradeSignalsFromEvidence(evidence))
 ```
 
-Keep `GradeEvidence` for legacy `observatory.behavior.v1` fixtures that do not
-declare the enhanced channels. Do not infer a channel from free-form
+`GradeSignalsFromEvidence` performs this mapping. `GradeEvidence` remains the
+legacy helper for `observatory.behavior.v1` fixtures that do not declare the
+enhanced channels. The adapter never infers a channel from free-form
 limitations or tool names.
 
 ## Exact field mapping
@@ -69,8 +69,7 @@ Tool-call ledger:
 
 ## Integration proof
 
-After wiring the adapter, run the grader tests with all typed channels present,
-then add one end-to-end owned skill and one owned plugin assertion that verifies:
+The grader and owned-fixture validation must verify:
 
 1. all protocol-declared required channels appear in `coverage.channels`;
 2. the owned benign fixtures receive their expected A or B grade;

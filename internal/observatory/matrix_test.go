@@ -194,13 +194,18 @@ func completeVariantInput(t *testing.T, id string, modelID string) MatrixCompari
 	config.TargetLineage = "example/fixture-skill"
 	config.Runtime.Model.ID = modelID
 	evidence := fixtureEvidence()
-	bindMatrixEvidence(&evidence, config)
+	bindMatrixEvidence(t, &evidence, config)
 	evidence.Run.ID = "obs_" + id
 	return MatrixComparisonInput{VariantID: modelID, Evidence: evidence, EffectiveConfig: &config}
 }
 
-func bindMatrixEvidence(evidence *Evidence, config Config) {
-	evidence.CaptureConfigSHA256 = captureConfigSHA256(config)
+func bindMatrixEvidence(t *testing.T, evidence *Evidence, config Config) {
+	t.Helper()
+	captureConfigSHA, err := captureConfigSHA256(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence.CaptureConfigSHA256 = captureConfigSHA
 	evidence.Target.Lineage = config.TargetLineage
 	evidence.Run.Runtime.ModelID = config.Runtime.Model.ID
 	evidence.Run.Runtime.ModelProvider = config.Runtime.Model.Provider
@@ -209,7 +214,7 @@ func bindMatrixEvidence(evidence *Evidence, config Config) {
 	evidence.Run.Isolation.Substrate = config.Isolation.Substrate
 	evidence.Run.Isolation.NetworkMode = config.Isolation.NetworkMode
 	evidence.Run.Isolation.Verification = config.Isolation.Verification
-	evidence.Run.Isolation.GuestFirewallPolicySHA256 = digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses)))
+	evidence.Run.Isolation.GuestFirewallPolicySHA256 = digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.ModelRelay, config.Runtime.MockEgress)))
 	evidence.Exercise.PromptSHA256 = digestBytes([]byte(config.Exercise.Prompt))
 	evidence.Exercise.TurnLimit = config.Exercise.TurnLimit
 }
@@ -313,7 +318,7 @@ func TestCompareMatrixRejectsReceiptBoundFixedAxisDrift(t *testing.T) {
 			changed := *right.EffectiveConfig
 			test.change(&changed)
 			right.EffectiveConfig = &changed
-			bindMatrixEvidence(&right.Evidence, changed)
+			bindMatrixEvidence(t, &right.Evidence, changed)
 			if _, err := CompareMatrix([]MatrixComparisonInput{left, right}); err == nil || !strings.Contains(err.Error(), "fixed configuration receipts differ") {
 				t.Fatalf("err = %v", err)
 			}

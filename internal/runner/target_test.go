@@ -74,6 +74,9 @@ func TestResolveTargetClassifiesPluginManifestFile(t *testing.T) {
 	if resolved.kind != targetKindPlugin || resolved.id != "observatory-probe" {
 		t.Fatalf("resolved = %#v", resolved)
 	}
+	if resolved.resolvedPath != dir {
+		t.Fatalf("resolvedPath = %q, want plugin directory %q", resolved.resolvedPath, dir)
+	}
 }
 
 func TestResolveTargetKeepsSkillClassification(t *testing.T) {

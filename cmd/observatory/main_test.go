@@ -3,12 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openclaw/clawscan/internal/observatory"
 )
@@ -33,7 +40,8 @@ func cliEvidence(runID string, completedAt string) observatory.Evidence {
 			ID: runID, Status: "completed", StartedAt: "2026-07-10T11:59:59Z", CompletedAt: completedAt, Executor: "fixture",
 			Isolation: observatory.IsolationEvidence{
 				Substrate: "proxmox-vm", NetworkMode: "deny-except-model", ContainmentProfile: "fixture",
-				GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64), Verification: "fixture",
+				GuestFirewallSHA256: "sha256:" + strings.Repeat("b", 64), GuestFirewallPolicySHA256: "sha256:" + strings.Repeat("e", 64),
+				ProxmoxTLSCASHA256: "sha256:" + strings.Repeat("f", 64), Verification: "fixture",
 			},
 			Runtime: observatory.RuntimeEvidence{OpenClawVersion: "OpenClaw fixture", StraceVersion: "strace fixture", ModelProvider: "local", ModelID: "fixture", ModelEndpoint: "private"},
 		},
@@ -45,7 +53,28 @@ func cliEvidence(runID string, completedAt string) observatory.Evidence {
 			{ID: "workspace-identity", Surface: "workspace file"},
 			{ID: "workspace-memory", Surface: "workspace file"},
 		},
-		Coverage: observatory.CoverageEvidence{SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true, Limitations: []string{"Fixture limitation."}},
+		RedirectProbes: []observatory.RedirectProbeObservation{},
+		Persistence: observatory.PersistenceEvidence{
+			Scope: "selected-persistence-surfaces", InventoryPaired: true,
+			Surfaces: []observatory.PersistenceSurface{{ID: "shell-init", Category: "shell-init", Scope: "user", Description: "User shell initialization files."}},
+			Findings: []observatory.PersistenceFinding{}, Limitations: []string{"Fixture persistence limitation."},
+		},
+		Coverage: observatory.CoverageEvidence{
+			SyscallScope: "selected-mvp-syscalls", FileSyscalls: true, ProcessSyscalls: true, NetworkSyscalls: true, BaselinePaired: true,
+			RedirectProbeScope: observatory.RedirectProbeScope, RedirectProbeCount: 0, RedirectProbesExercised: 0,
+			Limitations: []string{"Fixture limitation."},
+		},
+		ToolCallLedger: observatory.ToolCallLedger{
+			Source: observatory.ToolCallLedgerSource, MaxCallsPerLane: observatory.MaxToolCallsPerLane,
+			ArgumentSummaries: observatory.ToolArgumentCoverage{Available: false, Reason: "Fixture metadata contains no arguments."},
+			Baseline:          observatory.ToolCallLane{Coverage: "unavailable", Reason: "Fixture has no ledger.", Calls: []observatory.ToolCall{}},
+			Exercise:          observatory.ToolCallLane{Coverage: "unavailable", Reason: "Fixture has no ledger.", Calls: []observatory.ToolCall{}},
+		},
+		RuntimeTimeline: observatory.RuntimeTimeline{
+			MaxEventsPerLane: observatory.MaxRuntimeTimelineEventsPerLane,
+			Baseline:         observatory.RuntimeTimelineLane{Events: []observatory.RuntimeTimelineEvent{}},
+			Exercise:         observatory.RuntimeTimelineLane{Events: []observatory.RuntimeTimelineEvent{}},
+		},
 	}
 }
 
@@ -264,13 +293,19 @@ func writeMatrixConfig(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "observatory.yml")
+	crabboxPath := filepath.Join(dir, "crabbox.yml")
+	if err := os.WriteFile(crabboxPath, []byte("proxmox:\n  apiUrl: https://pve.fixture.invalid:8006\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	caPath := writeCLITestCA(t, dir)
 	config := `version: 1
 live: false
 artifactsDir: ` + filepath.Join(dir, "runs") + `
 executor:
   kind: crabbox
   command: crabbox
-  crabboxConfig: ` + filepath.Join(dir, "crabbox.yml") + `
+  crabboxConfig: ` + crabboxPath + `
+  tlsCAFile: ` + caPath + `
 runtime:
   model:
     baseUrl: http://10.0.0.2:8000/v1
@@ -289,6 +324,28 @@ matrix:
 		t.Fatal(err)
 	}
 	return configPath
+}
+
+func writeCLITestCA(t *testing.T, dir string) string {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "cli-test-ca"},
+		NotBefore: time.Unix(0, 0), NotAfter: time.Unix(4102444800, 0),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, template, template, privateKey.Public(), privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "proxmox-ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func matrixCommandTarget() string {

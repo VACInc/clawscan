@@ -173,7 +173,7 @@ func TestVirusTotalScannerScansPluginDirectoryAsPluginZip(t *testing.T) {
 	if !containsArg(result.Command, "plugin-zip") || containsArg(result.Command, "skill-zip") {
 		t.Fatalf("command = %#v", result.Command)
 	}
-	if artifact.Target.Kind != targetKindPlugin || artifact.Target.ID != "probe-plugin" {
+	if artifact.Target.Kind != targetKindPlugin || artifact.Target.ID != "observatory-probe" {
 		t.Fatalf("target = %#v", artifact.Target)
 	}
 	if artifact.Target.ResolvedPath != target {

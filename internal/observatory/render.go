@@ -35,10 +35,12 @@ type VersionChange struct {
 }
 
 type pageData struct {
-	Evidence Evidence
-	Changes  []VersionChange
-	Counts   map[string]int
-	Sections evidenceSectionPresence
+	Evidence      Evidence
+	Grade         Grade
+	PreviousGrade *Grade
+	Changes       []VersionChange
+	Counts        map[string]int
+	Sections      evidenceSectionPresence
 }
 
 type evidenceSectionPresence struct {
@@ -103,7 +105,12 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 	if err := ValidateEvidence(evidence); err != nil {
 		return err
 	}
+	grade := GradeEvidenceWithSignals(evidence, GradeSignalsFromEvidence(evidence))
+	if err := ValidateGrade(grade); err != nil {
+		return err
+	}
 	changes := []VersionChange{}
+	var previousGrade *Grade
 	if previous != nil {
 		if err := ValidateEvidence(*previous); err != nil {
 			return fmt.Errorf("validate previous evidence: %w", err)
@@ -112,6 +119,11 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 			return err
 		}
 		changes = DiffEvidence(*previous, evidence)
+		derived := GradeEvidenceWithSignals(*previous, GradeSignalsFromEvidence(*previous))
+		if err := ValidateGrade(derived); err != nil {
+			return fmt.Errorf("derive previous grade: %w", err)
+		}
+		previousGrade = &derived
 	}
 	directory, err := openRenderOutputDirectory(outputDir, 0o755)
 	if err != nil {
@@ -139,7 +151,7 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 		return err
 	}
 	sections := evidenceSections(evidence)
-	renderErr := evidencePageTemplate.Execute(file, pageData{Evidence: evidence, Changes: changes, Counts: counts, Sections: sections})
+	renderErr := evidencePageTemplate.Execute(file, pageData{Evidence: evidence, Grade: grade, PreviousGrade: previousGrade, Changes: changes, Counts: counts, Sections: sections})
 	closeErr := file.Close()
 	if renderErr != nil {
 		return renderErr
@@ -147,14 +159,18 @@ func RenderSite(outputDir string, evidence Evidence, previous *Evidence) error {
 	if closeErr != nil {
 		return closeErr
 	}
+	var evidenceOutput any = evidence
 	if evidence.SchemaVersion == LegacyEvidenceSchemaVersion || !sections.CanaryStages {
 		projection, err := legacyEvidenceProjection(evidence, sections)
 		if err != nil {
 			return err
 		}
-		return writeRenderJSON(directory, "evidence.json", projection, 0o644)
+		evidenceOutput = projection
 	}
-	return writeRenderJSON(directory, "evidence.json", evidence, 0o644)
+	if err := writeRenderJSON(directory, "evidence.json", evidenceOutput, 0o644); err != nil {
+		return err
+	}
+	return writeRenderJSON(directory, "grade.json", grade, 0o644)
 }
 
 func evidenceSections(evidence Evidence) evidenceSectionPresence {
@@ -579,6 +595,24 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
 		return value
 	},
 	"upper": strings.ToUpper,
+	"gradeClass": func(letter string) string {
+		switch letter {
+		case "A":
+			return "sev-none"
+		case "B":
+			return "sev-low"
+		case "C":
+			return "sev-moderate"
+		case "D":
+			return "sev-elevated"
+		case "F":
+			return "sev-critical"
+		default:
+			return "sev-ungraded"
+		}
+	},
+	"sevClass": func(severity string) string { return "sev-" + severity },
+	"join":     func(items []string) string { return strings.Join(items, " ") },
 	"runtimeTimelinePreview": func(events []RuntimeTimelineEvent) []RuntimeTimelineEvent {
 		if len(events) > maxRuntimeTimelineDisplayRows {
 			return events[:maxRuntimeTimelineDisplayRows]
@@ -633,6 +667,12 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     .change-added { color:var(--green); } .change-changed { color:var(--amber); } .change-removed { color:var(--red); }
     ul { margin:0; padding-left:20px; } li+li { margin-top:7px; }
     footer { margin-top:28px; color:var(--muted); font-size:13px; }
+	.grade-hero { display:flex; align-items:center; gap:22px; flex-wrap:wrap; }
+	.grade-letter { display:grid; place-items:center; width:96px; height:96px; border-radius:20px; border:1px solid var(--line); font:800 56px/1 ui-monospace,SFMono-Regular,Consolas,monospace; background:#0b111b; }
+	.grade-letter.sev-ungraded { font-size:26px; }
+	.sev-none { color:var(--green); } .sev-low { color:var(--cyan); } .sev-moderate { color:var(--amber); } .sev-elevated { color:#ffa361; } .sev-critical { color:var(--red); } .sev-ungraded { color:var(--muted); }
+	.pill { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font:700 11px ui-monospace,SFMono-Regular,Consolas,monospace; text-transform:uppercase; letter-spacing:.06em; }
+	.escalator { border-left:3px solid var(--red); padding:6px 0 6px 12px; margin-top:10px; }
     @media (max-width:780px) { .grid { grid-template-columns:repeat(2,1fr); } .meta { grid-template-columns:1fr; } .table-wrap { overflow-x:auto; } }
   </style>
 </head>
@@ -643,6 +683,26 @@ var evidencePageTemplate = template.Must(template.New("evidence").Funcs(template
     <p class="lede">Observed deltas from a paired baseline and {{.Evidence.Target.Kind}} exercise. This page reports evidence, not a safety verdict.</p>
     <span class="badge {{if ne .Evidence.Run.Status "completed"}}incomplete{{end}}">{{upper .Evidence.Run.Status}}</span>
   </header>
+	<section class="panel" aria-label="Behavioral grade">
+	  <div class="grade-hero">
+	    <div class="grade-letter {{gradeClass .Grade.Letter}}">{{if .Grade.Graded}}{{.Grade.Letter}}{{else}}N/A{{end}}</div>
+	    <div>
+	      <div class="eyebrow">Deterministic behavioral grade</div>
+	      <h2>{{if .Grade.Graded}}Grade {{.Grade.Letter}}{{else}}Ungraded{{end}}</h2>
+	      <p class="lede">{{.Grade.Summary}}</p>
+	      <p class="muted">Policy {{.Grade.PolicyVersion}} · Confidence {{upper .Grade.Confidence.Level}} · Coverage {{.Grade.Coverage.Capture}} ({{.Grade.Coverage.AssessedDimensions}}/{{.Grade.Coverage.TotalDimensions}} dimensions){{if .PreviousGrade}} · Previous {{if .PreviousGrade.Graded}}{{.PreviousGrade.Letter}}{{else}}ungraded{{end}}{{end}}</p>
+	    </div>
+	  </div>
+	  {{if .Grade.Escalators}}<div>{{range .Grade.Escalators}}<div class="escalator"><span class="pill sev-critical">{{.ID}}</span> {{.Description}}</div>{{end}}</div>{{end}}
+	  <div class="table-wrap"><table><thead><tr><th>Dimension</th><th>Severity</th><th>Grade</th><th>Reasons</th></tr></thead><tbody>
+	    {{range .Grade.Dimensions}}<tr><td>{{.Title}}</td><td><span class="pill {{sevClass .Severity}}">{{.Severity}}</span></td><td>{{.Grade}}</td><td>{{range .Reasons}}<div class="muted">{{.}}</div>{{end}}</td></tr>{{end}}
+	  </tbody></table></div>
+	  <h2 style="margin-top:18px">Declared vs. observed</h2>
+	  <p class="muted">Status: <span class="pill">{{.Grade.Comparison.Status}}</span>{{if .Grade.Comparison.DeclarationPresent}} · declared: {{if .Grade.Comparison.DeclaredCapabilities}}{{join .Grade.Comparison.DeclaredCapabilities}}{{else}}none{{end}}{{else}} · no machine-readable declaration{{end}}{{if .Grade.Comparison.ObservedCapabilities}} · observed: {{join .Grade.Comparison.ObservedCapabilities}}{{end}}</p>
+	  {{range .Grade.Comparison.Notes}}<p class="muted">{{.}}</p>{{end}}
+	  {{range .Grade.Confidence.Reasons}}<p class="muted">Confidence: {{.}}</p>{{end}}
+	  <p class="muted">This grade scores observed behavioral risk within the covered exercise only. It is never a universal safety verdict or a statement of author intent.</p>
+	</section>
   <section class="grid" aria-label="Observation totals">
     <div class="metric"><strong>{{index .Counts "file"}}</strong><span>File events</span></div>
     <div class="metric"><strong>{{index .Counts "process"}}</strong><span>Process events</span></div>

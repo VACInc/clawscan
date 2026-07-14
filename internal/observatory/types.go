@@ -48,18 +48,37 @@ type Evidence struct {
 }
 
 type TargetEvidence struct {
-	Name           string            `json:"name"`
-	Kind           string            `json:"kind"`
-	Lineage        string            `json:"lineage,omitempty"`
-	ID             string            `json:"id,omitempty"`
-	DeclaredTools  []string          `json:"declaredTools,omitempty"`
-	SHA256         string            `json:"sha256"`
-	FileCount      int               `json:"fileCount"`
-	DirectoryCount int               `json:"directoryCount"`
-	TotalBytes     int64             `json:"totalBytes"`
-	Files          []TargetFile      `json:"files"`
-	Directories    []TargetDirectory `json:"directories"`
-	Omitted        []TargetOmission  `json:"omitted,omitempty"`
+	Name                 string                `json:"name"`
+	Kind                 string                `json:"kind"`
+	Lineage              string                `json:"lineage,omitempty"`
+	ID                   string                `json:"id,omitempty"`
+	DeclaredTools        []string              `json:"declaredTools,omitempty"`
+	DeclaredCapabilities *DeclaredCapabilities `json:"declaredCapabilities,omitempty"`
+	SHA256               string                `json:"sha256"`
+	FileCount            int                   `json:"fileCount"`
+	DirectoryCount       int                   `json:"directoryCount"`
+	TotalBytes           int64                 `json:"totalBytes"`
+	Files                []TargetFile          `json:"files"`
+	Directories          []TargetDirectory     `json:"directories"`
+	Omitted              []TargetOmission      `json:"omitted,omitempty"`
+}
+
+// DeclaredCapabilities is the conservative, machine-readable capability
+// declaration parsed from target-owned metadata. It is lineage, not a verdict.
+type DeclaredCapabilities struct {
+	Source       string   `json:"source"`
+	Declared     bool     `json:"declared"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Notes        []string `json:"notes,omitempty"`
+}
+
+var declaredCapabilityTokens = map[string]bool{
+	"filesystem-read":   true,
+	"filesystem-write":  true,
+	"credential-access": true,
+	"network":           true,
+	"process-exec":      true,
+	"persistence":       true,
 }
 
 type TargetFile struct {
@@ -344,6 +363,9 @@ func ValidateEvidence(evidence Evidence) error {
 	}
 	if evidence.Target.Kind == "skill" && !skillIDPattern.MatchString(evidence.Target.ID) {
 		return errors.New("evidence skill target ID is invalid")
+	}
+	if err := validateDeclaredCapabilities(evidence.Target.DeclaredCapabilities); err != nil {
+		return err
 	}
 	if evidence.Target.FileCount < 1 || evidence.Target.FileCount != len(evidence.Target.Files) || evidence.Target.DirectoryCount < 1 || evidence.Target.DirectoryCount != len(evidence.Target.Directories) || evidence.Target.TotalBytes < 0 {
 		return errors.New("evidence target manifest is incomplete")
@@ -883,6 +905,39 @@ func validateRuntimeTimelineLane(lane RuntimeTimelineLane) error {
 			lastOffset = *event.OffsetMs
 		} else if event.OffsetMs != nil {
 			return errors.New("untimed event must not report an offset")
+		}
+	}
+	return nil
+}
+
+func validateDeclaredCapabilities(declared *DeclaredCapabilities) error {
+	if declared == nil {
+		return nil
+	}
+	if declared.Source != "plugin-manifest" && declared.Source != "skill-frontmatter" {
+		return errors.New("evidence declared capabilities source is invalid")
+	}
+	seen := map[string]bool{}
+	previous := ""
+	for _, token := range declared.Capabilities {
+		if !declaredCapabilityTokens[token] {
+			return fmt.Errorf("evidence declares an unknown capability token: %s", token)
+		}
+		if seen[token] {
+			return errors.New("evidence declared capabilities contain a duplicate token")
+		}
+		if token < previous {
+			return errors.New("evidence declared capabilities must be sorted")
+		}
+		seen[token] = true
+		previous = token
+	}
+	if !declared.Declared && len(declared.Capabilities) != 0 {
+		return errors.New("evidence declared capabilities are present but marked as not declared")
+	}
+	for _, note := range declared.Notes {
+		if strings.TrimSpace(note) == "" || len(note) > 200 || strings.ContainsAny(note, "\x00\r\n") {
+			return errors.New("evidence declared capability note is invalid")
 		}
 	}
 	return nil

@@ -77,13 +77,17 @@ func BuildMatrixPlan(target string, config Config) (MatrixPlan, error) {
 		if err != nil {
 			return MatrixPlan{}, fmt.Errorf("matrix variant %q: %w", variant.ID, err)
 		}
+		captureConfigSHA, err := captureConfigSHA256(effective)
+		if err != nil {
+			return MatrixPlan{}, fmt.Errorf("matrix variant %q capture configuration digest: %w", variant.ID, err)
+		}
 		plan.Variants = append(plan.Variants, MatrixPlanVariant{
 			ID:                  variant.ID,
 			ModelProvider:       effective.Runtime.Model.Provider,
 			ModelID:             effective.Runtime.Model.ID,
 			ModelEndpointClass:  modelEndpointClass(effective.Runtime.Model.BaseURL),
 			TimeoutSeconds:      config.Runtime.TimeoutSeconds,
-			CaptureConfigSHA256: captureConfigSHA256(effective),
+			CaptureConfigSHA256: captureConfigSHA,
 		})
 		// Mirror the host-side per-scan budget used in Scan so the worst-case
 		// wall clock reflects sequential execution honestly.
@@ -561,7 +565,11 @@ func validateMatrixInputBinding(input MatrixComparisonInput) (matrixConfigReceip
 		return matrixConfigReceipts{}, fmt.Errorf("effective configuration is invalid: %w", err)
 	}
 	evidence := input.Evidence
-	if expected := captureConfigSHA256(config); evidence.CaptureConfigSHA256 != expected {
+	expected, err := captureConfigSHA256(config)
+	if err != nil {
+		return matrixConfigReceipts{}, fmt.Errorf("compute effective capture configuration digest: %w", err)
+	}
+	if evidence.CaptureConfigSHA256 != expected {
 		return matrixConfigReceipts{}, fmt.Errorf("capture configuration digest %q does not match effective configuration %q", evidence.CaptureConfigSHA256, expected)
 	}
 	if evidence.Target.Lineage != config.TargetLineage {
@@ -575,7 +583,7 @@ func validateMatrixInputBinding(input MatrixComparisonInput) (matrixConfigReceip
 		evidence.Run.Isolation.Verification != config.Isolation.Verification {
 		return matrixConfigReceipts{}, errors.New("isolation receipt does not match effective configuration")
 	}
-	if evidence.Run.Isolation.GuestFirewallPolicySHA256 != digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses))) {
+	if evidence.Run.Isolation.GuestFirewallPolicySHA256 != digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.ModelRelay, config.Runtime.MockEgress))) {
 		return matrixConfigReceipts{}, errors.New("guest firewall policy receipt does not match the model endpoint allowlist")
 	}
 	if evidence.Run.Runtime.ModelProvider != config.Runtime.Model.Provider ||
