@@ -248,7 +248,7 @@ wait "$relay_pid" || relay_status=$?
 relay_pid=""
 trap - EXIT INT TERM
 
-relay_deadline_hit="$(jq -er '.deadlineHit | booleans' "$relay_receipt" 2>/dev/null)" || relay_deadline_hit=true
+relay_deadline_hit="$(jq -r 'if (.deadlineHit | type) == "boolean" then .deadlineHit else error("deadlineHit must be boolean") end' "$relay_receipt" 2>/dev/null)" || relay_deadline_hit=invalid
 if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$output_root/behavior-grade.json" || ! -s "$relay_receipt" ]] ||
    [[ "$relay_deadline_hit" != "false" ]]; then
   write_failure "behavior" "behavior capture failed"

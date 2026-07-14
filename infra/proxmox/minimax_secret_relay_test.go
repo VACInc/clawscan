@@ -74,12 +74,16 @@ func TestGatedPipelineBindsAndRejectsRelayDeadline(t *testing.T) {
 	for _, required := range []string{
 		"--print-scan-budget-seconds",
 		"OBSERVATORY_RELAY_DEADLINE_SECONDS=\"$relay_deadline_seconds\"",
-		".deadlineHit | booleans",
+		`if (.deadlineHit | type) == "boolean" then .deadlineHit`,
+		"relay_deadline_hit=invalid",
 		"$relay_deadline_hit\" != \"false",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("gated pipeline missing relay deadline guard %q", required)
 		}
+	}
+	if strings.Contains(text, `jq -er '.deadlineHit`) || strings.Contains(text, `jq -e '.deadlineHit`) {
+		t.Fatal("gated pipeline must not use jq --exit-status to read a valid false deadline flag")
 	}
 }
 
