@@ -659,10 +659,6 @@ func matrixInvariantMismatch(reference Evidence, other Evidence) string {
 		return "isolation containment profile"
 	case reference.Run.Isolation.Verification != other.Run.Isolation.Verification:
 		return "isolation verification receipt"
-	case reference.Run.Isolation.GuestFirewallSHA256 != other.Run.Isolation.GuestFirewallSHA256:
-		return "guest firewall receipt"
-	case reference.Run.Isolation.GuestFirewallPolicySHA256 != other.Run.Isolation.GuestFirewallPolicySHA256:
-		return "guest firewall policy receipt"
 	case reference.Run.Isolation.ProxmoxTLSCASHA256 != other.Run.Isolation.ProxmoxTLSCASHA256:
 		return "Proxmox TLS CA receipt"
 	case reference.Run.Runtime.OpenClawVersion != other.Run.Runtime.OpenClawVersion:

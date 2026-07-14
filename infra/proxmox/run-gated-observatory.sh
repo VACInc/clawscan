@@ -58,6 +58,31 @@ write_failure() {
   }' > "$result"
 }
 
+relay_pid=""
+behavior_pid=""
+cleanup_pipeline_children() {
+  local status="$1"
+  trap - EXIT INT TERM
+  if [[ -n "$relay_pid" ]]; then
+    if kill -0 "$relay_pid" 2>/dev/null; then
+      if [[ -n "${relay_done:-}" && ! -e "$relay_done" ]]; then
+        ( set -o noclobber; printf 'complete\n' > "$relay_done" ) 2>/dev/null || true
+      fi
+      kill -TERM "$relay_pid" 2>/dev/null || true
+    fi
+    wait "$relay_pid" 2>/dev/null || true
+    relay_pid=""
+  fi
+  if [[ -n "$behavior_pid" ]]; then
+    if kill -0 "$behavior_pid" 2>/dev/null; then
+      kill -TERM "$behavior_pid" 2>/dev/null || true
+    fi
+    wait "$behavior_pid" 2>/dev/null || true
+    behavior_pid=""
+  fi
+  exit "$status"
+}
+
 behavior_budget_seconds="$("$observatory_bin" validate-config --live --print-scan-budget-seconds "$config")"
 [[ "$behavior_budget_seconds" =~ ^[1-9][0-9]{2,4}$ ]] || die "Observatory returned an invalid behavior scan budget"
 relay_deadline_seconds="$((behavior_budget_seconds + 30))"
@@ -191,6 +216,9 @@ OBSERVATORY_RELAY_RECEIPT="$relay_receipt" \
 OBSERVATORY_RELAY_DONE_FILE="$relay_done" \
 node "$relay_script" > "$output_root/minimax-relay.stdout" 2> "$output_root/minimax-relay.stderr" &
 relay_pid=$!
+trap 'cleanup_pipeline_children "$?"' EXIT
+trap 'cleanup_pipeline_children 130' INT
+trap 'cleanup_pipeline_children 143' TERM
 printf '%s\n' "$relay_pid" > "$output_root/minimax-relay.pid"
 printf '%s\n' "node $relay_script (credential inherited; value not recorded)" > "$output_root/minimax-relay.command"
 unset api_key
@@ -206,13 +234,18 @@ done
 behavior_status=0
 "$observatory_bin" scan --config "$config" \
   --output "$output_root/behavior-evidence.json" "$stage/target" \
-  > "$output_root/observatory.stdout" 2> "$output_root/observatory.stderr" || behavior_status=$?
+  > "$output_root/observatory.stdout" 2> "$output_root/observatory.stderr" &
+behavior_pid=$!
+wait "$behavior_pid" || behavior_status=$?
+behavior_pid=""
 
 # This create-only marker asks the relay to close after in-flight requests. No
 # signal or process kill is used; the relay writes its bounded receipt and exits.
 ( set -o noclobber; printf 'complete\n' > "$relay_done" )
 relay_status=0
 wait "$relay_pid" || relay_status=$?
+relay_pid=""
+trap - EXIT INT TERM
 
 relay_deadline_hit="$(jq -er '.deadlineHit | booleans' "$relay_receipt" 2>/dev/null)" || relay_deadline_hit=true
 if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$relay_receipt" ]] ||

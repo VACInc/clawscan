@@ -50,6 +50,46 @@ func TestGatedPipelineBindsAndRejectsRelayDeadline(t *testing.T) {
 	}
 }
 
+func TestGatedPipelineCleansUpExactRelayChildOnEveryExit(t *testing.T) {
+	script, err := os.ReadFile("run-gated-observatory.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	pidIndex := strings.Index(text, "relay_pid=$!")
+	trapIndex := strings.Index(text, "trap 'cleanup_pipeline_children \"$?\"' EXIT")
+	metadataIndex := strings.Index(text, `printf '%s\n' "$relay_pid" > "$output_root/minimax-relay.pid"`)
+	if pidIndex < 0 || trapIndex <= pidIndex || metadataIndex <= trapIndex {
+		t.Fatalf("relay cleanup trap is not registered immediately after capturing the child PID")
+	}
+	for _, required := range []string{
+		`kill -0 "$relay_pid"`,
+		`kill -TERM "$relay_pid"`,
+		`wait "$relay_pid"`,
+		`kill -0 "$behavior_pid"`,
+		`kill -TERM "$behavior_pid"`,
+		`wait "$behavior_pid"`,
+		`trap 'cleanup_pipeline_children 130' INT`,
+		`trap 'cleanup_pipeline_children 143' TERM`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("gated pipeline relay cleanup is missing %q", required)
+		}
+	}
+	behaviorStart := strings.Index(text, `"$observatory_bin" scan --config "$config"`)
+	behaviorPID := strings.Index(text, "behavior_pid=$!")
+	behaviorWait := -1
+	if behaviorPID >= 0 {
+		if relative := strings.Index(text[behaviorPID:], `wait "$behavior_pid"`); relative >= 0 {
+			behaviorWait = behaviorPID + relative
+		}
+	}
+	if behaviorStart < 0 || behaviorPID <= behaviorStart || behaviorWait <= behaviorPID ||
+		!strings.Contains(text[behaviorStart:behaviorPID], "&\n") {
+		t.Fatal("behavior scan is not launched behind an interruptible wait")
+	}
+}
+
 func TestMiniMaxSecretRelayRejectsMissingDerivedDeadline(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {

@@ -212,8 +212,8 @@ func completeVariantInput(t *testing.T, id string, modelID string) MatrixCompari
 	config.TargetLineage = "example/fixture-skill"
 	config.Runtime.Model.ID = modelID
 	evidence := fixtureEvidence()
-	bindMatrixEvidence(t, &evidence, config)
 	evidence.Run.ID = "obs_" + id
+	bindMatrixEvidence(t, &evidence, config)
 	return MatrixComparisonInput{VariantID: modelID, Evidence: evidence, EffectiveConfig: &config}
 }
 
@@ -328,6 +328,28 @@ func TestCompareMatrixRequiresEffectiveConfigAndExactCaptureBinding(t *testing.T
 	caTampered.Evidence.Run.Isolation.ProxmoxTLSCASHA256 = "sha256:" + strings.Repeat("7", 64)
 	if _, err := CompareMatrix([]MatrixComparisonInput{left, caTampered}); err == nil || !strings.Contains(err.Error(), "Proxmox TLS CA receipt") {
 		t.Fatalf("TLS CA binding err = %v", err)
+	}
+}
+
+func TestCompareMatrixAllowsBoundPerVariantFirewallReceipts(t *testing.T) {
+	left := completeVariantInput(t, "a", "model-a")
+	right := completeVariantInput(t, "b", "model-b")
+
+	left.Evidence.Run.Isolation.GuestFirewallSHA256 = "sha256:" + strings.Repeat("1", 64)
+	changed := *right.EffectiveConfig
+	changed.Runtime.Model.BaseURL = "http://10.0.0.9:9000/v1"
+	changed.Runtime.ControlPlaneAddresses = []string{"10.0.0.9:9000"}
+	right.EffectiveConfig = &changed
+	bindMatrixEvidence(t, &right.Evidence, changed)
+	right.Evidence.Run.Isolation.GuestFirewallSHA256 = "sha256:" + strings.Repeat("2", 64)
+
+	comparison, err := CompareMatrix([]MatrixComparisonInput{left, right})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comparison.Variants) != 2 ||
+		comparison.Variants[0].GuestFirewallPolicySHA256 == comparison.Variants[1].GuestFirewallPolicySHA256 {
+		t.Fatalf("per-variant firewall receipts were not retained: %#v", comparison.Variants)
 	}
 }
 
