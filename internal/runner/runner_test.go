@@ -2833,6 +2833,39 @@ func TestRenderClawHubPromptUsesProductionScannerContextShape(t *testing.T) {
 	}
 }
 
+func TestClawHubOAuthProfileUsesClawHubPromptRenderer(t *testing.T) {
+	artifact := Artifact{
+		Profile: "clawhub-oauth",
+		Target:  Target{Kind: targetKindPlugin, ID: "probe-plugin"},
+		Scanners: map[string]ScannerResult{
+			"virustotal":      {Raw: json.RawMessage(`{"status":"clean","source":"engines","engineStats":{"malicious":0,"suspicious":0,"harmless":3,"undetected":70}}`)},
+			"skillspector":    {Raw: json.RawMessage(`{"status":"suspicious","score":55}`)},
+			"clawscan-static": {Raw: json.RawMessage(`{"schemaVersion":"clawscan-static-v1","findings":[{"id":"static.prompt_injection","severity":"medium"},{"id":"static.credential_exfiltration","severity":"high"}]}`)},
+		},
+	}
+	prompt, err := renderJudgePromptSource(
+		"clawhub/prompt.md",
+		"SYSTEM\n\nAdditional ClawHub policy for this Codex run:\nstale block",
+		artifact,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"- target kind: packageRelease",
+		`"status": "suspicious"`,
+		"- non-VT malicious signal present: yes",
+		"- pre-scan artifact injection signals: html-comment-injection",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("OAuth prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "stale block") {
+		t.Fatalf("OAuth profile used the generic prompt renderer:\n%s", prompt)
+	}
+}
+
 func TestClawHubPromptUsesPackageReleaseContextForPluginTarget(t *testing.T) {
 	artifact := Artifact{
 		Target: Target{Kind: targetKindPlugin, ID: "probe-plugin"},

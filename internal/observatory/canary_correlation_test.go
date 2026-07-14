@@ -133,6 +133,34 @@ func TestCanaryMarkerOperandsDoNotOverstateExecuteOrStdoutWrite(t *testing.T) {
 	}
 }
 
+func TestFailedCanaryPropagationSyscallsAreNotConfirmed(t *testing.T) {
+	marker := testCanaryMarkers()["cloud-credentials"]
+	metadata := CaptureMetadata{
+		BaselineHome: "/run/baseline/home", ExerciseHome: "/run/exercise/home",
+		TargetKind: "skill",
+	}
+	exercise := strings.Join([]string{
+		`execve("/run/exercise/home/.aws/credentials", ["x"], 0x0) = -1 EACCES (Permission denied)`,
+		`execve("` + marker + `", ["x"], 0x0) = -1 EPERM (Operation not permitted)`,
+		`sendto(5<TCP:[10.0.0.3:5000->93.184.216.34:443]>, "` + marker + `", 61, 0, NULL, 0) = -1 EPERM (Operation not permitted)`,
+		`sendmsg(5<TCP:[10.0.0.3:5000->93.184.216.34:443]>, {msg_iov=[{iov_base="` + marker + `", iov_len=61}], msg_iovlen=1}, 0) = -1 EPIPE (Broken pipe)`,
+		`write(5<TCP:[10.0.0.3:5000->93.184.216.34:443]>, "` + marker + `", 61) = -1 EPIPE (Broken pipe)`,
+	}, "\n")
+	result := AnalyzeTraces(AnalysisInput{
+		BaselineTraces: []string{`getpid() = 100`}, ExerciseTraces: []string{exercise},
+		Metadata: metadata, Canaries: testCanaries(),
+	})
+	cloud := findCanary(result.Canaries, "cloud-credentials")
+	if cloud.ExerciseInteractions != 0 || cloud.DeltaInteractions != 0 {
+		t.Fatalf("failed propagation became confirmed canary evidence: %#v", cloud)
+	}
+	for _, stage := range []string{CanaryStageExecute, CanaryStageOutbound} {
+		if got := findCanaryStageForTest(cloud.Stages, stage); got.Stage != "" {
+			t.Fatalf("failed syscall became %s evidence: %#v", stage, got)
+		}
+	}
+}
+
 func TestBuildEvidenceUsesOnlyVerifiedCanonicalSinkPayloads(t *testing.T) {
 	config := validTestConfig(t, t.TempDir())
 	config.Runtime.MockEgress = MockEgressConfig{

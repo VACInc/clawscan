@@ -466,7 +466,7 @@ func (config Config) validateMatrix() error {
 	}
 	seenID := map[string]bool{}
 	seenDigest := map[string]string{}
-	fixedReceipts := matrixInvariantReceipts(config)
+	fixedReceipts := matrixInvariantReceipts(config, "")
 	for _, variant := range variants {
 		if !matrixVariantIDPattern.MatchString(variant.ID) {
 			return fmt.Errorf("matrix variant id must be a stable label of at most 64 URL-safe characters: %q", variant.ID)
@@ -480,7 +480,7 @@ func (config Config) validateMatrix() error {
 		if err := effective.Validate(); err != nil {
 			return fmt.Errorf("matrix variant %q: %w", variant.ID, err)
 		}
-		if got := matrixInvariantReceipts(effective); got != fixedReceipts {
+		if got := matrixInvariantReceipts(effective, ""); got != fixedReceipts {
 			return fmt.Errorf("matrix variant %q changes configuration outside the documented model and endpoint axes", variant.ID)
 		}
 		digest, err := captureConfigSHA256(effective)

@@ -4,11 +4,26 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
+
+var (
+	matrixCAOnce sync.Once
+	matrixCAPEM  []byte
+)
+
+func sharedMatrixCAPEM(t *testing.T) []byte {
+	t.Helper()
+	matrixCAOnce.Do(func() {
+		matrixCAPEM = append([]byte(nil), testCAPEM(t, "matrix-shared-ca")...)
+	})
+	return append([]byte(nil), matrixCAPEM...)
+}
 
 func matrixTestConfig(t *testing.T, variants ...MatrixVariant) Config {
 	t.Helper()
@@ -128,7 +143,7 @@ func TestVariantConfigChangesOnlyDocumentedAxes(t *testing.T) {
 		ControlPlaneAddresses: []string{"10.0.0.9:9000"},
 	}
 	effective := base.VariantConfig(variant)
-	if got, want := matrixInvariantReceipts(effective), matrixInvariantReceipts(base); got != want {
+	if got, want := matrixInvariantReceipts(effective, ""), matrixInvariantReceipts(base, ""); got != want {
 		t.Fatalf("fixed receipts changed: got=%#v want=%#v", got, want)
 	}
 	if !reflect.DeepEqual(effective.Executor, base.Executor) || !reflect.DeepEqual(effective.Isolation, base.Isolation) ||
@@ -191,6 +206,9 @@ func TestBuildMatrixPlanShowsResourceMultiplierAndHidesRawEndpoints(t *testing.T
 func completeVariantInput(t *testing.T, id string, modelID string) MatrixComparisonInput {
 	t.Helper()
 	config := validTestConfig(t, t.TempDir())
+	if err := os.WriteFile(config.Executor.TLSCAFile, sharedMatrixCAPEM(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	config.TargetLineage = "example/fixture-skill"
 	config.Runtime.Model.ID = modelID
 	evidence := fixtureEvidence()
@@ -214,6 +232,11 @@ func bindMatrixEvidence(t *testing.T, evidence *Evidence, config Config) {
 	evidence.Run.Isolation.Substrate = config.Isolation.Substrate
 	evidence.Run.Isolation.NetworkMode = config.Isolation.NetworkMode
 	evidence.Run.Isolation.Verification = config.Isolation.Verification
+	_, tlsCASHA256, err := readAndValidateTLSCAFile(config.Executor.TLSCAFile, proxmoxAPIHostname(config.Executor.CrabboxConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence.Run.Isolation.ProxmoxTLSCASHA256 = tlsCASHA256
 	evidence.Run.Isolation.GuestFirewallPolicySHA256 = digestBytes([]byte(guestFirewallRules("policy", config.Runtime.ControlPlaneAddresses, config.Runtime.ModelRelay, config.Runtime.MockEgress)))
 	evidence.Exercise.PromptSHA256 = digestBytes([]byte(config.Exercise.Prompt))
 	evidence.Exercise.TurnLimit = config.Exercise.TurnLimit
@@ -266,7 +289,9 @@ func TestCompareMatrixProducesPerVariantSignalsAndTotals(t *testing.T) {
 	if comparison.HeldConstant.CaptureProtocolRevision != CaptureProtocolRevision ||
 		comparison.HeldConstant.FixedConfigSHA256 == "" || comparison.HeldConstant.IsolationConfigSHA256 == "" ||
 		comparison.HeldConstant.ResourceLimitsSHA256 == "" || comparison.HeldConstant.ExerciseConfigSHA256 == "" ||
-		comparison.HeldConstant.TargetConfigSHA256 == "" || comparison.HeldConstant.RuntimeConstantsSHA256 == "" {
+		comparison.HeldConstant.TargetConfigSHA256 == "" || comparison.HeldConstant.RuntimeConstantsSHA256 == "" ||
+		comparison.HeldConstant.ModelRelayConfigSHA256 == "" || comparison.HeldConstant.MockEgressConfigSHA256 == "" ||
+		comparison.HeldConstant.RedirectConfigSHA256 == "" || comparison.HeldConstant.ProxmoxTLSCASHA256 == "" {
 		t.Fatalf("fixed receipts are incomplete: %#v", comparison.HeldConstant)
 	}
 }
@@ -298,6 +323,12 @@ func TestCompareMatrixRequiresEffectiveConfigAndExactCaptureBinding(t *testing.T
 	if _, err := CompareMatrix([]MatrixComparisonInput{left, firewallTampered}); err == nil || !strings.Contains(err.Error(), "firewall policy receipt") {
 		t.Fatalf("firewall binding err = %v", err)
 	}
+
+	caTampered := right
+	caTampered.Evidence.Run.Isolation.ProxmoxTLSCASHA256 = "sha256:" + strings.Repeat("7", 64)
+	if _, err := CompareMatrix([]MatrixComparisonInput{left, caTampered}); err == nil || !strings.Contains(err.Error(), "Proxmox TLS CA receipt") {
+		t.Fatalf("TLS CA binding err = %v", err)
+	}
 }
 
 func TestCompareMatrixRejectsReceiptBoundFixedAxisDrift(t *testing.T) {
@@ -307,6 +338,8 @@ func TestCompareMatrixRejectsReceiptBoundFixedAxisDrift(t *testing.T) {
 	}{
 		{name: "resource limits", change: func(config *Config) { config.Limits.MaxTasks++ }},
 		{name: "timeout", change: func(config *Config) { config.Runtime.TimeoutSeconds++ }},
+		{name: "model relay limit", change: func(config *Config) { config.Runtime.ModelRelay.MaxRequests++ }},
+		{name: "mock egress limit", change: func(config *Config) { config.Runtime.MockEgress.MaxRequests++ }},
 		{name: "prompt", change: func(config *Config) { config.Exercise.Prompt += " Fixed-axis drift." }},
 		{name: "isolation", change: func(config *Config) { config.Isolation.Verification = "other-network-proof" }},
 		{name: "target lineage", change: func(config *Config) { config.TargetLineage = "example/other-skill" }},
@@ -324,6 +357,18 @@ func TestCompareMatrixRejectsReceiptBoundFixedAxisDrift(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("Proxmox TLS CA bytes", func(t *testing.T) {
+		left := completeVariantInput(t, "a", "model-a")
+		right := completeVariantInput(t, "b", "model-b")
+		changed := *right.EffectiveConfig
+		changed.Executor.TLSCAFile = writeTestCA(t, t.TempDir(), "alternate-matrix-ca.pem")
+		right.EffectiveConfig = &changed
+		bindMatrixEvidence(t, &right.Evidence, changed)
+		if _, err := CompareMatrix([]MatrixComparisonInput{left, right}); err == nil || !strings.Contains(err.Error(), "fixed configuration receipts differ") {
+			t.Fatalf("err = %v", err)
+		}
+	})
 }
 
 func TestCompareMatrixRejectsDuplicateAndAmbiguousIdentities(t *testing.T) {

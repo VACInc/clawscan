@@ -63,9 +63,14 @@ func BuildMatrixPlan(target string, config Config) (MatrixPlan, error) {
 	if err != nil {
 		return MatrixPlan{}, err
 	}
+	_, proxmoxTLSCASHA256, err := readAndValidateTLSCAFile(baseEffective.Executor.TLSCAFile, proxmoxAPIHostname(baseEffective.Executor.CrabboxConfig))
+	if err != nil {
+		return MatrixPlan{}, fmt.Errorf("read matrix Proxmox TLS CA: %w", err)
+	}
+	fixedReceipts := matrixInvariantReceipts(baseEffective, proxmoxTLSCASHA256)
 	plan := MatrixPlan{
 		Schema:              MatrixPlanSchema,
-		FixedConfigSHA256:   matrixInvariantReceipts(baseEffective).FixedConfigSHA256,
+		FixedConfigSHA256:   fixedReceipts.FixedConfigSHA256,
 		TargetSHA256:        staged.Evidence.SHA256,
 		VariantCount:        len(config.Matrix.Variants),
 		ResourceMultiplier:  len(config.Matrix.Variants),
@@ -251,8 +256,12 @@ type MatrixConstants struct {
 	ExecutorConfigSHA256    string `json:"executorConfigSha256"`
 	IsolationConfigSHA256   string `json:"isolationConfigSha256"`
 	RuntimeConstantsSHA256  string `json:"runtimeConstantsSha256"`
+	ModelRelayConfigSHA256  string `json:"modelRelayConfigSha256"`
+	MockEgressConfigSHA256  string `json:"mockEgressConfigSha256"`
 	ExerciseConfigSHA256    string `json:"exerciseConfigSha256"`
+	RedirectConfigSHA256    string `json:"redirectConfigSha256"`
 	ResourceLimitsSHA256    string `json:"resourceLimitsSha256"`
+	ProxmoxTLSCASHA256      string `json:"proxmoxTlsCaSha256"`
 	IsolationSubstrate      string `json:"isolationSubstrate"`
 	IsolationNetworkMode    string `json:"isolationNetworkMode"`
 	ContainmentProfile      string `json:"containmentProfile"`
@@ -271,11 +280,15 @@ type matrixConfigReceipts struct {
 	ExecutorConfigSHA256    string
 	IsolationConfigSHA256   string
 	RuntimeConstantsSHA256  string
+	ModelRelayConfigSHA256  string
+	MockEgressConfigSHA256  string
 	ExerciseConfigSHA256    string
+	RedirectConfigSHA256    string
 	ResourceLimitsSHA256    string
+	ProxmoxTLSCASHA256      string
 }
 
-func matrixInvariantReceipts(config Config) matrixConfigReceipts {
+func matrixInvariantReceipts(config Config, proxmoxTLSCASHA256 string) matrixConfigReceipts {
 	target := struct {
 		TargetLineage string `json:"targetLineage"`
 	}{TargetLineage: config.TargetLineage}
@@ -292,20 +305,28 @@ func matrixInvariantReceipts(config Config) matrixConfigReceipts {
 		TimeoutSeconds:  config.Runtime.TimeoutSeconds,
 	}
 	fixed := struct {
-		CaptureProtocolRevision string          `json:"captureProtocolRevision"`
-		Target                  any             `json:"target"`
-		Executor                any             `json:"executor"`
-		Isolation               IsolationConfig `json:"isolation"`
-		RuntimeConstants        any             `json:"runtimeConstants"`
-		Exercise                ExerciseConfig  `json:"exercise"`
-		Limits                  LimitsConfig    `json:"limits"`
+		CaptureProtocolRevision string           `json:"captureProtocolRevision"`
+		ProxmoxTLSCASHA256      string           `json:"proxmoxTlsCaSha256"`
+		Target                  any              `json:"target"`
+		Executor                any              `json:"executor"`
+		Isolation               IsolationConfig  `json:"isolation"`
+		RuntimeConstants        any              `json:"runtimeConstants"`
+		ModelRelay              ModelRelayConfig `json:"modelRelay"`
+		MockEgress              MockEgressConfig `json:"mockEgress"`
+		Exercise                ExerciseConfig   `json:"exercise"`
+		Redirect                RedirectConfig   `json:"redirect"`
+		Limits                  LimitsConfig     `json:"limits"`
 	}{
 		CaptureProtocolRevision: CaptureProtocolRevision,
+		ProxmoxTLSCASHA256:      proxmoxTLSCASHA256,
 		Target:                  target,
 		Executor:                executor,
 		Isolation:               config.Isolation,
 		RuntimeConstants:        runtimeConstants,
+		ModelRelay:              config.Runtime.ModelRelay,
+		MockEgress:              config.Runtime.MockEgress,
 		Exercise:                config.Exercise,
+		Redirect:                config.Redirect,
 		Limits:                  config.Limits,
 	}
 	return matrixConfigReceipts{
@@ -315,8 +336,12 @@ func matrixInvariantReceipts(config Config) matrixConfigReceipts {
 		ExecutorConfigSHA256:    matrixDigest(executor),
 		IsolationConfigSHA256:   matrixDigest(config.Isolation),
 		RuntimeConstantsSHA256:  matrixDigest(runtimeConstants),
+		ModelRelayConfigSHA256:  matrixDigest(config.Runtime.ModelRelay),
+		MockEgressConfigSHA256:  matrixDigest(config.Runtime.MockEgress),
 		ExerciseConfigSHA256:    matrixDigest(config.Exercise),
+		RedirectConfigSHA256:    matrixDigest(config.Redirect),
 		ResourceLimitsSHA256:    matrixDigest(config.Limits),
+		ProxmoxTLSCASHA256:      proxmoxTLSCASHA256,
 	}
 }
 
@@ -450,8 +475,12 @@ func CompareMatrix(inputs []MatrixComparisonInput) (MatrixComparison, error) {
 			ExecutorConfigSHA256:    referenceReceipts.ExecutorConfigSHA256,
 			IsolationConfigSHA256:   referenceReceipts.IsolationConfigSHA256,
 			RuntimeConstantsSHA256:  referenceReceipts.RuntimeConstantsSHA256,
+			ModelRelayConfigSHA256:  referenceReceipts.ModelRelayConfigSHA256,
+			MockEgressConfigSHA256:  referenceReceipts.MockEgressConfigSHA256,
 			ExerciseConfigSHA256:    referenceReceipts.ExerciseConfigSHA256,
+			RedirectConfigSHA256:    referenceReceipts.RedirectConfigSHA256,
 			ResourceLimitsSHA256:    referenceReceipts.ResourceLimitsSHA256,
+			ProxmoxTLSCASHA256:      referenceReceipts.ProxmoxTLSCASHA256,
 			IsolationSubstrate:      reference.Run.Isolation.Substrate,
 			IsolationNetworkMode:    reference.Run.Isolation.NetworkMode,
 			ContainmentProfile:      reference.Run.Isolation.ContainmentProfile,
@@ -572,6 +601,13 @@ func validateMatrixInputBinding(input MatrixComparisonInput) (matrixConfigReceip
 	if evidence.CaptureConfigSHA256 != expected {
 		return matrixConfigReceipts{}, fmt.Errorf("capture configuration digest %q does not match effective configuration %q", evidence.CaptureConfigSHA256, expected)
 	}
+	_, proxmoxTLSCASHA256, err := readAndValidateTLSCAFile(config.Executor.TLSCAFile, proxmoxAPIHostname(config.Executor.CrabboxConfig))
+	if err != nil {
+		return matrixConfigReceipts{}, fmt.Errorf("read effective Proxmox TLS CA: %w", err)
+	}
+	if evidence.Run.Isolation.ProxmoxTLSCASHA256 != proxmoxTLSCASHA256 {
+		return matrixConfigReceipts{}, errors.New("Proxmox TLS CA receipt does not match effective configuration")
+	}
 	if evidence.Target.Lineage != config.TargetLineage {
 		return matrixConfigReceipts{}, errors.New("target lineage does not match effective configuration")
 	}
@@ -594,7 +630,7 @@ func validateMatrixInputBinding(input MatrixComparisonInput) (matrixConfigReceip
 	if evidence.Exercise.PromptSHA256 != digestBytes([]byte(config.Exercise.Prompt)) || evidence.Exercise.TurnLimit != config.Exercise.TurnLimit {
 		return matrixConfigReceipts{}, errors.New("exercise receipt does not match effective configuration")
 	}
-	return matrixInvariantReceipts(config), nil
+	return matrixInvariantReceipts(config, proxmoxTLSCASHA256), nil
 }
 
 func matrixInvariantMismatch(reference Evidence, other Evidence) string {
@@ -623,6 +659,12 @@ func matrixInvariantMismatch(reference Evidence, other Evidence) string {
 		return "isolation containment profile"
 	case reference.Run.Isolation.Verification != other.Run.Isolation.Verification:
 		return "isolation verification receipt"
+	case reference.Run.Isolation.GuestFirewallSHA256 != other.Run.Isolation.GuestFirewallSHA256:
+		return "guest firewall receipt"
+	case reference.Run.Isolation.GuestFirewallPolicySHA256 != other.Run.Isolation.GuestFirewallPolicySHA256:
+		return "guest firewall policy receipt"
+	case reference.Run.Isolation.ProxmoxTLSCASHA256 != other.Run.Isolation.ProxmoxTLSCASHA256:
+		return "Proxmox TLS CA receipt"
 	case reference.Run.Runtime.OpenClawVersion != other.Run.Runtime.OpenClawVersion:
 		return "OpenClaw runtime version"
 	case reference.Run.Runtime.StraceVersion != other.Run.Runtime.StraceVersion:

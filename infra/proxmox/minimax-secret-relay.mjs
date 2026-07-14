@@ -36,6 +36,7 @@ const receipt = {
   deadlineHit: false,
 };
 let active = 0;
+let admittedRequests = 0;
 let shuttingDown = false;
 let receiptWritten = false;
 let doneTimer;
@@ -55,13 +56,24 @@ function shutdown(deadlineHit = false) {
 }
 function reject(res, status, message) {
   receipt.rejectedRequests++;
+  deny(res, status, message);
+  if (admittedRequests >= maxRequests && active === 0) shutdown(false);
+}
+function deny(res, status, message) {
   res.writeHead(status, {"content-type": "application/json", connection: "close"});
   res.end(JSON.stringify({error: {type: "observatory_relay", message}}));
 }
 
 const server = http.createServer((req, res) => {
-  if (shuttingDown) return reject(res, 503, "relay is closing");
-  if (receipt.acceptedRequests + receipt.rejectedRequests >= maxRequests) return reject(res, 429, "request cap reached");
+  if (shuttingDown) return deny(res, 503, "relay is closing");
+  if (admittedRequests >= maxRequests) {
+    deny(res, 429, "request cap reached");
+    if (active === 0) shutdown(false);
+    return;
+  }
+  // Reserve the bounded request slot synchronously. Body parsing and upstream
+  // forwarding are asynchronous, so counting only at body completion races.
+  admittedRequests++;
   if (req.method !== "POST" || req.url !== "/v1/chat/completions") return reject(res, 404, "route is not allowed");
   if (req.headers.authorization !== "Bearer local") return reject(res, 401, "relay credential rejected");
   if (String(req.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase() !== "application/json") return reject(res, 415, "JSON required");
@@ -79,7 +91,7 @@ const server = http.createServer((req, res) => {
     if (released) return;
     released = true;
     active--;
-    if (receipt.acceptedRequests + receipt.rejectedRequests >= maxRequests && active === 0) shutdown(false);
+    if (admittedRequests >= maxRequests && active === 0) shutdown(false);
   };
   res.once("close", release);
   req.on("data", chunk => {

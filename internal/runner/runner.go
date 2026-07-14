@@ -1453,7 +1453,7 @@ func prepareJudgePrompt(source string, artifact Artifact, state *judgeCommandSta
 }
 
 func renderJudgePromptSource(source string, template string, artifact Artifact) (string, error) {
-	if artifact.Profile == "clawhub" && judgeSourceKey(source) == "clawhub/prompt.md" {
+	if (artifact.Profile == "clawhub" || artifact.Profile == "clawhub-oauth") && judgeSourceKey(source) == "clawhub/prompt.md" {
 		return RenderClawHubPrompt(template, artifact)
 	}
 	return RenderPromptTemplate(template, artifact)

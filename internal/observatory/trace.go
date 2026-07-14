@@ -1535,6 +1535,7 @@ func canaryValueStages(line string, marker string) []string {
 		return nil
 	}
 	syscall := strings.TrimSpace(line[:open])
+	succeeded := syscallSucceeded(syscallResult(line))
 	switch syscall {
 	case "open", "openat", "openat2":
 		pathIndex := 0
@@ -1550,6 +1551,9 @@ func canaryValueStages(line string, marker string) []string {
 			return []string{CanaryStageWrite}
 		}
 	case "execve", "execveat":
+		if !succeeded {
+			return nil
+		}
 		programIndex := 0
 		if syscall == "execveat" {
 			programIndex = 1
@@ -1558,11 +1562,11 @@ func canaryValueStages(line string, marker string) []string {
 			return []string{CanaryStageExecute}
 		}
 	case "sendto":
-		if argumentContainsMarker(line, 1, marker) {
+		if succeeded && argumentContainsMarker(line, 1, marker) {
 			return []string{CanaryStageOutbound}
 		}
 	case "sendmsg", "sendmmsg":
-		if iovecArgumentContainsMarker(line, 1, marker) {
+		if succeeded && iovecArgumentContainsMarker(line, 1, marker) {
 			return []string{CanaryStageOutbound}
 		}
 	case "write", "writev":
@@ -1573,7 +1577,7 @@ func canaryValueStages(line string, marker string) []string {
 		if !payloadContainsMarker {
 			return nil
 		}
-		if subject, _ := networkFDSubject(line, nil, ""); subject != "" {
+		if subject, _ := networkFDSubject(line, nil, ""); succeeded && subject != "" {
 			return []string{CanaryStageOutbound}
 		}
 		if fd, ok := syscallFDNumber(line); ok && fd > 2 {
@@ -1685,6 +1689,9 @@ func canaryPathStages(line string, canary CanaryDefinition, metadata CaptureMeta
 			return []string{CanaryStageWrite}
 		}
 	case "execve", "execveat":
+		if !syscallSucceeded(syscallResult(line)) {
+			break
+		}
 		programIndex := 0
 		if syscall == "execveat" {
 			programIndex = 1
