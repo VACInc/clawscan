@@ -529,13 +529,16 @@ const server = net.createServer((socket) => {
       connBytes += slice.length;
       capturedTotal += slice.length;
     }
-    if (connBytes >= maxBytesPerRequest || capturedTotal >= maxTotalBytes) {
+    if (truncated) {
       socket.pause();
       respond();
     }
   });
   socket.on("end", respond);
-  socket.setTimeout(750, respond);
+  socket.setTimeout(750, () => {
+    if (connBytes >= maxBytesPerRequest || capturedTotal >= maxTotalBytes) truncated = true;
+    respond();
+  });
 });
 server.maxConnections = maxConcurrentSockets;
 server.on("drop", () => { rejectedRequests += 1; truncated = true; });

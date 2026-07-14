@@ -58,7 +58,9 @@ write_failure() {
   }' > "$result"
 }
 
-"$observatory_bin" validate-config --live "$config" >/dev/null
+behavior_budget_seconds="$("$observatory_bin" validate-config --live --print-scan-budget-seconds "$config")"
+[[ "$behavior_budget_seconds" =~ ^[1-9][0-9]{2,4}$ ]] || die "Observatory returned an invalid behavior scan budget"
+relay_deadline_seconds="$((behavior_budget_seconds + 30))"
 "$observatory_bin" stage \
   --output "$stage/target" \
   --metadata "$stage/target-metadata.json" \
@@ -184,6 +186,7 @@ OBSERVATORY_RELAY_LISTEN="$relay_listen" \
 OBSERVATORY_MINIMAX_API_KEY="$api_key" \
 OBSERVATORY_RELAY_MODEL="MiniMax-M3" \
 OBSERVATORY_RELAY_MAX_REQUESTS=16 \
+OBSERVATORY_RELAY_DEADLINE_SECONDS="$relay_deadline_seconds" \
 OBSERVATORY_RELAY_RECEIPT="$relay_receipt" \
 OBSERVATORY_RELAY_DONE_FILE="$relay_done" \
 node "$relay_script" > "$output_root/minimax-relay.stdout" 2> "$output_root/minimax-relay.stderr" &
@@ -211,7 +214,9 @@ behavior_status=0
 relay_status=0
 wait "$relay_pid" || relay_status=$?
 
-if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$relay_receipt" ]]; then
+relay_deadline_hit="$(jq -er '.deadlineHit | booleans' "$relay_receipt" 2>/dev/null)" || relay_deadline_hit=true
+if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$relay_receipt" ]] ||
+   [[ "$relay_deadline_hit" != "false" ]]; then
   write_failure "behavior" "behavior capture failed"
   echo "$result"
   exit 1

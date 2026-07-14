@@ -13,12 +13,12 @@ const maxResponseBytes = 32 * 1024 * 1024;
 const maxTotalBytes = 64 * 1024 * 1024;
 const maxConcurrent = 2;
 const requestTimeoutMs = 180_000;
-const startupTimeoutMs = 900_000;
-const idleTimeoutMs = 60_000;
+const deadlineSeconds = Number(process.env.OBSERVATORY_RELAY_DEADLINE_SECONDS || 0);
 const upstream = new URL("https://api.minimax.io/v1/chat/completions");
 
-if (!apiKey || !receiptPath || !donePath || !/^\d+$/.test(String(maxRequests)) || maxRequests < 1 || maxRequests > 64) {
-  throw new Error("relay key, receipt, done file, and bounded request count are required");
+if (!apiKey || !receiptPath || !donePath || !/^\d+$/.test(String(maxRequests)) || maxRequests < 1 || maxRequests > 64 ||
+    !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1 || deadlineSeconds > 8_000) {
+  throw new Error("relay key, receipt, done file, bounded request count, and scan-derived deadline are required");
 }
 const match = listenAddress.match(/^(\d+\.\d+\.\d+\.\d+):(\d+)$/);
 if (!match || Number(match[2]) < 1024 || Number(match[2]) > 65535) throw new Error("literal IPv4 relay listen address is required");
@@ -38,7 +38,6 @@ const receipt = {
 let active = 0;
 let shuttingDown = false;
 let receiptWritten = false;
-let idleTimer;
 let doneTimer;
 
 function writeReceipt() {
@@ -50,22 +49,14 @@ function shutdown(deadlineHit = false) {
   if (shuttingDown) return;
   shuttingDown = true;
   receipt.deadlineHit ||= deadlineHit;
-  clearTimeout(idleTimer);
   clearInterval(doneTimer);
   server.close(() => { writeReceipt(); process.exit(0); });
   setTimeout(() => { writeReceipt(); process.exit(active === 0 ? 0 : 1); }, 5000).unref();
-}
-function armIdleTimer() {
-  clearTimeout(idleTimer);
-  if (receipt.acceptedRequests + receipt.rejectedRequests > 0 && active === 0) {
-    idleTimer = setTimeout(() => shutdown(false), idleTimeoutMs);
-  }
 }
 function reject(res, status, message) {
   receipt.rejectedRequests++;
   res.writeHead(status, {"content-type": "application/json", connection: "close"});
   res.end(JSON.stringify({error: {type: "observatory_relay", message}}));
-  armIdleTimer();
 }
 
 const server = http.createServer((req, res) => {
@@ -80,7 +71,6 @@ const server = http.createServer((req, res) => {
 
   active++;
   receipt.peakConcurrency = Math.max(receipt.peakConcurrency, active);
-  clearTimeout(idleTimer);
   const chunks = [];
   let bytes = 0;
   let upstreamRequest;
@@ -89,7 +79,6 @@ const server = http.createServer((req, res) => {
     if (released) return;
     released = true;
     active--;
-    armIdleTimer();
     if (receipt.acceptedRequests + receipt.rejectedRequests >= maxRequests && active === 0) shutdown(false);
   };
   res.once("close", release);
@@ -172,4 +161,4 @@ process.on("SIGINT", () => shutdown(false));
 doneTimer = setInterval(() => {
   if (active === 0 && fs.existsSync(donePath)) shutdown(false);
 }, 250);
-setTimeout(() => shutdown(true), startupTimeoutMs).unref();
+setTimeout(() => shutdown(true), deadlineSeconds * 1000).unref();

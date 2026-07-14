@@ -696,6 +696,58 @@ func TestMockEgressSinkScriptCapturesBoundedPayload(t *testing.T) {
 	}
 }
 
+func TestMockEgressExactByteCapIsCompleteOnlyAfterEOF(t *testing.T) {
+	t.Run("exact cap with EOF is complete", func(t *testing.T) {
+		sink := runControlledSink(t, 8, 32)
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", sink.port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tcp := conn.(*net.TCPConn)
+		if _, err := tcp.Write([]byte("01234567")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tcp.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		_ = tcp.SetReadDeadline(time.Now().Add(3 * time.Second))
+		response := make([]byte, 16)
+		if n, err := tcp.Read(response); err != nil || string(response[:n]) != "OK\n" {
+			t.Fatalf("response = %q err = %v", response[:n], err)
+		}
+		_ = tcp.Close()
+		receipt := sink.collect()
+		if receipt.Truncated || receipt.CapturedBytes != 8 || string(receipt.payload) != "01234567" {
+			t.Fatalf("receipt = %#v", receipt)
+		}
+	})
+
+	t.Run("paced byte after exact cap is truncated", func(t *testing.T) {
+		sink := runControlledSink(t, 8, 32)
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", sink.port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte("01234567")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if _, err := conn.Write([]byte("8")); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		response := make([]byte, 16)
+		if n, err := conn.Read(response); err != nil || string(response[:n]) != "OK\n" {
+			t.Fatalf("response = %q err = %v", response[:n], err)
+		}
+		_ = conn.Close()
+		receipt := sink.collect()
+		if !receipt.Truncated || receipt.CapturedBytes != 8 || string(receipt.payload) != "01234567" {
+			t.Fatalf("receipt = %#v", receipt)
+		}
+	})
+}
+
 func TestMockEgressSinkBoundsRequestAndObjectOverhead(t *testing.T) {
 	sink := runControlledSink(t, 32, 256)
 	for index := 0; index < 24; index++ {

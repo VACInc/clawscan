@@ -110,6 +110,17 @@ func writeHistoryConfig(t *testing.T, dir string, artifactsDir string) string {
 	return path
 }
 
+func TestValidateConfigPrintsFullPairedScanBudget(t *testing.T) {
+	configPath := writeHistoryConfig(t, t.TempDir(), t.TempDir())
+	var stdout bytes.Buffer
+	if err := runValidateConfig([]string{"--print-scan-budget-seconds", configPath}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "1500\n" {
+		t.Fatalf("scan budget = %q", stdout.String())
+	}
+}
+
 func TestGradeCommandEmitsDerivedGradeJSON(t *testing.T) {
 	path := writeTempEvidenceFile(t, validEvidenceForTest())
 	var stdout, stderr bytes.Buffer

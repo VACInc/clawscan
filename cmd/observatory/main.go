@@ -427,6 +427,7 @@ func runValidateConfig(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("validate-config", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	live := flags.Bool("live", false, "also require live-execution safety controls")
+	printScanBudget := flags.Bool("print-scan-budget-seconds", false, "print the full paired behavior-scan wall-clock budget")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -441,6 +442,10 @@ func runValidateConfig(args []string, stdout io.Writer) error {
 		if err := config.ValidateLive(); err != nil {
 			return err
 		}
+	}
+	if *printScanBudget {
+		fmt.Fprintln(stdout, config.Runtime.TimeoutSeconds*2+300)
+		return nil
 	}
 	fmt.Fprintln(stdout, "valid")
 	return nil
