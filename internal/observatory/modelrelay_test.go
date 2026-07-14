@@ -37,6 +37,7 @@ func TestHostileLaneHasNoUnixSocketsOrDirectModelRoute(t *testing.T) {
 		`MemorySwapMax=0`,
 		`LimitNOFILE=1024`,
 		`PrivateIPC=yes`,
+		`SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter`,
 		`for (const value of r.modelRelayIps)`,
 	} {
 		if !strings.Contains(lane, required) {
@@ -56,6 +57,31 @@ func TestHostileLaneHasNoUnixSocketsOrDirectModelRoute(t *testing.T) {
 		if !strings.Contains(remoteRunScript, required) {
 			t.Fatalf("runtime account guard missing %q", required)
 		}
+	}
+}
+
+func TestTrustedRelayAndSinkKeepOnlyTheirExactListenerPolicy(t *testing.T) {
+	listenerDeny := `SystemCallFilter=~bind listen accept accept4`
+	relayStart := strings.Index(remoteRunScript, `local relay_unit="observatory-$RUN_ID-$lane-model-relay"`)
+	sinkStart := strings.Index(remoteRunScript, `local sink_unit="observatory-$RUN_ID-$lane-mock-egress"`)
+	laneStart := strings.Index(remoteRunScript, `  run_lane "$lane" "$root"`)
+	if relayStart < 0 || sinkStart <= relayStart || laneStart <= sinkStart {
+		t.Fatal("trusted listener unit boundaries not found")
+	}
+	if strings.Contains(remoteRunScript[relayStart:sinkStart], listenerDeny) {
+		t.Fatal("trusted model relay cannot bind its exact allowlisted port")
+	}
+	if strings.Contains(remoteRunScript[sinkStart:laneStart], listenerDeny) {
+		t.Fatal("trusted mock sink cannot bind its exact allowlisted port")
+	}
+	if !strings.Contains(remoteRunScript[relayStart:sinkStart], `SocketBindAllow=ipv4:tcp:$MODEL_RELAY_PORT`) {
+		t.Fatal("trusted model relay does not use systemd's address-family:protocol:port syntax")
+	}
+	if !strings.Contains(remoteRunScript[relayStart:sinkStart], `--property=IPAddressAllow=127.0.0.1`) {
+		t.Fatal("trusted model relay does not admit the hostile lane's kernel-selected loopback source")
+	}
+	if !strings.Contains(remoteRunScript[sinkStart:laneStart], `SocketBindAllow=ipv4:tcp:$MOCK_SINK_PORT`) {
+		t.Fatal("trusted mock sink does not use systemd's address-family:protocol:port syntax")
 	}
 }
 

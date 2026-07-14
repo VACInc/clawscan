@@ -1554,7 +1554,7 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 	for _, required := range []string{
 		"systemd-run", "KillMode=control-group", "SendSIGKILL=yes", "RuntimeMaxSec", "run-agent.sh",
 		"ProtectSystem=strict", "ProtectHome=tmpfs", "IPAddressDeny=any", "SocketBindDeny=any", "StandardOutput=null",
-		"SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter", "SystemCallErrorNumber=EPERM",
+		"SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter", "SystemCallErrorNumber=EPERM",
 		`BindPaths=$root/tmp:/tmp $root/var-tmp:/var/tmp`, `WorkingDirectory=$workspace`,
 		"same-name dedicated primary group", "must not have supplementary groups",
 		"control and agent users must differ",
@@ -1571,6 +1571,16 @@ func TestCaptureTargetBindingAndRuntimeQuota(t *testing.T) {
 		"capture_tool_audit exercise",
 		`printf 'captured\n' > "$META/$lane-audit-status"`,
 		`printf 'unavailable\n' > "$META/$lane-audit-status"`,
+		`if as_root test -L "$state" || ! as_root test -d "$state"; then`,
+		`if as_root test -L "$audit_output/audit.json" || ! as_root test -f "$audit_output/audit.json"; then`,
+		`recorder_observed=$(as_root node -e`,
+		`local audit_copy_max_bytes=67108864`,
+		`local audit_dir="$OUT/runtime/audit-$lane"`,
+		`audit_available_bytes=$(as_root stat -f -c %a:%S "$OUT/runtime")`,
+		`--property="LimitFSIZE=$audit_copy_max_bytes"`,
+		`contained tool-audit export exceeded its receipt cap`,
+		`expected_prompt_sha=$(node -e`,
+		`staged prompt digest mismatch for $lane lane`,
 		"recorderObserved", "missing recorder observation",
 	} {
 		if !strings.Contains(remoteRunScript, required) {
@@ -1774,6 +1784,12 @@ func (executor *fixtureExecutor) Run(_ context.Context, command string, args []s
 	executor.args = append([]string(nil), args...)
 	if env["CRABBOX_CONFIG"] == "" {
 		executor.t.Fatal("missing CRABBOX_CONFIG")
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "artifact")); err != nil {
+		executor.t.Fatalf("staged artifact missing from Crabbox workspace: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "target")); !os.IsNotExist(err) {
+		executor.t.Fatalf("Crabbox-excluded top-level target path must not be used: %v", err)
 	}
 	tlsEnvironment := env
 	if executor.expectWrapperShim {
@@ -2284,6 +2300,7 @@ func TestGeneratedPluginConfigDiscoversOwnedFixtureWhenCLIAvailable(t *testing.T
 		"timeoutSeconds": 60,
 		"targetKind":     "plugin",
 		"targetId":       "observatory-probe",
+		"targetTool":     "observatory_probe",
 		"canaries":       testCanaryMarkers(),
 		"model": map[string]any{
 			"provider": "observatory", "baseUrl": "http://127.0.0.1:8000/v1", "id": "fixture-model",
@@ -2327,6 +2344,78 @@ func TestGeneratedPluginConfigDiscoversOwnedFixtureWhenCLIAvailable(t *testing.T
 	}
 	if !bytes.Contains(output, []byte(`"id": "observatory-probe"`)) && !bytes.Contains(output, []byte(`"id":"observatory-probe"`)) {
 		t.Fatalf("fixture plugin missing from inventory: %s", output)
+	}
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generated map[string]any
+	if err := json.Unmarshal(configData, &generated); err != nil {
+		t.Fatal(err)
+	}
+	toolsConfig, _ := generated["tools"].(map[string]any)
+	allow, _ := toolsConfig["alsoAllow"].([]any)
+	if len(allow) != 1 || allow[0] != "observatory_probe" {
+		t.Fatalf("fixture plugin tool is not explicitly exposed: %s", configData)
+	}
+
+	// A plugin with an explicit custom exercise prompt may legitimately declare
+	// no tools (for example, startup-only behavior). Its runtime must still load
+	// without manufacturing an empty tool policy entry.
+	delete(runtime, "targetTool")
+	if err := writeJSON(runtimePath, runtime, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	noToolState := filepath.Join(dir, "state-no-tool")
+	noToolWorkspace := filepath.Join(dir, "workspace-no-tool")
+	noToolConfig := filepath.Join(noToolState, "openclaw.json")
+	noToolEnvironment := append(os.Environ(),
+		"OBSERVATORY_WORKSPACE="+noToolWorkspace,
+		"OBSERVATORY_HOME="+dir,
+		"OBSERVATORY_LANE=exercise",
+		"OBSERVATORY_TARGET_ROOT="+pluginRoot,
+		"OPENCLAW_STATE_DIR="+noToolState,
+		"OPENCLAW_CONFIG_PATH="+noToolConfig,
+	)
+	command = exec.Command(node, scriptPath, runtimePath)
+	command.Env = noToolEnvironment
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generate tool-less plugin config: %v: %s", err, output)
+	}
+	command = exec.Command(openclaw, "config", "validate", "--json")
+	command.Env = noToolEnvironment
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("validate tool-less plugin config: %v: %s", err, output)
+	}
+	noToolData, err := os.ReadFile(noToolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var noToolGenerated map[string]any
+	if err := json.Unmarshal(noToolData, &noToolGenerated); err != nil {
+		t.Fatal(err)
+	}
+	noToolTools, _ := noToolGenerated["tools"].(map[string]any)
+	if _, exists := noToolTools["alsoAllow"]; exists {
+		t.Fatalf("tool-less plugin manufactured a tool allowlist: %s", noToolData)
+	}
+}
+
+func TestGeneratedConfigSupportsPinnedOpenClawSchema(t *testing.T) {
+	if strings.Contains(writeConfigScript, "securityAcknowledgedAt") {
+		t.Fatal("generated config uses a wizard field unavailable in pinned OpenClaw 2026.6.11")
+	}
+	if !strings.Contains(writeConfigScript, `bundledDiscovery: "allowlist"`) {
+		t.Fatal("generated plugin config does not explicitly select allowlist discovery")
+	}
+	for _, required := range []string{
+		`timeoutSeconds: runtime.timeoutSeconds`,
+		`config.tools.alsoAllow = [runtime.targetTool]`,
+		`--timeout "$(node -e`,
+	} {
+		if !strings.Contains(writeConfigScript+remoteAgentScript, required) {
+			t.Fatalf("generated agent runtime does not bind the configured timeout: missing %q", required)
+		}
 	}
 }
 
@@ -2939,7 +3028,7 @@ func runToolAuditExporter(t *testing.T, node string, laneRoot string, maxCalls i
 	if err := os.WriteFile(exporterPath, []byte(toolAuditExportScript), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	outputDir := filepath.Join(laneRoot, "audit-export")
+	outputDir := filepath.Join(t.TempDir(), "audit-export")
 	if err := os.MkdirAll(outputDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2995,6 +3084,70 @@ func TestToolAuditExporterDoesNotClaimCoverageWithoutRecorderLifecycle(t *testin
 	}
 	if _, err := parseToolAuditLedger(payload); err == nil || !strings.Contains(err.Error(), "recorder lifecycle") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestToolAuditExporterTreatsAbsentRecorderTableAsUnavailable(t *testing.T) {
+	node := requireNodeSQLite(t)
+	laneRoot := t.TempDir()
+	sqliteDir := filepath.Join(laneRoot, "state", "state")
+	if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(sqliteDir, "openclaw.sqlite")
+	command := exec.Command(node, "--no-warnings", "--input-type=module", "-e",
+		`import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(process.argv[1]); db.exec("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); db.close();`,
+		databasePath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create stock state database: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	payload, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document auditLedgerDocument
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.RecorderObserved == nil || *document.RecorderObserved || document.TotalCalls == nil || *document.TotalCalls != 0 || len(document.Events) != 0 {
+		t.Fatalf("unexpected unavailable-recorder receipt: %#v", document)
+	}
+}
+
+func TestToolAuditExporterTreatsReadOnlyWALDatabaseWithoutRecorderAsUnavailable(t *testing.T) {
+	node := requireNodeSQLite(t)
+	laneRoot := t.TempDir()
+	sqliteDir := filepath.Join(laneRoot, "state", "state")
+	if err := os.MkdirAll(sqliteDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(sqliteDir, "openclaw.sqlite")
+	command := exec.Command(node, "--no-warnings", "--input-type=module", "-e",
+		`import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(process.argv[1]); db.exec("PRAGMA journal_mode=WAL; CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"); db.close();`,
+		databasePath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create WAL state database: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if err := os.Chmod(databasePath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sqliteDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(sqliteDir, 0o700)
+		_ = os.Chmod(databasePath, 0o600)
+	})
+	payload, err := runToolAuditExporter(t, node, laneRoot, MaxToolCallsPerLane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document auditLedgerDocument
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.RecorderObserved == nil || *document.RecorderObserved || document.TotalCalls == nil || *document.TotalCalls != 0 || len(document.Events) != 0 {
+		t.Fatalf("unexpected unavailable WAL-recorder receipt: %#v", document)
 	}
 }
 

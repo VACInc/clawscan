@@ -199,15 +199,17 @@ Redirect escalation tiers are observed-behavior labels, not a safety verdict.
 
 1. Declared-capability input, observed-capability diffs, and deterministic
    behavioral grading are implemented as a derived, versioned projection (`observatory.grade.v2`,
-   policy `observatory.grade-policy.v2`): a deterministic A–F behavioral grade
+   policy `observatory.grade-policy.v4`): a deterministic A–F behavioral grade
    with separate confidence/coverage, an explicit `ungraded` state, dimension
    reasons, hard escalators, and a conservative declared-vs-observed comparison.
    The grade is computed from `observatory.behavior.v2` evidence (with explicit
    legacy-v1 read compatibility) and is never a field inside it, so the evidence
-   stays pure observation. Version 2 binds the
+   stays pure observation. Version 4 preserves the version 3 scoring rules, binds the
    full evidence digest, reports typed-channel coverage, fails closed on missing,
    malformed, or truncated mandatory inputs, and requires confirmed residual
-   evidence before persistence can receive F. See `docs/observatory.md`.
+   evidence before activation-capable persistence can receive F, while ordinary
+   OpenClaw session/audit state remains elevated, and bounds the derived explanation
+   projection without truncating raw evidence. See `docs/observatory.md`.
 2. Version-keyed storage and update diffs are delivered as a hands-off local
    history: `scan` records completed evidence in a bounded, append-only,
    per-identity store and selects the latest strictly comparable predecessor to

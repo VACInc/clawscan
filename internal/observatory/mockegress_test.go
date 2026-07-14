@@ -207,7 +207,7 @@ func TestRemoteRunnerHardensControlledSinkUnit(t *testing.T) {
 		`--property=MemorySwapMax=0`,
 		`--property=TasksMax=16`,
 		`--property="LimitFSIZE=$MOCK_RECEIPT_MAX_BYTES"`,
-		`--property="SocketBindAllow=tcp:ipv4:$MOCK_SINK_PORT"`,
+		`--property="SocketBindAllow=ipv4:tcp:$MOCK_SINK_PORT"`,
 		`--property=SocketBindDeny=any`,
 		`--property="ReadWritePaths=$OUT/$lane"`,
 		`systemctl kill --kill-who=main --signal=SIGTERM "$sink_unit"`,

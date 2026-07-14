@@ -18,7 +18,7 @@ disk_size="${OBSERVATORY_PROXMOX_DISK_SIZE:-64G}"
 
 die() { echo "error: $*" >&2; exit 1; }
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
-for command in curl pvesm qemu-img qm sha256sum virt-customize; do
+for command in curl guestfish pvesm qemu-img qm sha256sum virt-customize; do
   command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
 done
 is_uint "$template_id" || die "template ID must be numeric"
@@ -39,7 +39,20 @@ source_image="$workdir/source.img"
 custom_image="$workdir/${template_name}.qcow2"
 curl --proto '=https' --tlsv1.2 -fL --retry 3 --output "$source_image" "$UBUNTU_IMAGE_URL"
 printf '%s  %s\n' "$UBUNTU_IMAGE_SHA256" "$source_image" | sha256sum -c -
+# The published cloud image numbers its root partition as 1 even though it is
+# physically after partitions 14-16. virt-resize reorders those partitions and
+# leaves the embedded BIOS GRUB prefix pointing at the old partition number.
+# Grow partition 1 in place instead, preserving every partition number and the
+# image's BIOS/UEFI boot contracts while making room for provisioning.
 qemu-img convert -O qcow2 "$source_image" "$custom_image"
+qemu-img resize "$custom_image" "$disk_size"
+guestfish --rw -a "$custom_image" <<'GUESTFISH'
+run
+part-expand-gpt /dev/sda
+part-resize /dev/sda 1 -34
+e2fsck-f /dev/sda1
+resize2fs /dev/sda1
+GUESTFISH
 
 virt-customize -a "$custom_image" --network \
   --mkdir /opt/observatory-template \
@@ -48,7 +61,7 @@ virt-customize -a "$custom_image" --network \
   --copy-in "$script_dir/validate-observatory-template.sh:/opt/observatory-template" \
   --run-command 'chmod 0555 /opt/observatory-template/*.sh && chmod 0444 /opt/observatory-template/template.lock' \
   --run-command '/opt/observatory-template/provision-observatory-guest.sh /opt/observatory-template/template.lock' \
-  --run-command 'cloud-init clean --logs --machine-id --configs ssh_config'
+  --run-command 'cloud-init clean --logs --machine-id --configs ssh_config && printf "uninitialized\n" > /etc/machine-id && ln -sfn /etc/machine-id /var/lib/dbus/machine-id'
 
 qm create "$template_id" \
   --name "$template_name" \
@@ -67,11 +80,9 @@ disk_volume="$(pvesm list "$storage" --vmid "$template_id" | awk -v id="$templat
 qm set "$template_id" --scsi0 "${disk_volume},discard=on"
 qm set "$template_id" --ide2 "${storage}:cloudinit"
 qm set "$template_id" --boot c --bootdisk scsi0
-qm set "$template_id" --ipconfig0 ip=dhcp --ciuser crabbox
-qm resize "$template_id" scsi0 "$disk_size"
+qm set "$template_id" --ipconfig0 ip=dhcp --ciuser crabbox --ciupgrade 0
 qm set "$template_id" --onboot 0 --tags clawscan-observatory
 qm template "$template_id"
-qm set "$template_id" --protection 1
 
 cat <<EOF
 Created Observatory runner template:

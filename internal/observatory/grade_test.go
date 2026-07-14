@@ -3,12 +3,43 @@ package observatory
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestGradeProjectionBoundsNoisyRuntimeEvidence(t *testing.T) {
+	evidence := gradableEvidence()
+	for index := 0; index < 2000; index++ {
+		evidence.Observations = append(evidence.Observations,
+			fileObservation("open-for-read", fmt.Sprintf("/opt/runtime/module-%04d.js", index), "succeeded"))
+	}
+	evidence.Observations = append(evidence.Observations,
+		fileObservation("open-for-read", "/opt/runtime/"+strings.Repeat("oversized-subject-", 120000), "succeeded"))
+	if err := ValidateEvidence(evidence); err != nil {
+		t.Fatalf("noisy evidence invalid: %v", err)
+	}
+	grade := GradeEvidence(evidence)
+	if err := ValidateGrade(grade); err != nil {
+		t.Fatalf("bounded noisy grade invalid: %v", err)
+	}
+	dimension := gradeDimension(grade, dimSensitive)
+	if len(dimension.Reasons) > MaxGradeReasonsPerDimension || len(dimension.EvidenceRefs) > MaxGradeRefsPerSet {
+		t.Fatalf("grade explanation was not bounded: reasons=%d refs=%d", len(dimension.Reasons), len(dimension.EvidenceRefs))
+	}
+	if !strings.Contains(strings.Join(dimension.Reasons, " "), "Additional detail omitted") {
+		t.Fatalf("bounded grade did not disclose omitted detail: %#v", dimension.Reasons)
+	}
+	for _, ref := range dimension.EvidenceRefs {
+		if len(ref.Subject) > MaxGradeRefTextBytes {
+			t.Fatalf("oversized grade reference subject was retained: %d bytes", len(ref.Subject))
+		}
+	}
+}
 
 // gradableEvidence returns a complete, valid, gradable baseline with no risky
 // behavior. Tests mutate it to exercise individual policy paths.
@@ -200,8 +231,35 @@ func TestGradeValidLongObservationReferenceRemainsValid(t *testing.T) {
 		t.Fatalf("derived grade rejected a valid long observation: %v", err)
 	}
 	refs := gradeDimension(grade, dimSensitive).EvidenceRefs
-	if len(refs) != 1 || refs[0].Subject != evidence.Observations[0].Subject {
-		t.Fatalf("grade lost exact evidence reference: %#v", refs)
+	expectedDigest := digestBytes([]byte(evidence.Observations[0].Subject))
+	if len(refs) != 1 || len(refs[0].Subject) > MaxGradeRefTextBytes || !strings.HasSuffix(refs[0].Subject, "...["+expectedDigest+"]") {
+		t.Fatalf("grade did not retain a bounded digest reference: %#v", refs)
+	}
+}
+
+func TestBoundedGradeRefTextPreservesOriginalIdentityAfterSanitizing(t *testing.T) {
+	newline := boundedGradeRefText("a\nb")
+	space := boundedGradeRefText("a b")
+	if newline == space || !strings.HasSuffix(newline, "...["+digestBytes([]byte("a\nb"))+"]") {
+		t.Fatalf("sanitized references lost original identity: newline=%q space=%q", newline, space)
+	}
+	if len(newline) > MaxGradeRefTextBytes || !utf8.ValidString(newline) {
+		t.Fatalf("bounded sanitized reference is invalid: %q", newline)
+	}
+}
+
+func TestGradeConfirmedOrdinaryOpenClawStateDoesNotEscalateToF(t *testing.T) {
+	evidence := gradableEvidence()
+	signals := GradeSignals{Persistence: GradePersistenceSignals{
+		Status: completeAuthoritativeChannel(),
+		Findings: []GradePersistenceFinding{{
+			Surface: "openclaw-state", Operation: "write", Subject: "$STATE/state/openclaw.sqlite",
+			Outcome: "succeeded", Residual: "confirmed", Delta: 1,
+		}},
+	}}
+	grade := GradeEvidenceWithSignals(evidence, signals)
+	if grade.Letter != "D" || hasEscalator(grade, "successful-persistence") {
+		t.Fatalf("ordinary runtime state grade=%q escalators=%#v", grade.Letter, grade.Escalators)
 	}
 }
 

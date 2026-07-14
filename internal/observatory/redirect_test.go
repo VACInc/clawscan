@@ -428,7 +428,7 @@ func TestEffectivePromptAugmentedExactlyOnceAcrossAllPaths(t *testing.T) {
 	}
 }
 
-func TestScanSharesAugmentedPromptAcrossBothLanes(t *testing.T) {
+func TestScanStagesNeutralBaselineAndTargetAwareExercisePrompts(t *testing.T) {
 	requireLinuxControlHost(t)
 	skill := filepath.Join("..", "..", "testdata", "fixtures", "probe-skill")
 	config := validTestConfig(t, t.TempDir())
@@ -442,23 +442,29 @@ func TestScanSharesAugmentedPromptAcrossBothLanes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The single staged prompt.txt is installed into both lanes by run.sh, and the
-	// evidence prompt digest binds exactly that augmented prompt.
-	promptBytes, err := os.ReadFile(filepath.Join(result.RunDirectory, "stage", "runner", "prompt.txt"))
+	exercisePromptBytes, err := os.ReadFile(filepath.Join(result.RunDirectory, "stage", "runner", "exercise-prompt.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimRight(string(promptBytes), "\n") != effective.Exercise.Prompt {
-		t.Fatalf("staged prompt differs from augmented effective prompt:\n%q\n%q", promptBytes, effective.Exercise.Prompt)
+	if strings.TrimRight(string(exercisePromptBytes), "\n") != effective.Exercise.Prompt {
+		t.Fatalf("staged exercise prompt differs from augmented effective prompt:\n%q\n%q", exercisePromptBytes, effective.Exercise.Prompt)
 	}
 	if result.Evidence.Exercise.PromptSHA256 != digestBytes([]byte(effective.Exercise.Prompt)) {
 		t.Fatal("evidence prompt digest does not bind the augmented effective prompt")
 	}
-	if !strings.Contains(string(promptBytes), redirectProbeExposureInstruction()) {
-		t.Fatal("staged lane prompt is not augmented for probe exposure")
+	baselinePromptBytes, err := os.ReadFile(filepath.Join(result.RunDirectory, "stage", "runner", "baseline-prompt.txt"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(remoteRunScript, `"$CONTROL/prompt.txt" "$root/prompt.txt"`) {
-		t.Fatal("remote runner does not install the shared prompt into each lane")
+	if !strings.Contains(string(exercisePromptBytes), redirectProbeExposureInstruction()) ||
+		!strings.Contains(string(baselinePromptBytes), redirectProbeExposureInstruction()) {
+		t.Fatal("staged lane prompts are not augmented for probe exposure")
+	}
+	if strings.Contains(string(baselinePromptBytes), staged.ID) || strings.Contains(string(baselinePromptBytes), "Use the installed") {
+		t.Fatalf("baseline prompt refers to the intentionally absent target: %q", baselinePromptBytes)
+	}
+	if !strings.Contains(remoteRunScript, `"$CONTROL/$lane-prompt.txt" "$root/prompt.txt"`) {
+		t.Fatal("remote runner does not install each lane's dedicated prompt")
 	}
 }
 

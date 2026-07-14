@@ -23,12 +23,12 @@ const config = {
     lastRunAt: new Date().toISOString(),
     lastRunVersion: "observatory",
     lastRunMode: "local",
-    securityAcknowledgedAt: new Date().toISOString(),
   },
   agents: {
     defaults: {
       model: { primary: model.provider + "/" + model.id },
       sandbox: { mode: "off" },
+      timeoutSeconds: runtime.timeoutSeconds,
     },
     list: [{
       id: "observatory",
@@ -45,6 +45,7 @@ const config = {
         baseUrl: model.baseUrl,
         apiKey: "local",
         api: model.api,
+        timeoutSeconds: runtime.timeoutSeconds,
         models: [{
           id: model.id,
           name: "Observatory local model",
@@ -68,8 +69,10 @@ const config = {
   },
 };
 if (runtime.targetKind === "plugin") {
+  if (lane === "exercise" && typeof runtime.targetTool === "string" && runtime.targetTool.length > 0) config.tools.alsoAllow = [runtime.targetTool];
   config.plugins = lane === "exercise" ? {
     enabled: true,
+    bundledDiscovery: "allowlist",
     allow: [runtime.targetId],
     deny: [],
     load: { paths: [targetRoot] },
@@ -79,7 +82,7 @@ if (runtime.targetKind === "plugin") {
         hooks: { allowPromptInjection: false, allowConversationAccess: false },
       },
     },
-  } : { enabled: true, allow: [], deny: [], load: { paths: [] }, entries: {} };
+  } : { enabled: true, bundledDiscovery: "allowlist", allow: [], deny: [], load: { paths: [] }, entries: {} };
 } else {
   config.plugins = { enabled: false };
 }
@@ -302,7 +305,7 @@ exec strace -f -qq -s 0 -yy -ttt -e signal=none \
     ${MOCK_ENV[@]+"${MOCK_ENV[@]}"} \
     HOME="$HOME_DIR" TMPDIR=/tmp OBSERVATORY_WORKSPACE="$WORKSPACE" OPENCLAW_STATE_DIR="$STATE" OPENCLAW_CONFIG_PATH="$STATE/openclaw.json" \
     "$OPENCLAW_COMMAND" agent --local --agent observatory --session-id "$SESSION" \
-      --message-file "$PROMPT" --json \
+      --message-file "$PROMPT" --timeout "$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.timeoutSeconds))' "$RUNTIME_JSON")" --json \
   > "$TRACE_DIR/agent.stdout" 2> "$TRACE_DIR/agent.stderr"
 `
 
@@ -358,12 +361,47 @@ const realLaneRoot = fs.realpathSync(laneRoot);
 const realDatabase = fs.realpathSync(databasePath);
 const realOutputDir = fs.realpathSync(outputDir);
 if (!beneath(realDatabase, realLaneRoot)) throw new Error("OpenClaw SQLite database escaped the lane root");
-if (!beneath(realOutputDir, realLaneRoot)) throw new Error("audit output escaped the lane root");
+if (beneath(realOutputDir, realLaneRoot)) throw new Error("audit scratch must be isolated from the lane filesystem");
 if (fs.existsSync(outputPath)) throw new Error("audit output already exists");
 
-const database = new DatabaseSync(databasePath, { readOnly: true });
+// OpenClaw uses WAL mode. Even a read-only query can require SQLite to create
+// shared-memory state after the writer exits, which must never make the lane
+// writable. Copy the stopped database and any validated sidecars into this
+// exporter's private scratch directory, then recover/query only that copy.
+const analysisDatabasePath = path.join(outputDir, "openclaw-audit-copy.sqlite");
+fs.copyFileSync(databasePath, analysisDatabasePath, fs.constants.COPYFILE_EXCL);
+fs.chmodSync(analysisDatabasePath, 0o600);
+for (const suffix of ["-wal", "-shm"]) {
+  const source = databasePath + suffix;
+  if (!fs.existsSync(source)) continue;
+  const destination = analysisDatabasePath + suffix;
+  fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+  fs.chmodSync(destination, 0o600);
+}
+
+const database = new DatabaseSync(analysisDatabasePath);
 try {
   database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+  const auditTable = database.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'"
+  ).get();
+  if (auditTable?.name !== "audit_events") {
+    // Released OpenClaw builds can create the shared state database without
+    // shipping the optional audit recorder. That is unavailable coverage, not
+    // a malformed recorder. Existing-but-incompatible audit tables still fail
+    // closed through the strict column checks below.
+    const payload = JSON.stringify({
+      source: "openclaw-state-sqlite",
+      recorderObserved: false,
+      maxCalls,
+      events: [],
+      totalCalls: 0,
+      truncated: false,
+    }) + "\n";
+    database.close();
+    fs.writeFileSync(outputPath, payload, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    process.exit(0);
+  }
   const columns = database.prepare("PRAGMA table_info(audit_events)").all();
   const names = new Set(columns.map((column) => String(column.name)));
   const required = [
@@ -578,7 +616,8 @@ as_root install -d -m 0711 "$WORK_ROOT"
 as_root install -d -m 0711 -o "$CONTROL_UID" -g "$CONTROL_GID" "$CONTROL"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/runtime.json" "$CONTROL/runtime.json"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/firewall.nft" "$CONTROL/firewall.nft"
-as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/prompt.txt" "$CONTROL/prompt.txt"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/baseline-prompt.txt" "$CONTROL/baseline-prompt.txt"
+as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/exercise-prompt.txt" "$CONTROL/exercise-prompt.txt"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/write-config.mjs" "$CONTROL/write-config.mjs"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/apply-target-modes.mjs" "$CONTROL/apply-target-modes.mjs"
 as_root install -m 0600 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/export-tool-audit.mjs" "$CONTROL/export-tool-audit.mjs"
@@ -588,6 +627,12 @@ as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/mode
 as_root install -m 0500 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/mock-egress-sink.mjs" "$CONTROL/mock-egress-sink.mjs"
 as_root install -m 0700 -o "$CONTROL_UID" -g "$CONTROL_GID" "$STAGED_RUNNER/run-agent.sh" "$CONTROL/run-agent.sh"
 RUNTIME_JSON="$CONTROL/runtime.json"
+for lane in baseline exercise; do
+  expected_prompt_sha=$(node -e 'const r=require(process.argv[1]);const v=r.lanePromptSha256?.[process.argv[2]];if(!/^sha256:[0-9a-f]{64}$/.test(v))process.exit(2);process.stdout.write(v)' "$RUNTIME_JSON" "$lane") \
+    || fail "missing bound prompt digest for $lane lane"
+  actual_prompt_sha="sha256:$(sha256sum "$CONTROL/$lane-prompt.txt" | cut -d' ' -f1)"
+  [ "$actual_prompt_sha" = "$expected_prompt_sha" ] || fail "staged prompt digest mismatch for $lane lane"
+done
 MODEL_RELAY_DEADLINE_SECONDS=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.modelRelay.deadlineSeconds))' "$RUNTIME_JSON")
 MODEL_RELAY_RECEIPT_MAX_BYTES=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(r.modelRelay.receiptMaxBytes))' "$RUNTIME_JSON")
 MODEL_RELAY_PORT=$(node -e 'const r=require(process.argv[1]); process.stdout.write(String(new URL("http://"+r.modelRelay.listenAddress).port))' "$RUNTIME_JSON")
@@ -634,7 +679,7 @@ seed_lane() {
   as_root mount -t tmpfs -o "size=$MAX_LANE_BYTES,nosuid,nodev,mode=0700,uid=$(id -u "$AGENT_USER"),gid=$(id -g "$AGENT_USER")" "observatory-$RUN_ID-$lane" "$root"
   [ "$(findmnt -n -o FSTYPE --target "$root")" = "tmpfs" ] || fail "lane storage must be a bounded tmpfs"
   as_root install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$workspace" "$workspace/memory" "$state" "$home" "$home/.aws" "$root/tmp" "$root/var-tmp"
-  as_root install -m 0600 -o "$AGENT_USER" -g "$AGENT_USER" "$CONTROL/prompt.txt" "$root/prompt.txt"
+  as_root install -m 0600 -o "$AGENT_USER" -g "$AGENT_USER" "$CONTROL/$lane-prompt.txt" "$root/prompt.txt"
   if [ "$lane" = "exercise" ]; then
     if [ "$TARGET_KIND" = "skill" ]; then
       target_root="$workspace/skills/$TARGET_ID"
@@ -644,7 +689,7 @@ seed_lane() {
       fail "unsupported staged target kind"
     fi
     as_root install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$target_root"
-    as_root cp -a "$REPO_ROOT/target/." "$target_root/"
+    as_root cp -a "$REPO_ROOT/artifact/." "$target_root/"
   fi
   as_root env OBSERVATORY_WORKSPACE="$workspace" OBSERVATORY_HOME="$home" OBSERVATORY_LANE="$lane" OBSERVATORY_TARGET_ROOT="$target_root" \
     OPENCLAW_STATE_DIR="$state" OPENCLAW_CONFIG_PATH="$state/openclaw.json" \
@@ -727,7 +772,7 @@ run_inventory() {
     --property="StandardOutput=file:$receipt" \
     --property=StandardError=null \
     --property=SystemCallArchitectures=native \
-    --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+    --property="SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter" \
     --property=SystemCallErrorNumber=EPERM \
     --property=UMask=0077 \
     /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -800,7 +845,7 @@ run_lane() {
     --property=StandardOutput=null \
     --property=StandardError=null \
     --property=SystemCallArchitectures=native \
-    --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+    --property="SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter" \
     --property=SystemCallErrorNumber=EPERM \
     --property=UMask=0077 \
     --property="WorkingDirectory=$workspace" \
@@ -821,7 +866,11 @@ run_lane_and_capture() {
   local relay_wait_pid=""
   local relay_unit="observatory-$RUN_ID-$lane-model-relay"
   local relay_receipt="$OUT/$lane/model-relay.json"
-  local relay_network_args=(--property=IPAddressDeny=any)
+  # systemd applies IPAddressAllow to both ends of accepted connections. The
+  # hostile agent connects from the kernel-selected 127.0.0.1 source address,
+  # so permit that source in addition to the relay bind address. The exact
+  # destination port remains enforced by nftables and SocketBindAllow.
+  local relay_network_args=(--property=IPAddressDeny=any --property=IPAddressAllow=127.0.0.1)
   while IFS= read -r address; do
     [ -n "$address" ] && relay_network_args+=(--property="IPAddressAllow=$address")
   done < <(node -e 'const r=require(process.argv[1]); for (const value of r.modelRelayIps) console.log(value)' "$RUNTIME_JSON")
@@ -865,7 +914,7 @@ run_lane_and_capture() {
     --property=TimeoutStopSec=2s \
     --property=KillMode=control-group \
     --property=SendSIGKILL=yes \
-    --property="SocketBindAllow=tcp:ipv4:$MODEL_RELAY_PORT" \
+    --property="SocketBindAllow=ipv4:tcp:$MODEL_RELAY_PORT" \
     --property=SocketBindDeny=any \
     --property="ReadOnlyPaths=$CONTROL/runtime.json $CONTROL/model-relay.mjs" \
     --property="ReadWritePaths=$OUT/$lane" \
@@ -934,7 +983,7 @@ run_lane_and_capture() {
       --property=TimeoutStopSec=2s \
       --property=KillMode=control-group \
       --property=SendSIGKILL=yes \
-      --property="SocketBindAllow=tcp:ipv4:$MOCK_SINK_PORT" \
+      --property="SocketBindAllow=ipv4:tcp:$MOCK_SINK_PORT" \
       --property=SocketBindDeny=any \
       --property="ReadOnlyPaths=$CONTROL/runtime.json $CONTROL/mock-egress-sink.mjs" \
       --property="ReadWritePaths=$OUT/$lane" \
@@ -991,26 +1040,62 @@ capture_tool_audit() {
   local state="$root/state"
   local sqlite_dir="$state/state"
   local database="$sqlite_dir/openclaw.sqlite"
-  local audit_dir="$root/audit-export"
+  local audit_copy_max_bytes=67108864
+  local audit_dir="$OUT/runtime/audit-$lane"
   local audit_output="$audit_dir/output"
   local unit="observatory-$RUN_ID-audit-$lane"
-  [ ! -L "$state" ] && [ -d "$state" ] || fail "OpenClaw state root is not a real directory for $lane lane"
-  if [ ! -e "$sqlite_dir" ] && [ ! -L "$sqlite_dir" ]; then
+  if as_root test -L "$state" || ! as_root test -d "$state"; then
+    fail "OpenClaw state root is not a real directory for $lane lane"
+  fi
+  if ! as_root test -e "$sqlite_dir" && ! as_root test -L "$sqlite_dir"; then
     printf 'unavailable\n' > "$META/$lane-audit-status"
     return
   fi
-  [ ! -L "$sqlite_dir" ] && [ -d "$sqlite_dir" ] || fail "OpenClaw SQLite directory is not a real directory for $lane lane"
-  if [ ! -e "$database" ] && [ ! -L "$database" ]; then
+  if as_root test -L "$sqlite_dir" || ! as_root test -d "$sqlite_dir"; then
+    fail "OpenClaw SQLite directory is not a real directory for $lane lane"
+  fi
+  if ! as_root test -e "$database" && ! as_root test -L "$database"; then
     printf 'unavailable\n' > "$META/$lane-audit-status"
     return
   fi
-  [ ! -L "$database" ] && [ -f "$database" ] || fail "OpenClaw SQLite database is not a regular file for $lane lane"
+  if as_root test -L "$database" || ! as_root test -f "$database"; then
+    fail "OpenClaw SQLite database is not a regular file for $lane lane"
+  fi
   for sidecar in "$database-wal" "$database-shm"; do
-    if [ -e "$sidecar" ] || [ -L "$sidecar" ]; then
-      [ ! -L "$sidecar" ] && [ -f "$sidecar" ] || fail "OpenClaw SQLite sidecar is not a regular file for $lane lane"
+    if as_root test -e "$sidecar" || as_root test -L "$sidecar"; then
+      if as_root test -L "$sidecar" || ! as_root test -f "$sidecar"; then
+        fail "OpenClaw SQLite sidecar is not a regular file for $lane lane"
+      fi
     fi
   done
-  [ ! -e "$audit_dir" ] && [ ! -L "$audit_dir" ] || fail "audit export path already exists for $lane lane"
+  local audit_copy_bytes
+  audit_copy_bytes=$(as_root stat -c %s "$database") || fail "cannot size OpenClaw SQLite database for $lane lane"
+  [[ "$audit_copy_bytes" =~ ^[0-9]+$ ]] || fail "invalid OpenClaw SQLite database size for $lane lane"
+  for sidecar in "$database-wal" "$database-shm"; do
+    if as_root test -f "$sidecar"; then
+      local sidecar_bytes
+      sidecar_bytes=$(as_root stat -c %s "$sidecar") || fail "cannot size OpenClaw SQLite sidecar for $lane lane"
+      [[ "$sidecar_bytes" =~ ^[0-9]+$ ]] || fail "invalid OpenClaw SQLite sidecar size for $lane lane"
+      audit_copy_bytes=$((audit_copy_bytes + sidecar_bytes))
+    fi
+  done
+  if [ "$audit_copy_bytes" -gt "$audit_copy_max_bytes" ]; then
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+    return
+  fi
+  local audit_available_bytes
+  audit_available_bytes=$(as_root stat -f -c %a:%S "$OUT/runtime") || fail "cannot inspect audit scratch capacity for $lane lane"
+  [[ "$audit_available_bytes" =~ ^[0-9]+:[0-9]+$ ]] || fail "invalid audit scratch capacity for $lane lane"
+  local audit_available_blocks=${audit_available_bytes%%:*}
+  local audit_block_bytes=${audit_available_bytes##*:}
+  audit_available_bytes=$((audit_available_blocks * audit_block_bytes))
+  if [ "$audit_available_bytes" -lt $((audit_copy_bytes + 8388608)) ]; then
+    printf 'unavailable\n' > "$META/$lane-audit-status"
+    return
+  fi
+  if as_root test -e "$audit_dir" || as_root test -L "$audit_dir"; then
+    fail "audit export path already exists for $lane lane"
+  fi
   as_root install -d -m 0711 -o root -g root "$audit_dir"
   as_root install -d -m 0700 -o "$AGENT_USER" -g "$AGENT_USER" "$audit_output"
   as_root install -m 0444 "$CONTROL/export-tool-audit.mjs" "$audit_dir/export-tool-audit.mjs"
@@ -1026,7 +1111,7 @@ capture_tool_audit() {
       --property=CPUQuota=50% \
       --property=TasksMax=16 \
       --property=LimitNOFILE=64 \
-      --property=LimitFSIZE=8388608 \
+      --property="LimitFSIZE=$audit_copy_max_bytes" \
       --property=NoNewPrivileges=yes \
       --property=CapabilityBoundingSet= \
       --property=AmbientCapabilities= \
@@ -1056,7 +1141,7 @@ capture_tool_audit() {
       --property=StandardOutput=null \
       --property=StandardError=null \
       --property=SystemCallArchitectures=native \
-      --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+      --property="SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter" \
       --property=SystemCallErrorNumber=EPERM \
       --property=UMask=0077 \
       --property="WorkingDirectory=$audit_output" \
@@ -1064,9 +1149,12 @@ capture_tool_audit() {
         node "$audit_dir/export-tool-audit.mjs" "$root" "$audit_output/audit.json" "$AGENT_ID" "4096"; then
     fail "contained OpenClaw tool-audit export failed for $lane lane"
   fi
-  [ ! -L "$audit_output/audit.json" ] && [ -f "$audit_output/audit.json" ] || fail "contained tool-audit export produced no regular receipt for $lane lane"
+  if as_root test -L "$audit_output/audit.json" || ! as_root test -f "$audit_output/audit.json"; then
+    fail "contained tool-audit export produced no regular receipt for $lane lane"
+  fi
+  [ "$(as_root stat -c %s "$audit_output/audit.json")" -le 8388608 ] || fail "contained tool-audit export exceeded its receipt cap for $lane lane"
   local recorder_observed
-  recorder_observed=$(node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).recorderObserved;if(typeof value!=="boolean")throw new Error("missing recorder observation");process.stdout.write(value?"1":"0")' "$audit_output/audit.json") \
+  recorder_observed=$(as_root node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).recorderObserved;if(typeof value!=="boolean")throw new Error("missing recorder observation");process.stdout.write(value?"1":"0")' "$audit_output/audit.json") \
     || fail "contained tool-audit export produced an invalid recorder receipt for $lane lane"
   if [ "$recorder_observed" != "1" ]; then
     printf 'unavailable\n' > "$META/$lane-audit-status"

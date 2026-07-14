@@ -78,8 +78,12 @@ provisioned.
 When `executor.command` is a local credential
 wrapper, `executor.crabboxBinary` pins the reviewed Crabbox build. Observatory
 gives the wrapper a per-run binary shim so the CA and secure-TLS overrides are
-applied only after credential lookup, immediately before Crabbox starts. Only
-the local 1Password Connect variables cross into the credential wrapper. Other
+applied only after credential lookup, immediately before Crabbox starts. The
+wrapper must execute the supplied `CRABBOX_BIN` when present (after checking
+that it is the per-run `crabbox-tls-shim`) and otherwise fall back to its pinned
+site binary; requiring `SSL_CERT_FILE` before that shim runs breaks the verified
+TLS handoff. Only the local 1Password Connect variables cross into the
+credential wrapper. Other
 ambient credentials and all ambient `CRABBOX_*` overrides are stripped.
 The dedicated Crabbox YAML accepts only `provider`, `target`, and current
 Proxmox fields; profiles, jobs, sync overrides, and environment forwarding are
@@ -299,7 +303,7 @@ alone.
 Example summary:
 
 ```
-grade: F (policy observatory.grade-policy.v2, confidence moderate, coverage complete)
+grade: F (policy observatory.grade-policy.v4, confidence moderate, coverage complete)
 ```
 
 Standalone grade outputs are secure, create-only artifacts. Observatory creates
@@ -376,7 +380,7 @@ Severity maps to letters: `none`→A, `low`→B, `moderate`→C, `elevated`→D,
 | --- | --- |
 | Synthetic canary exposure | access = moderate (C); copy into an observed subject = elevated (D); **confirmed propagation = F** |
 | Sensitive resource access | successful secret access = moderate (C); blocked attempt or undeclared access = elevated (D) |
-| Persistence | non-workspace or persistence-surface write intent without a confirmed residual = elevated (D); **typed confirmed residual persistence = F** |
+| Persistence | non-workspace or persistence-surface write intent without a confirmed residual = elevated (D); confirmed ordinary OpenClaw runtime state = elevated (D); **typed confirmed residual persistence on an activation-capable surface = F** |
 | Network egress | private reach = moderate (C); external reach, blocked attempt, or undeclared = elevated (D) |
 | Containment-boundary attempts | any blocked boundary crossing = elevated (D) |
 | Instruction redirection | **typed redirect signal = F**; otherwise not assessed |
@@ -394,7 +398,8 @@ tool-ledger coverage without coupling the policy to capture implementation
 types. The mapping and authority rules are documented in
 [`observatory-grading-integration.md`](observatory-grading-integration.md).
 
-Typed persistence is F only for `succeeded` plus residual `confirmed`. Redirect
+Typed persistence is F only for `succeeded` plus residual `confirmed` on an
+activation-capable surface. Ordinary OpenClaw session/audit state remains a D. Redirect
 is F only for an exercised, attributed positive `deviated` delta. Mock egress is
 D for sink traffic and F only when its cleartext receipt attributes a planted
 canary. Canary `read` is C, `write` or `agent-output` is D, and `execute` or
@@ -439,10 +444,13 @@ deltas from an unpaired capture are unreliable.
 ### Schema and migration notes
 
 - Artifact schema `observatory.grade.v2`; policy version
-  `observatory.grade-policy.v2`. Version 2 binds the full evidence digest,
+  `observatory.grade-policy.v4`. Version 4 retains the version 3 scoring rules,
+  binds the full evidence digest,
   exposes per-channel coverage, fails closed on mandatory channel gaps, makes
   tool-ledger evidence supplemental, and requires typed residual proof for
-  successful persistence. Bump the policy version whenever severities,
+  successful activation-capable persistence, while ordinary OpenClaw
+  session/audit state remains elevated rather than becoming an F. It also bounds published explanation/reference sets
+  while leaving the complete digest-bound evidence authoritative. Bump the policy version whenever severities,
   dimensions, escalators, taxonomy, or aggregation change so grades from
   different policies stay distinguishable.
 - `observatory.behavior.v2` carries the optional, backward-compatible field
@@ -701,7 +709,11 @@ least `mockEgress.maxTotalBytes * 2 + 1 MiB`.
 
 ## Owned fixture proof
 
-Development and validation use only:
+Development and validation use only owned fixtures:
+
+- `testdata/fixtures/pipeline-safe-skill` and `pipeline-safe-plugin` — benign
+  fixtures that must traverse the complete security, ClawHub review,
+  model-relay, and behavior pipeline;
 
 - `testdata/fixtures/probe-skill` — reads a synthetic canary, attempts an
   inaccessible system file, writes a synthetic workspace receipt, appends a
@@ -713,6 +725,11 @@ Development and validation use only:
   synthetic canary, proves `/etc/shadow` remains unreadable, performs the same
   shell-init and denied-system-cron persistence probes, and writes a synthetic
   receipt.
+
+The probe fixtures intentionally trip the fail-closed static gate; they prove
+that unsafe inputs never receive a model credential or behavior VM. Their
+lower-level behavior evidence is exercised directly by the owned-fixture test
+suite. The pipeline-safe fixtures provide the positive full-pipeline proof.
 
 No ClawHub target is used until the owned fixtures pass the real VM lane.
 Skill names are validated as canonical OpenClaw identifiers and the same ID is

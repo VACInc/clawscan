@@ -715,6 +715,10 @@ func validatePersistenceEvidence(persistence PersistenceEvidence) error {
 			strings.ContainsAny(finding.Subject, "\x00\r\n") || strings.Contains(finding.Subject, "OBS-CANARY-") {
 			return errors.New("evidence contains an invalid persistence finding subject")
 		}
+		classified, classifiedOK := classifyPersistenceSurface(finding.Subject)
+		if !classifiedOK || classified.ID != finding.Surface || classified.Category != finding.Category {
+			return errors.New("evidence persistence finding subject does not match its classified surface")
+		}
 		if !validOutcome[finding.Outcome] || !validEvidence[finding.Evidence] || !validResidual[finding.Residual] {
 			return errors.New("evidence contains an invalid persistence finding classification")
 		}

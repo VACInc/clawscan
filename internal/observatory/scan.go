@@ -137,7 +137,10 @@ func Scan(ctx context.Context, target string, config Config, executor CommandExe
 	if err := os.Mkdir(stageDir, 0o700); err != nil {
 		return ScanResult{}, err
 	}
-	staged, err := StageTarget(target, filepath.Join(stageDir, "target"), config.Limits)
+	// Crabbox excludes a top-level directory named "target" as a common build
+	// artifact. Use an explicit transport name so the staged input cannot vanish
+	// between controller inspection and guest execution.
+	staged, err := StageTarget(target, filepath.Join(stageDir, "artifact"), config.Limits)
 	if err != nil {
 		return ScanResult{}, err
 	}
@@ -366,11 +369,11 @@ func verifyCaptureConfig(metadata CaptureMetadata, config Config) error {
 	return nil
 }
 
-// effectiveConfigForTarget resolves the base exercise prompt (target-aware
-// default or operator-supplied custom) and then augments every path exactly once
-// with the probe-exposure instruction. Both lanes share this single effective
-// prompt, so seeding stays exercised without breaking baseline subtraction, and
-// the augmented prompt is bound through captureConfigSHA256 and PromptSHA256.
+// effectiveConfigForTarget resolves the target-aware exercise prompt and
+// augments it exactly once with the probe-exposure instruction. The baseline
+// uses a separate fixed neutral prompt because the target is intentionally
+// absent there. The exercise prompt remains bound through captureConfigSHA256
+// and PromptSHA256; the baseline prompt is versioned by CaptureProtocolRevision.
 func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, error) {
 	base := config.Exercise.Prompt
 	if base == DefaultExercisePrompt {
@@ -396,7 +399,7 @@ func effectiveConfigForTarget(config Config, target TargetEvidence) (Config, err
 // version comparisons cannot mix evidence produced by different protocols. It
 // embeds PersistenceProtocolRevision so a change to the persistence surface
 // catalog or before/after inventory semantics also invalidates stale receipts.
-const CaptureProtocolRevision = "observatory.capture-protocol.v21+" + PersistenceProtocolRevision
+const CaptureProtocolRevision = "observatory.capture-protocol.v26+" + PersistenceProtocolRevision
 
 func captureConfigSHA256(config Config) (string, error) {
 	return captureConfigSHA256ForProtocol(config, CaptureProtocolRevision)
@@ -416,6 +419,7 @@ func captureConfigSHA256WithTLSCA(config Config, protocolRevision string, tlsCAS
 	config.applyDefaults()
 	binding := struct {
 		CaptureProtocolRevision string          `json:"captureProtocolRevision"`
+		BaselinePromptSHA256    string          `json:"baselinePromptSha256"`
 		TargetLineage           string          `json:"targetLineage"`
 		ExecutorKind            string          `json:"executorKind"`
 		ProxmoxTLSCASHA256      string          `json:"proxmoxTlsCaSha256"`
@@ -426,6 +430,7 @@ func captureConfigSHA256WithTLSCA(config Config, protocolRevision string, tlsCAS
 		Limits                  LimitsConfig    `json:"limits"`
 	}{
 		CaptureProtocolRevision: protocolRevision,
+		BaselinePromptSHA256:    digestBytes([]byte(augmentPromptWithProbeExposure(DefaultBaselinePrompt) + "\n")),
 		TargetLineage:           config.TargetLineage,
 		ExecutorKind:            config.Executor.Kind,
 		ProxmoxTLSCASHA256:      tlsCASHA256,
@@ -510,11 +515,13 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err != nil {
 		return err
 	}
+	baselinePrompt := augmentPromptWithProbeExposure(DefaultBaselinePrompt)
 	runtime := map[string]any{
 		"runId":               runID,
 		"targetSha256":        target.SHA256,
 		"targetKind":          target.Kind,
 		"targetId":            target.ID,
+		"targetTool":          firstDeclaredTool(target.DeclaredTools),
 		"captureConfigSha256": captureConfigSHA,
 		"openclawCommand":     config.Runtime.OpenClawCommand,
 		"agentUser":           config.Runtime.AgentUser,
@@ -533,6 +540,10 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		"canaries":            canaries,
 		"redirects":           redirectMarkers,
 		"redirectSeeds":       redirectSeedFiles,
+		"lanePromptSha256": map[string]string{
+			"baseline": digestBytes([]byte(baselinePrompt + "\n")),
+			"exercise": digestBytes([]byte(config.Exercise.Prompt + "\n")),
+		},
 		"model": map[string]any{
 			"provider":      config.Runtime.Model.Provider,
 			"baseUrl":       relayBaseURL,
@@ -545,7 +556,10 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 	if err := writeJSON(filepath.Join(runnerDir, "runtime.json"), runtime, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(runnerDir, "prompt.txt"), []byte(config.Exercise.Prompt+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runnerDir, "baseline-prompt.txt"), []byte(baselinePrompt+"\n"), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(runnerDir, "exercise-prompt.txt"), []byte(config.Exercise.Prompt+"\n"), 0o644); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(runnerDir, "write-config.mjs"), []byte(writeConfigScript), 0o644); err != nil {
@@ -586,6 +600,13 @@ func writeRuntimeFiles(stageDir string, config Config, runID string, target Targ
 		return err
 	}
 	return os.WriteFile(filepath.Join(stageDir, ".gitattributes"), []byte("* -text -filter -ident\n"), 0o644)
+}
+
+func firstDeclaredTool(tools []string) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	return tools[0]
 }
 
 func guestFirewallRules(runID string, endpoints []string, modelRelay ModelRelayConfig, mockEgress MockEgressConfig) string {

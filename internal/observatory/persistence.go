@@ -6,13 +6,18 @@ import (
 	"strings"
 )
 
-var persistenceSurfaceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+var (
+	persistenceSurfaceIDPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+	runtimeTrajectoryTempPattern   = regexp.MustCompile(`^\$STATE/agents/observatory/sessions/\.openclaw-trajectory-\.[0-9]+\.[0-9a-f-]{16,}\.tmp$`)
+	runtimeSessionIndexTempPattern = regexp.MustCompile(`^\$STATE/agents/observatory/sessions/sessions\.json\.[0-9]+\.[0-9a-f-]{16,}\.tmp$`)
+	runtimeAttestationPattern      = regexp.MustCompile(`^\$STATE/workspace-attestations/[0-9a-f]{64}\.attested$`)
+)
 
 // PersistenceProtocolRevision versions the persistence surface catalog and the
 // inventory-diff semantics. It is folded into CaptureProtocolRevision so that a
 // change to what counts as a persistence surface cannot silently mix evidence
 // across protocol revisions.
-const PersistenceProtocolRevision = "observatory.persistence.v2"
+const PersistenceProtocolRevision = "observatory.persistence.v3"
 
 const persistenceScope = "selected-persistence-surfaces"
 
@@ -226,6 +231,23 @@ func classifyPersistenceSurface(subject string) (persistenceSurfaceDefinition, b
 		}
 	}
 	return persistenceSurfaceDefinition{}, false
+}
+
+// normalizeRuntimeBookkeepingPath preserves runtime-owned state as a real
+// persistence surface while replacing only lane-random filename components.
+// Equal baseline/exercise runtime writes therefore subtract normally, and an
+// extra target write with the same shape still remains as a positive delta.
+func normalizeRuntimeBookkeepingPath(subject string) string {
+	switch {
+	case runtimeTrajectoryTempPattern.MatchString(subject):
+		return "$STATE/agents/observatory/sessions/$RUNTIME-trajectory.tmp"
+	case runtimeSessionIndexTempPattern.MatchString(subject):
+		return "$STATE/agents/observatory/sessions/$RUNTIME-session-index.tmp"
+	case runtimeAttestationPattern.MatchString(subject):
+		return "$STATE/workspace-attestations/$RUNTIME.attested"
+	default:
+		return subject
+	}
 }
 
 func isInventoryScopedSubject(subject string) bool {
@@ -494,5 +516,5 @@ func normalizeInventoryPath(relative string) string {
 	if component == "workspace" && (rest == "skills" || strings.HasPrefix(rest, "skills/") || rest == "plugins" || strings.HasPrefix(rest, "plugins/")) {
 		return ""
 	}
-	return label + "/" + rest
+	return normalizeRuntimeBookkeepingPath(label + "/" + rest)
 }

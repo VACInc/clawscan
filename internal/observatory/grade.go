@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // GradeSchemaVersion identifies the derived grade projection. The grade is a
@@ -19,10 +20,20 @@ const GradeSchemaVersion = "observatory.grade.v2"
 // dimensions, escalators, taxonomy mapping, or aggregation change so consumers
 // can tell one policy's grade from another. The grade is reproducible: the same
 // evidence and the same policy version always produce the same grade.
-const GradePolicyVersion = "observatory.grade-policy.v2"
+const GradePolicyVersion = "observatory.grade-policy.v4"
 
 // MaxGradeBytes bounds the encoded grade projection.
 const MaxGradeBytes = 4 << 20
+
+// Grade explanations are an index into the complete, digest-bound evidence,
+// not a second copy of every syscall row. Bound each published reference set so
+// noisy but valid runtimes cannot make an otherwise valid grade exceed its own
+// encoded-size safety limit.
+const (
+	MaxGradeReasonsPerDimension = 64
+	MaxGradeRefsPerSet          = 64
+	MaxGradeRefTextBytes        = 240
+)
 
 // Grade is the machine-readable, deterministic behavioral grade returned by a
 // normal scan. Letter is one of A, B, C, D, F when Graded is true, or the
@@ -393,10 +404,11 @@ func GradeEvidenceWithSignals(evidence Evidence, signals GradeSignals) Grade {
 			accumulator.reasons = []string{"No instruction-redirection signal channel is present in this evidence; this dimension was not assessed."}
 		}
 		severity := accumulator.severity
+		referenceCount := len(dedupeRefs(accumulator.refs))
 		dimension := GradeDimension{
 			ID: id, Title: dimensionTitles[id], Assessed: assessed,
 			Severity: severityName(severity), Grade: severityLetter(severity),
-			Reasons: accumulator.reasons, EvidenceRefs: dedupeRefs(accumulator.refs),
+			Reasons: boundedGradeReasons(accumulator.reasons, referenceCount), EvidenceRefs: boundedGradeRefs(accumulator.refs),
 		}
 		if !assessed {
 			dimension.Severity = "not-assessed"
@@ -539,6 +551,17 @@ func applyTypedGradeSignals(signals GradeSignals, accumulators map[string]*dimen
 				Operation: finding.Operation, Subject: finding.Subject, Outcome: finding.Outcome, Role: finding.Residual, Delta: finding.Delta}
 			observedCaps[capPersistence] = append(observedCaps[capPersistence], ref)
 			if finding.Outcome == "succeeded" && finding.Residual == "confirmed" {
+				// Ordinary OpenClaw runtime state is still reported as elevated
+				// persistence evidence, but it is not itself an auto-start or code
+				// execution surface. Loading and exercising a benign plugin/skill
+				// legitimately updates session and audit state. Reserve the hard F
+				// escalator for confirmed residual changes on activation-capable
+				// surfaces such as hooks, config, plugins, skills, schedules, shell
+				// startup, and service definitions.
+				if finding.Surface == "openclaw-state" {
+					accumulators[dimPersistence].raise(sevElevated, "Confirmed a residual change in ordinary OpenClaw runtime state; no activation-capable persistence surface was changed.", ref)
+					continue
+				}
 				accumulators[dimPersistence].raise(sevCritical, "Typed lifecycle evidence confirmed a residual persistence change after exercise.", ref)
 				*escalators = append(*escalators, GradeEscalator{
 					ID: "successful-persistence", Dimension: dimPersistence,
@@ -747,7 +770,7 @@ func compareDeclaredVsObserved(declared *DeclaredCapabilities, observedCaps map[
 		comparison.Notes = appendUnique(comparison.Notes, "No machine-readable capability declaration was found; observed risky capabilities cannot be confirmed as declared or undeclared. This lowers confidence rather than asserting a violation.")
 		for _, capability := range risky {
 			comparison.Findings = append(comparison.Findings, CapabilityFinding{
-				Capability: capability, Status: "indeterminate", EvidenceRefs: dedupeRefs(observedCaps[capability]),
+				Capability: capability, Status: "indeterminate", EvidenceRefs: boundedGradeRefs(observedCaps[capability]),
 			})
 		}
 		return comparison
@@ -772,7 +795,7 @@ func compareDeclaredVsObserved(declared *DeclaredCapabilities, observedCaps map[
 			anyUndeclared = true
 		}
 		comparison.Findings = append(comparison.Findings, CapabilityFinding{
-			Capability: capability, Status: status, EvidenceRefs: dedupeRefs(observedCaps[capability]),
+			Capability: capability, Status: status, EvidenceRefs: boundedGradeRefs(observedCaps[capability]),
 		})
 	}
 	switch {
@@ -1419,6 +1442,61 @@ func dedupeRefs(refs []ObservationRef) []ObservationRef {
 	return result
 }
 
+func boundedGradeRefs(refs []ObservationRef) []ObservationRef {
+	bounded := make([]ObservationRef, 0, len(refs))
+	for _, ref := range refs {
+		ref.Type = boundedGradeRefText(ref.Type)
+		ref.Channel = boundedGradeRefText(ref.Channel)
+		ref.ID = boundedGradeRefText(ref.ID)
+		ref.Kind = boundedGradeRefText(ref.Kind)
+		ref.Operation = boundedGradeRefText(ref.Operation)
+		ref.Subject = boundedGradeRefText(ref.Subject)
+		ref.Outcome = boundedGradeRefText(ref.Outcome)
+		ref.Role = boundedGradeRefText(ref.Role)
+		bounded = append(bounded, ref)
+	}
+	refs = dedupeRefs(bounded)
+	if len(refs) > MaxGradeRefsPerSet {
+		refs = refs[:MaxGradeRefsPerSet]
+	}
+	return refs
+}
+
+func boundedGradeRefText(value string) string {
+	original := value
+	display := strings.ToValidUTF8(strings.NewReplacer("\x00", " ", "\r", " ", "\n", " ").Replace(value), "�")
+	if display == original && len(display) <= MaxGradeRefTextBytes {
+		return display
+	}
+	digest := digestBytes([]byte(original))
+	suffix := "...[" + digest + "]"
+	if len(display)+len(suffix) <= MaxGradeRefTextBytes {
+		return display + suffix
+	}
+	prefixBytes := MaxGradeRefTextBytes - len(suffix)
+	prefix := display[:prefixBytes]
+	for !utf8.ValidString(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix + suffix
+}
+
+func boundedGradeReasons(reasons []string, referenceCount int) []string {
+	if len(reasons) <= MaxGradeReasonsPerDimension && referenceCount <= MaxGradeRefsPerSet {
+		return reasons
+	}
+	limit := MaxGradeReasonsPerDimension - 1
+	if len(reasons) < limit {
+		limit = len(reasons)
+	}
+	bounded := append([]string(nil), reasons[:limit]...)
+	bounded = append(bounded, fmt.Sprintf(
+		"Additional detail omitted from this bounded grade projection (%d reason(s), %d evidence reference(s) total); the complete digest-bound evidence remains authoritative.",
+		len(reasons), referenceCount,
+	))
+	return bounded
+}
+
 func dedupeEscalators(escalators []GradeEscalator) []GradeEscalator {
 	if len(escalators) == 0 {
 		return nil
@@ -1428,11 +1506,11 @@ func dedupeEscalators(escalators []GradeEscalator) []GradeEscalator {
 		key := escalator.Dimension + "\x00" + escalator.ID
 		current, exists := byKey[key]
 		if exists {
-			current.EvidenceRefs = dedupeRefs(append(current.EvidenceRefs, escalator.EvidenceRefs...))
+			current.EvidenceRefs = boundedGradeRefs(append(current.EvidenceRefs, escalator.EvidenceRefs...))
 			byKey[key] = current
 			continue
 		}
-		escalator.EvidenceRefs = dedupeRefs(escalator.EvidenceRefs)
+		escalator.EvidenceRefs = boundedGradeRefs(escalator.EvidenceRefs)
 		byKey[key] = escalator
 	}
 	result := make([]GradeEscalator, 0, len(byKey))
@@ -1488,6 +1566,9 @@ func ValidateGrade(grade Grade) error {
 		}
 		if dimension.Reasons == nil || len(dimension.Reasons) == 0 {
 			return fmt.Errorf("grade dimension %s has no traceable reason", dimension.ID)
+		}
+		if len(dimension.Reasons) > MaxGradeReasonsPerDimension || len(dimension.EvidenceRefs) > MaxGradeRefsPerSet {
+			return fmt.Errorf("grade dimension %s exceeds bounded explanation limits", dimension.ID)
 		}
 		for _, reason := range dimension.Reasons {
 			if hasUnsafeGradeText(reason, 1000) {
@@ -1570,7 +1651,7 @@ func ValidateGrade(grade Grade) error {
 	previousEscalatorKey := ""
 	for _, escalator := range grade.Escalators {
 		key := escalator.Dimension + "\x00" + escalator.ID
-		if escalatorKeys[key] || !validEscalator(escalator) || dimensionSeverities[escalator.Dimension] != sevCritical ||
+		if escalatorKeys[key] || !validEscalator(escalator) || len(escalator.EvidenceRefs) > MaxGradeRefsPerSet || dimensionSeverities[escalator.Dimension] != sevCritical ||
 			(previousEscalatorKey != "" && key < previousEscalatorKey) || !refsAreCanonical(escalator.EvidenceRefs) {
 			return errors.New("grade contains an invalid or duplicate hard escalator")
 		}
@@ -1646,9 +1727,11 @@ func validateObservationRefs(refs []ObservationRef) error {
 		if ref.Delta <= 0 {
 			return errors.New("evidence reference delta must be positive")
 		}
-		// Reference text is copied from already validated public evidence. JSON
-		// encoding safely represents control characters and the overall grade size
-		// remains bounded, so valid long subjects must not invalidate their grade.
+		for _, value := range []string{ref.Type, ref.Channel, ref.ID, ref.Kind, ref.Operation, ref.Subject, ref.Outcome, ref.Role} {
+			if len(value) > MaxGradeRefTextBytes || strings.ContainsAny(value, "\x00\r\n") {
+				return errors.New("evidence reference text exceeds its bounded projection")
+			}
+		}
 	}
 	return nil
 }
@@ -1697,7 +1780,8 @@ func validateDeclaredComparison(comparison DeclaredComparison) error {
 	}
 	for _, finding := range comparison.Findings {
 		if strings.TrimSpace(finding.Capability) == "" ||
-			(finding.Status != "declared" && finding.Status != "declared-broad" && finding.Status != "undeclared" && finding.Status != "indeterminate") {
+			(finding.Status != "declared" && finding.Status != "declared-broad" && finding.Status != "undeclared" && finding.Status != "indeterminate") ||
+			len(finding.EvidenceRefs) > MaxGradeRefsPerSet || !refsAreCanonical(finding.EvidenceRefs) {
 			return errors.New("declared-vs-observed finding is invalid")
 		}
 		if err := validateObservationRefs(finding.EvidenceRefs); err != nil {

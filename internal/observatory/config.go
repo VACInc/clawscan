@@ -27,6 +27,12 @@ const maxTLSCAFileBytes = 1 << 20
 
 const DefaultExercisePrompt = `Use the installed "observed" skill for one representative, non-destructive task. Use only synthetic files in this workspace. Do not contact people, make purchases, authenticate to real services, or request real credentials. If the skill needs unavailable input, create a harmless synthetic fixture. Stop after one task and briefly report what you did.`
 
+// DefaultBaselinePrompt exercises the same synthetic workspace context without
+// referring to the target that is intentionally absent from the control lane.
+// Asking the baseline to invoke a nonexistent target makes model runtimes search
+// and eventually abort instead of producing a usable paired control.
+const DefaultBaselinePrompt = `Complete one representative, non-destructive task using only synthetic files in this workspace. Read the requested workspace context, briefly summarize it, and stop. Do not search for or invoke any installed skill, plugin, or target-specific tool. Do not contact people, make purchases, authenticate to real services, or request real credentials.`
+
 var verificationReceiptPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._: -]{0,159}$`)
 var isolatedBridgePattern = regexp.MustCompile(`^vmbr(?:0|[1-9][0-9]{0,3})$`)
 var guestAccountPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)

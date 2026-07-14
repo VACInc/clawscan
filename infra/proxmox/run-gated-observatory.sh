@@ -87,15 +87,15 @@ behavior_budget_seconds="$("$observatory_bin" validate-config --live --print-sca
 [[ "$behavior_budget_seconds" =~ ^[1-9][0-9]{2,4}$ ]] || die "Observatory returned an invalid behavior scan budget"
 relay_deadline_seconds="$((behavior_budget_seconds + 30))"
 "$observatory_bin" stage \
-  --output "$stage/target" \
-  --metadata "$stage/target-metadata.json" \
+  --output "$stage/artifact" \
+  --metadata "$stage/artifact-metadata.json" \
   "$target" >/dev/null
 
 # Submit VirusTotal before slower local work. This pass never runs a judge; it
 # records either a terminal hash result or the upload receipt used by the later
 # bounded poll.
 virustotal_status=0
-"$clawscan_bin" "$stage/target" \
+"$clawscan_bin" "$stage/artifact" \
   --scanner virustotal \
   --sandbox off \
   --output "$virustotal_dir/initial.json" \
@@ -179,7 +179,7 @@ if ! jq -e '.scanners.virustotal.raw' "$virustotal_dir/initial.json" > "$review_
 fi
 
 review_status=0
-"$clawscan_bin" "$stage/target" \
+"$clawscan_bin" "$stage/artifact" \
   --profile clawhub-oauth \
   --scanner-result "virustotal=$review_dir/virustotal.json" \
   --scanner-result "skillspector=$review_dir/skillspector.json" \
@@ -233,7 +233,8 @@ done
 
 behavior_status=0
 "$observatory_bin" scan --config "$config" \
-  --output "$output_root/behavior-evidence.json" "$stage/target" \
+  --output "$output_root/behavior-evidence.json" \
+  --grade-output "$output_root/behavior-grade.json" "$stage/artifact" \
   > "$output_root/observatory.stdout" 2> "$output_root/observatory.stderr" &
 behavior_pid=$!
 wait "$behavior_pid" || behavior_status=$?
@@ -248,7 +249,7 @@ relay_pid=""
 trap - EXIT INT TERM
 
 relay_deadline_hit="$(jq -er '.deadlineHit | booleans' "$relay_receipt" 2>/dev/null)" || relay_deadline_hit=true
-if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$relay_receipt" ]] ||
+if [[ "$behavior_status" -ne 0 || "$relay_status" -ne 0 || ! -s "$output_root/behavior-evidence.json" || ! -s "$output_root/behavior-grade.json" || ! -s "$relay_receipt" ]] ||
    [[ "$relay_deadline_hit" != "false" ]]; then
   write_failure "behavior" "behavior capture failed"
   echo "$result"
@@ -259,6 +260,7 @@ jq -n \
   --slurpfile securityGate "$security_dir/security-gate.json" \
   --slurpfile clawhubReview "$review_dir/artifact.json" \
   --slurpfile relay "$relay_receipt" \
+  --slurpfile behaviorGrade "$output_root/behavior-grade.json" \
   --arg evidence "$output_root/behavior-evidence.json" '{
     schemaVersion: "observatory.pipeline.v1",
     status: "passed",
@@ -267,6 +269,7 @@ jq -n \
     securityGate: $securityGate[0],
     clawhubReview: $clawhubReview[0],
     modelRelay: $relay[0],
-    behaviorEvidence: $evidence
+    behaviorEvidence: $evidence,
+    behaviorGrade: $behaviorGrade[0]
   }' > "$result"
 echo "$result"

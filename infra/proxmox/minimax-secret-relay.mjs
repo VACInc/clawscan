@@ -93,6 +93,11 @@ const server = http.createServer((req, res) => {
     active--;
     if (admittedRequests >= maxRequests && active === 0) shutdown(false);
   };
+  // A normally completed response emits "finish" before the socket's close
+  // event. Release on either terminal event so graceful keep-alive teardown
+  // cannot leave the bounded-concurrency counter stuck above zero and turn a
+  // successful relay run into a fallback exit 1.
+  res.once("finish", release);
   res.once("close", release);
   req.on("data", chunk => {
     bytes += chunk.length;
@@ -111,9 +116,15 @@ const server = http.createServer((req, res) => {
     if (res.writableEnded) return;
     let body;
     try {
-      body = Buffer.concat(chunks, bytes);
-      const parsed = JSON.parse(body.toString("utf8"));
+      const parsed = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || parsed.model !== model) throw new Error("model mismatch");
+      // MiniMax-M3's streamed OpenAI-compatible response can leave OpenClaw's
+      // agent loop waiting for a terminal stream event after the HTTP response
+      // itself has completed. Keep this credential boundary deterministic by
+      // requesting the equivalent bounded non-streaming response upstream.
+      parsed.stream = false;
+      body = Buffer.from(JSON.stringify(parsed));
+      if (body.length < 1 || body.length > maxRequestBytes) throw new Error("normalized request too large");
     } catch {
       return reject(res, 400, "valid JSON for the pinned model is required");
     }

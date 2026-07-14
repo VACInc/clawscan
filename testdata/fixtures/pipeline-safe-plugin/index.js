@@ -7,6 +7,7 @@ export default definePluginEntry({
   register(api) {
     api.registerTool({
       name: "observatory_pipeline_safe",
+      label: "Observatory Pipeline Safe",
       description: "Return a fixed local validation message.",
       parameters: { type: "object", additionalProperties: false, properties: {} },
       async execute() {

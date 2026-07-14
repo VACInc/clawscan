@@ -32,6 +32,39 @@ func TestMiniMaxSecretRelayLifecycleIsCompletionOrScanDeadlineBound(t *testing.T
 	}
 }
 
+func TestMiniMaxSecretRelayNormalizesUpstreamToBoundedNonStreamingResponse(t *testing.T) {
+	script, err := os.ReadFile("minimax-secret-relay.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		"parsed.stream = false",
+		"body = Buffer.from(JSON.stringify(parsed))",
+		"body.length > maxRequestBytes",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("relay is missing deterministic non-streaming normalization %q", required)
+		}
+	}
+}
+
+func TestMiniMaxSecretRelayReleasesCompletedResponsesBeforeShutdown(t *testing.T) {
+	script, err := os.ReadFile("minimax-secret-relay.mjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	for _, required := range []string{
+		`res.once("finish", release)`,
+		`res.once("close", release)`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("relay is missing terminal response release %q", required)
+		}
+	}
+}
+
 func TestGatedPipelineBindsAndRejectsRelayDeadline(t *testing.T) {
 	script, err := os.ReadFile("run-gated-observatory.sh")
 	if err != nil {

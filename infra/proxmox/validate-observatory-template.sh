@@ -7,7 +7,7 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "missing command $1"; }
 [[ "${EUID}" -eq 0 ]] || fail "run as root"
 
 for command in \
-  docker findmnt jq mount mountpoint nft node openclaw passwd pgrep runuser sha256sum \
+  ctr docker findmnt jq mount mountpoint nft node openclaw passwd pgrep runuser sha256sum \
   skopeo stat strace sudo systemctl systemd-run tar
 do
   need "$command"
@@ -93,7 +93,6 @@ test "$(stat -c '%a:%U:%G' /opt/observatory-template/clawscan-runtime-amd64.oci.
 runtime_archive=/opt/observatory-template/clawscan-runtime-amd64.oci.tar
 probe_root="$(mktemp -d /run/observatory-template-check.XXXXXXXXXX)"
 runtime_manifest="$probe_root/runtime-manifest.json"
-loaded_config="$probe_root/loaded-config.json"
 cleanup() {
   if mountpoint -q "$probe_root/mnt"; then
     umount "$probe_root/mnt"
@@ -106,9 +105,10 @@ skopeo inspect --raw "oci-archive:${runtime_archive}:${CLAWSCAN_RUNTIME_OCI_TAG}
 [[ "$(skopeo manifest-digest "$runtime_manifest")" == "$CLAWSCAN_RUNTIME_AMD64_DIGEST" ]] || fail "runtime archive manifest digest mismatch"
 runtime_config_digest="$(jq -er .config.digest "$runtime_manifest")"
 [[ "$runtime_config_digest" == "$(jq -er .clawscanRuntimeConfigDigest "$receipt")" ]] || fail "runtime archive config digest mismatch"
-skopeo inspect --config --raw "docker-daemon:${CLAWSCAN_RUNTIME_LOCAL_IMAGE}" > "$loaded_config"
-[[ "sha256:$(sha256sum "$loaded_config" | awk '{print $1}')" == "$runtime_config_digest" ]] || fail "loaded runtime image config mismatch"
-docker image inspect "$CLAWSCAN_RUNTIME_LOCAL_IMAGE" >/dev/null || fail "loaded runtime image is absent"
+[[ "$(ctr --namespace moby images list | awk -v ref="$CLAWSCAN_RUNTIME_LOCAL_IMAGE" '$1 == ref { print $3; exit }')" == "$CLAWSCAN_RUNTIME_AMD64_DIGEST" ]] || fail "containerd runtime image digest mismatch"
+# The exact tag-to-manifest binding is verified through containerd above; this
+# verifies that the Docker daemon can resolve the same pinned local tag.
+docker image inspect "$CLAWSCAN_RUNTIME_LOCAL_IMAGE" >/dev/null || fail "loaded runtime image is unavailable through Docker"
 
 chmod 0711 "$probe_root"
 install -d -m 0700 -o observatory -g observatory "$probe_root/mnt" "$probe_root/tmp" "$probe_root/var-tmp"
@@ -146,11 +146,15 @@ fs.writeFileSync("/tmp/observatory-template-write-ok", "ok", { mode: 0o600 });
 
 await new Promise((resolve, reject) => {
   const server = net.createServer();
+  server.unref();
+  const timer = setTimeout(() => reject(new Error("socket bind denial timed out")), 1000);
   server.once("error", (error) => {
+    clearTimeout(timer);
     if (error.code === "EACCES" || error.code === "EPERM") resolve();
     else reject(error);
   });
   server.listen({ host: "127.0.0.1", port: 0 }, () => {
+    clearTimeout(timer);
     server.close();
     reject(new Error("socket bind unexpectedly succeeded"));
   });
@@ -158,11 +162,22 @@ await new Promise((resolve, reject) => {
 
 await new Promise((resolve, reject) => {
   const socket = net.connect({ host: "127.0.0.2", port: 9 });
+  socket.unref();
+  const timer = setTimeout(() => {
+    socket.destroy();
+    // systemd's IPAddressDeny= filter may silently drop the packet instead of
+    // returning EPERM. A bounded timeout still proves the forbidden endpoint
+    // was unreachable; only a completed connection is a failure.
+    resolve();
+  }, 1000);
   socket.once("error", (error) => {
+    clearTimeout(timer);
+    socket.destroy();
     if (error.code === "EACCES" || error.code === "EPERM") resolve();
     else reject(error);
   });
   socket.once("connect", () => {
+    clearTimeout(timer);
     socket.destroy();
     reject(new Error("denied network connection unexpectedly succeeded"));
   });
@@ -172,7 +187,7 @@ chown observatory:observatory "$probe_root/tmp/hardening-probe.mjs"
 chmod 0500 "$probe_root/tmp/hardening-probe.mjs"
 
 tmp_unit="observatory-template-check-$$"
-systemd-run --quiet --wait --collect --unit="$tmp_unit" \
+systemd-run --quiet --wait --collect --pipe --unit="$tmp_unit" \
   --property=User=observatory \
   --property=Group=observatory \
   --property=CapabilityBoundingSet= \
@@ -210,16 +225,13 @@ systemd-run --quiet --wait --collect --unit="$tmp_unit" \
   --property=SendSIGKILL=yes \
   --property=IPAddressDeny=any \
   --property=IPAddressAllow=127.0.0.1 \
-  --property=SocketBindAllow=ipv4:tcp:65535 \
   --property=SocketBindDeny=any \
   --property="ReadOnlyPaths=$probe_root/mnt" \
   --property="ReadWritePaths=$probe_root/tmp $probe_root/var-tmp" \
   --property="InaccessiblePaths=/opt/observatory-template" \
   --property="WorkingDirectory=$probe_root/tmp" \
-  --property=StandardOutput=null \
-  --property=StandardError=null \
   --property=SystemCallArchitectures=native \
-  --property="SystemCallFilter=~io_uring_setup io_uring_register io_uring_enter" \
+  --property="SystemCallFilter=~bind listen accept accept4 io_uring_setup io_uring_register io_uring_enter" \
   --property=SystemCallErrorNumber=EPERM \
   --property=UMask=0077 \
   /usr/bin/strace -qq -o /tmp/hardening-probe.strace \

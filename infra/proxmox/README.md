@@ -20,9 +20,9 @@ model credential, Proxmox token, scanner API key, target, repository checkout,
 or OpenClaw state.
 
 The runtime image is stored as a digest-preserving OCI archive. Every clone
-verifies the archive manifest, imports the exact image into Docker under the
-site-local `observatory-pinned` tag, and verifies the loaded config digest
-before ClawScan can use it.
+verifies the archive manifest, imports it through Docker's `moby` containerd
+namespace under the site-local `observatory-pinned` tag, and verifies the
+loaded manifest digest before ClawScan can use it.
 
 The Proxmox VMID is a site-local generation identifier, not a cryptographic
 content identity. Use a new VMID/name for every rebuild and never replace an
@@ -45,10 +45,16 @@ UID's exact model-relay destination. Guest access to the Proxmox host, LAN,
 Internet, other Proxmox nodes, and other quarantine guests is denied.
 
 Clones use DHCP (`ip=dhcp`); addresses are intentionally dynamic. The build
-seals cloud-init and resets `/etc/machine-id`, so each clone generates a unique
-machine/DHCP identity on first boot instead of reusing the template's lease.
+seals cloud-init, seeds `/etc/machine-id` as `uninitialized`, and disables
+first-boot package upgrades. Each clone therefore generates a unique
+machine/DHCP identity without trying to reach Ubuntu mirrors from quarantine.
+The template is intentionally not Proxmox-protected because that flag is
+inherited by full clones and would prevent Crabbox's mandatory teardown.
 
-The build requires `qm`, `pvesm`, `qemu-img`, `virt-customize`, and `curl`.
+The build requires `qm`, `pvesm`, `qemu-img`, `guestfish`, `virt-customize`, and
+`curl`. The builder expands the pinned cloud image's root filesystem in place
+before installing runtime payloads. That preserves the source partition numbers
+and both of its BIOS/UEFI boot paths.
 After creation, copy `crabbox-observatory.example.yml` outside the repository,
 set the real site-local values, and keep that config mode 0600. Its reviewed
 shape is:
@@ -80,6 +86,8 @@ gate runs ClawScan Static,
 SkillSpector without an LLM, Cisco's base analyzers, and AgentVerus inside the
 pinned Docker runtime. It removes optional provider credentials before launch
 and applies `evaluate-local-free-scan.jq` to the complete artifact.
+The controller stages the payload as `artifact/`; `target/` is deliberately not
+used because Crabbox excludes that common build-directory name during sync.
 
 Any scanner error, unexpected skip, incomplete/omitted evidence, changed output
 contract, or material finding returns exit `42` with:
@@ -95,6 +103,9 @@ VirusTotal report or non-benign/failed judge blocks the behavioral phase. The
 model relay must not be started and the behavior VM must not be provisioned
 until all of those gates pass.
 
+On success, `result.json` embeds the deterministic `behaviorGrade` and points
+to the complete `behaviorEvidence` artifact in the same output directory.
+
 VirusTotal hash misses upload the staged archive and are not a private analysis
 channel. The operator is responsible for target-upload authorization and API
 plan/terms suitability; the pipeline never silently substitutes a private
@@ -106,7 +117,8 @@ The disposable VM never receives the MiniMax key. Observatory's existing
 guest-local bounded relay forwards only to `minimax-secret-relay.mjs` on the
 controller. That outer relay accepts only `POST /v1/chat/completions`, the exact
 `MiniMax-M3` model, `Authorization: Bearer local`, bounded bodies/concurrency,
-and injects the real key only for `https://api.minimax.io`. The Proxmox host
+normalizes the upstream request to a bounded non-streaming response, and injects
+the real key only for `https://api.minimax.io`. The Proxmox host
 firewall is the outer allowlist: the quarantine subnet can reach only the
 controller's one relay IP and port.
 

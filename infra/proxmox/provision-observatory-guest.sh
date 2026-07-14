@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# libguestfs run-command environments do not consistently include
+# /usr/local/bin. Provisioning installs pinned runtimes there and must validate
+# the same commands that will be visible after boot.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 lock_file="${1:-/opt/observatory-template/template.lock}"
 [[ "${EUID}" -eq 0 ]] || { echo "run as root" >&2; exit 2; }
 [[ -r "$lock_file" ]] || { echo "missing template lock: $lock_file" >&2; exit 2; }
@@ -139,14 +144,17 @@ expected_config="$(jq -r .clawscanRuntimeConfigDigest "$receipt")"
 verify_dir="$(mktemp -d --tmpdir observatory-runtime-load.XXXXXXXXXX)"
 trap 'rm -rf "$verify_dir"' EXIT
 manifest="$verify_dir/manifest.json"
-loaded_config="$verify_dir/loaded-config.json"
 skopeo inspect --raw "oci-archive:${archive}:${tag}" > "$manifest"
 resolved="$(skopeo manifest-digest "$manifest")"
 [[ "$resolved" == "$digest" ]]
 [[ "$(jq -r .config.digest "$manifest")" == "$expected_config" ]]
-skopeo copy "oci-archive:${archive}:${tag}" "docker-daemon:${image}" >/dev/null
-skopeo inspect --config --raw "docker-daemon:${image}" > "$loaded_config"
-[[ "sha256:$(sha256sum "$loaded_config" | awk '{print $1}')" == "$expected_config" ]]
+import_ref="observatory:${tag}"
+ctr --namespace moby images import --base-name observatory "$archive" >/dev/null
+ctr --namespace moby images tag --force "$import_ref" "$image" >/dev/null
+[[ "$(ctr --namespace moby images list | awk -v ref="$image" '$1 == ref { print $3; exit }')" == "$digest" ]]
+# containerd owns the exact tag-to-manifest binding above. This separate check
+# confirms that Docker can resolve that pinned tag without depending on the
+# backend-specific meaning of Docker's .Id field.
 docker image inspect "$image" >/dev/null
 EOF
 chmod 0555 /usr/local/sbin/observatory-load-runtime-image

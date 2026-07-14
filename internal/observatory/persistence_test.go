@@ -53,6 +53,49 @@ func TestClassifyPersistenceSurfaceCoversAgentAndUserSurfaces(t *testing.T) {
 	}
 }
 
+func TestRuntimeBookkeepingPathsNormalizeWithoutLeavingPersistenceCoverage(t *testing.T) {
+	cases := map[string]string{
+		"$STATE/agents/observatory/sessions/.openclaw-trajectory-.1234.b4eb4c6a-5e62-4da9-9bd8-ae49ec16e95d.tmp":  "$STATE/agents/observatory/sessions/$RUNTIME-trajectory.tmp",
+		"$STATE/agents/observatory/sessions/sessions.json.1234.b4eb4c6a-5e62-4da9-9bd8-ae49ec16e95d.tmp":          "$STATE/agents/observatory/sessions/$RUNTIME-session-index.tmp",
+		"$STATE/workspace-attestations/1e1a814f585b28a037a7cf60edc27a2d0c3803f703a330883d03208726cf481a.attested": "$STATE/workspace-attestations/$RUNTIME.attested",
+	}
+	for subject, want := range cases {
+		normalized := normalizeRuntimeBookkeepingPath(subject)
+		if normalized != want {
+			t.Fatalf("normalize runtime bookkeeping %q = %q, want %q", subject, normalized, want)
+		}
+		if surface, ok := classifyPersistenceSurface(normalized); !ok || surface.ID != "openclaw-state" {
+			t.Fatalf("normalized runtime bookkeeping %q escaped persistence coverage: %#v ok=%v", normalized, surface, ok)
+		}
+	}
+
+	for _, subject := range []string{
+		"$STATE/openclaw.json",
+		"$STATE/hooks/on-start.json",
+		"$STATE/agents/observatory/sessions/poison.jsonl",
+		"$STATE/workspace-attestations/poison.attested",
+		"$STATE/agents/other/sessions/poison.jsonl",
+	} {
+		if _, ok := classifyPersistenceSurface(subject); !ok {
+			t.Fatalf("real persistence surface %q was excluded", subject)
+		}
+	}
+}
+
+func TestAnalyzeTracesSubtractsNormalizedRuntimeBookkeepingButKeepsExtraWrite(t *testing.T) {
+	metadata := CaptureMetadata{
+		BaselineState: "/run/baseline/state",
+		ExerciseState: "/run/exercise/state",
+	}
+	baseline := `openat(AT_FDCWD, "/run/baseline/state/agents/observatory/sessions/sessions.json.100.b4eb4c6a-5e62-4da9-9bd8-ae49ec16e95d.tmp", O_WRONLY|O_CREAT, 0600) = 3`
+	exercise := `openat(AT_FDCWD, "/run/exercise/state/agents/observatory/sessions/sessions.json.200.c5fc5d7b-6f73-4eba-acde-bf50fd27fa6e.tmp", O_WRONLY|O_CREAT, 0600) = 3
+openat(AT_FDCWD, "/run/exercise/state/agents/observatory/sessions/sessions.json.201.d6ad6e8c-7a84-4fcb-acde-c0610e38ab7f.tmp", O_WRONLY|O_CREAT, 0600) = 4`
+	result := AnalyzeTraces(AnalysisInput{BaselineTraces: []string{baseline}, ExerciseTraces: []string{exercise}, Metadata: metadata})
+	if len(result.Observations) != 1 || result.Observations[0].Subject != "$STATE/agents/observatory/sessions/$RUNTIME-session-index.tmp" || result.Observations[0].DeltaCount != 1 {
+		t.Fatalf("normalized runtime bookkeeping delta = %#v", result.Observations)
+	}
+}
+
 func TestPersistenceCatalogIsSelfConsistentAndSorted(t *testing.T) {
 	catalog := persistenceSurfaceCatalog()
 	if len(catalog) != len(persistenceSurfaces) {
@@ -272,6 +315,11 @@ func TestValidatePersistenceEvidenceRejectsInconsistentResidual(t *testing.T) {
 			name:    "unknown surface",
 			finding: PersistenceFinding{Surface: "not-a-surface", Category: "shell-init", Operation: "write", Subject: "$HOME/.bashrc", Outcome: "succeeded", Evidence: "syscall", Residual: "unavailable", ExerciseCount: 1, DeltaCount: 1},
 			want:    "unknown surface",
+		},
+		{
+			name:    "subject surface mismatch",
+			finding: PersistenceFinding{Surface: "openclaw-state", Category: "agent-state", Operation: "write", Subject: "$HOME/.bashrc", Outcome: "succeeded", Evidence: "syscall+inventory", Residual: "confirmed", ExerciseCount: 1, DeltaCount: 1},
+			want:    "does not match its classified surface",
 		},
 		{
 			name:    "bad delta",

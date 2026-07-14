@@ -1302,10 +1302,10 @@ func normalizePath(path string, metadata CaptureMetadata, exercise bool) string 
 		}
 		cleanRoot := pathpkg.Clean(candidate.path)
 		if path == cleanRoot {
-			return candidate.label
+			return normalizeRuntimeBookkeepingPath(candidate.label)
 		}
 		if strings.HasPrefix(path, cleanRoot+"/") {
-			return candidate.label + "/" + strings.TrimPrefix(path, cleanRoot+"/")
+			return normalizeRuntimeBookkeepingPath(candidate.label + "/" + strings.TrimPrefix(path, cleanRoot+"/"))
 		}
 	}
 	if strings.HasPrefix(path, "/home/") {

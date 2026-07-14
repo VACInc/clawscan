@@ -10,7 +10,7 @@ sudo /opt/observatory-template/validate-observatory-template.sh \
   > "$output_root/template-validation.txt"
 CLAWSCAN_BIN="$repo_root/bin/clawscan" \
   "$repo_root/infra/proxmox/run-security-gate.sh" \
-  "$repo_root/target" "$output_root" || gate_exit=$?
+  "$repo_root/artifact" "$output_root" || gate_exit=$?
 
 jq -n --argjson gateExit "$gate_exit" '{gateExit: $gateExit}' \
   > "$output_root/runner-exit.json"
