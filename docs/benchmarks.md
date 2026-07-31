@@ -33,6 +33,24 @@ ask Codex:
 Use $report-clawhub-malicious-skill to walk me through reporting a malicious ClawHub skill.
 ```
 
+## Profile proposal trust boundary
+
+Profile proposals are reviewed in two separate lanes because a profile can name
+the judge command:
+
+- **Proposal validation** (`Profile Proposal Validation`) runs on the pull
+  request with read-only permissions and no secrets. It builds the validator
+  from the trusted base commit, extracts the proposed file from the pull-request
+  head without checking that tree out, and validates it strictly as data.
+- **Benchmarking** (`SkillTrustBench Benchmark`) is a maintainer dispatch. It
+  accepts an exact commit SHA, refuses any commit that is not already an
+  ancestor of `main` or a `trusted/*` branch, and only then runs the benchmark
+  with named credentials. It publishes the dated baseline as an artifact and
+  pushes no commits.
+
+No pull-request-selected ref, config, or artifact reaches a job that holds
+credentials.
+
 ## ClawHub Profile Baseline
 
 Maintainers validate accepted `clawhub` profile proposals against the public

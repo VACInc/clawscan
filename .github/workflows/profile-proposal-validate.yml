@@ -1,0 +1,119 @@
+name: Profile Proposal Validation
+
+# Untrusted lane.
+#
+# This workflow validates a ClawHub profile proposal as data. It builds the
+# validator from the trusted base commit, extracts the proposed file contents
+# from the pull-request head without checking out or executing that tree, holds
+# no repository or provider secret, and cannot write to the repository.
+#
+# Running a proposed profile is a separate maintainer action; see
+# skilltrustbench-benchmark.yml.
+
+on:
+  pull_request:
+    paths:
+      - "proposals/**"
+      - "internal/profiles/clawhub/**"
+      - "benchmarks/skilltrustbench-leaderboard-10pct/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: profile-proposal-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate-proposal:
+    name: Validate proposal shape
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted base commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Collect proposal contents as data
+        id: collect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # The pull-request head is fetched but never checked out and never
+          # executed. Only named blobs are extracted from it.
+          git fetch --no-tags --depth=50 origin "pull/${PR_NUMBER}/head"
+          head_sha="$(git rev-parse FETCH_HEAD)"
+          echo "Head under validation: $head_sha"
+
+          data_root="$RUNNER_TEMP/proposal-data"
+          rm -rf "$data_root"
+          mkdir -p "$data_root"
+
+          git diff --name-only "$BASE_SHA...$head_sha" >"$RUNNER_TEMP/changed-files.txt"
+          echo "Changed files:"
+          cat "$RUNNER_TEMP/changed-files.txt"
+
+          proposals="$(grep -E '^proposals/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}/clawscan\.yml$' "$RUNNER_TEMP/changed-files.txt" || true)"
+          count="$(printf '%s' "$proposals" | grep -c . || true)"
+          if [ "$count" -ne 1 ]; then
+            echo "Exactly one proposals/<GHSA-ID>/clawscan.yml must change; found $count." >&2
+            exit 1
+          fi
+
+          mkdir -p "$data_root/$(dirname "$proposals")"
+          git show "$head_sha:$proposals" >"$data_root/$proposals"
+
+          {
+            echo "data_root=$data_root"
+            echo "proposal=$proposals"
+            echo "changed_files=$RUNNER_TEMP/changed-files.txt"
+            echo "baseline_date=$(date -u +%F)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Validate proposal as data
+        env:
+          DATA_ROOT: ${{ steps.collect.outputs.data_root }}
+          PROPOSAL: ${{ steps.collect.outputs.proposal }}
+          CHANGED_FILES: ${{ steps.collect.outputs.changed_files }}
+          BASELINE_DATE: ${{ steps.collect.outputs.baseline_date }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/validate-profile-proposal \
+            --root "$DATA_ROOT" \
+            --proposal "$PROPOSAL" \
+            --changed-files "$CHANGED_FILES" \
+            --baseline-date "$BASELINE_DATE" | tee "$RUNNER_TEMP/validation.txt"
+
+      - name: Summarize validation
+        if: always()
+        env:
+          PROPOSAL: ${{ steps.collect.outputs.proposal }}
+        run: |
+          {
+            echo "## ClawHub profile proposal validation"
+            echo
+            echo "- Proposal: \`${PROPOSAL:-unresolved}\`"
+            echo "- Lane: untrusted, read-only, no secrets"
+            echo "- Benchmarking a proposal requires a maintainer dispatch of"
+            echo "  \`skilltrustbench-benchmark.yml\` against a reviewed commit"
+            echo "  that is already an ancestor of the trusted branch."
+            if [ -f "$RUNNER_TEMP/validation.txt" ]; then
+              echo
+              echo '```'
+              cat "$RUNNER_TEMP/validation.txt"
+              echo '```'
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

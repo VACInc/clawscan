@@ -61,13 +61,24 @@ and, if accepted, promote the public profile behavior into the bundled
 
 3. Validate the candidate profile.
 
-   Prefer the manual GitHub Actions workflow when available:
+   Validation and execution are two separate lanes, and they are separate on
+   purpose. A profile proposal can name the judge command, so running an
+   unreviewed proposal in a job that holds scanner or model credentials is
+   remote code execution against those credentials.
 
-   ```text
-   SkillTrustBench Profile Gate
-   ```
+   - `Profile Proposal Validation` runs automatically on the pull request. It
+     holds no secrets, cannot write to the repository, and treats the proposal
+     strictly as data.
+   - `SkillTrustBench Benchmark` is the maintainer lane. Dispatch it only after
+     the reviewed proposal commit is already an ancestor of `main` (or of a
+     `trusted/*` branch), and pass that exact 40-character commit SHA. The
+     workflow refuses any commit that is not an ancestor of the trusted ref, and
+     it never checks out a pull-request branch.
 
-   Dispatch it with the PR number and proposal path. It should run:
+   Never dispatch a benchmark against an unmerged proposal branch, and never
+   copy a candidate config out of the validation lane into the benchmark lane.
+
+   The benchmark lane runs:
 
    ```bash
    clawscan benchmark SkillTrustBench \
@@ -111,6 +122,10 @@ and, if accepted, promote the public profile behavior into the bundled
      --subset-case-ids-sha256 903a036e4b7b16ee28e22d5d9db57a00b3764cfe41e43144acad67921e5196c2 \
      --workflow-url <workflow-url>
    ```
+
+   The benchmark lane also produces this file as the `skilltrustbench-baseline`
+   artifact. It does not commit or push anything, so a maintainer commits the
+   baseline from a reviewed branch.
 
    If the PR merges, the newest dated JSON file in
    `benchmarks/skilltrustbench-leaderboard-10pct/` is the latest accepted

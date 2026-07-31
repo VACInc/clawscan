@@ -19,10 +19,6 @@ on:
         description: Optional comma/space-separated scanners when profile is empty.
         required: false
         default: ""
-      split:
-        description: Optional benchmark split. Empty uses the benchmark default.
-        required: false
-        default: ""
       ids:
         description: Optional benchmark ID source. Accepts a local text/JSONL path or HTTP(S) JSONL URL.
         required: false
@@ -35,18 +31,6 @@ on:
         description: Row offset for reproducible chunks.
         required: false
         default: "0"
-      predictions_output:
-        description: Optional predictions JSONL path for clawhub-security-signals.
-        required: false
-        default: ""
-      output_path:
-        description: Benchmark artifact JSON path.
-        required: false
-        default: ./artifacts/clawscan-benchmark.json
-      artifact_name:
-        description: Uploaded artifact name.
-        required: false
-        default: clawscan-benchmark
       sandbox:
         description: ClawScan command sandbox mode.
         required: false
@@ -55,14 +39,14 @@ on:
         options:
           - docker
           - off
-      sandbox_image:
-        description: Docker runtime image when sandbox is docker.
-        required: false
-        default: ghcr.io/openclaw/clawscan-runtime:latest
-      pr_number:
-        description: Optional PR number to checkout before running.
+      commit_sha:
+        description: Optional exact 40-character commit SHA to benchmark. Must be an ancestor of trusted_ref.
         required: false
         default: ""
+      trusted_ref:
+        description: Trusted branch that commit_sha must descend from.
+        required: false
+        default: main
   workflow_call:
     inputs:
       benchmark_id:
@@ -116,10 +100,14 @@ on:
         type: string
         required: false
         default: ghcr.io/openclaw/clawscan-runtime:latest
-      pr_number:
+      commit_sha:
         type: string
         required: false
         default: ""
+      trusted_ref:
+        type: string
+        required: false
+        default: main
     secrets:
       LLM_API_KEY:
         required: false
@@ -146,27 +134,47 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   benchmark:
     name: Run ${{ inputs.benchmark_id }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout trusted ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ inputs.trusted_ref }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Checkout pull request branch
-        if: ${{ inputs.pr_number != '' }}
+      - name: Check out verified trusted commit
+        if: ${{ inputs.commit_sha != '' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        run: gh pr checkout "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          TRUSTED_REF: ${{ inputs.trusted_ref }}
+        run: |
+          set -euo pipefail
+          # This job holds credentials, so it only ever executes code that is
+          # already part of the trusted branch history.
+          case "$TRUSTED_REF" in
+            main | trusted/*) ;;
+            *)
+              echo "trusted_ref must be main or trusted/*, got $TRUSTED_REF" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "commit_sha must be a full 40-character lowercase hex SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/${TRUSTED_REF#refs/heads/}"; then
+            echo "commit_sha is not an ancestor of $TRUSTED_REF; refusing to run untrusted code with secrets" >&2
+            exit 1
+          fi
+          git checkout --detach "$COMMIT_SHA"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache: true
@@ -177,7 +185,7 @@ jobs:
       - name: Pull ClawScan runtime image
         if: ${{ inputs.sandbox == 'docker' }}
         env:
-          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image }}
+          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime:latest' }}
         run: docker pull "$CLAWSCAN_SANDBOX_IMAGE"
 
       - name: Run benchmark
@@ -191,9 +199,9 @@ jobs:
           LIMIT: ${{ inputs.limit }}
           OFFSET: ${{ inputs.offset }}
           PREDICTIONS_OUTPUT: ${{ inputs.predictions_output }}
-          OUTPUT_PATH: ${{ inputs.output_path }}
+          OUTPUT_PATH: ${{ inputs.output_path || './artifacts/clawscan-benchmark.json' }}
           CLAWSCAN_SANDBOX: ${{ inputs.sandbox }}
-          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image }}
+          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime:latest' }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           DEFAULT_MODEL: ${{ secrets.DEFAULT_MODEL }}
           DEFAULT_BASE_URL: ${{ secrets.DEFAULT_BASE_URL }}
@@ -243,8 +251,8 @@ jobs:
       - name: Summarize benchmark
         if: always()
         env:
-          OUTPUT_PATH: ${{ inputs.output_path }}
-          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          OUTPUT_PATH: ${{ inputs.output_path || './artifacts/clawscan-benchmark.json' }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name || 'clawscan-benchmark' }}
         run: |
           {
             echo "## ClawScan benchmark"
@@ -268,11 +276,11 @@ jobs:
 
       - name: Upload benchmark artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ inputs.artifact_name }}
+          name: ${{ inputs.artifact_name || 'clawscan-benchmark' }}
           path: |
             ./artifacts/**
-            ${{ inputs.output_path }}
+            ${{ inputs.output_path || './artifacts/clawscan-benchmark.json' }}
             ${{ inputs.predictions_output }}
           if-no-files-found: error

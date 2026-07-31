@@ -1,0 +1,193 @@
+name: SkillTrustBench Benchmark
+
+# Trusted lane.
+#
+# A maintainer dispatches this workflow against an exact commit that is already
+# an ancestor of the trusted branch, which means it has been reviewed and
+# merged. Nothing here accepts a pull-request number, a pull-request ref, or a
+# configuration artifact produced by the untrusted validation lane.
+#
+# The baseline summary is published as an artifact. Committing it is a separate
+# maintainer action, so no automated commit is pushed onto a proposal branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact 40-character commit SHA to benchmark. Must already be an ancestor of the trusted ref.
+        required: true
+      trusted_ref:
+        description: Trusted branch the commit must descend from.
+        required: false
+        default: main
+      config_path:
+        description: Config path within that commit, for example proposals/GHSA-xxxx-yyyy-zzzz/clawscan.yml.
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skilltrustbench-benchmark-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  verify-trusted-commit:
+    name: Verify trusted commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      baseline_date: ${{ steps.baseline.outputs.date }}
+      baseline_path: ${{ steps.baseline.outputs.path }}
+    steps:
+      - name: Checkout trusted ref
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.trusted_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify commit is trusted
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          TRUSTED_REF: ${{ inputs.trusted_ref }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          case "$TRUSTED_REF" in
+            main | trusted/*) ;;
+            *)
+              echo "trusted_ref must be main or trusted/*, got $TRUSTED_REF" >&2
+              exit 1
+              ;;
+          esac
+          case "$COMMIT_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *)
+              echo "commit_sha must be a full 40-character lowercase hex SHA" >&2
+              exit 1
+              ;;
+          esac
+          if ! git cat-file -e "${COMMIT_SHA}^{commit}" 2>/dev/null; then
+            echo "commit_sha is not present in this repository" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/${TRUSTED_REF#refs/heads/}"; then
+            echo "commit_sha is not an ancestor of $TRUSTED_REF; review and merge it first" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "$COMMIT_SHA:$CONFIG_PATH" 2>/dev/null; then
+            echo "config_path does not exist at commit_sha" >&2
+            exit 1
+          fi
+          echo "Trusted commit verified: $COMMIT_SHA descends from $TRUSTED_REF"
+
+      - name: Determine dated baseline path
+        id: baseline
+        run: |
+          set -euo pipefail
+          baseline_date="$(date -u +%F)"
+          echo "date=$baseline_date" >>"$GITHUB_OUTPUT"
+          echo "path=benchmarks/skilltrustbench-leaderboard-10pct/${baseline_date}.json" >>"$GITHUB_OUTPUT"
+
+  run-benchmark:
+    name: Run SkillTrustBench benchmark
+    needs: verify-trusted-commit
+    uses: ./.github/workflows/run-clawscan-benchmark.yml
+    with:
+      commit_sha: ${{ inputs.commit_sha }}
+      trusted_ref: ${{ inputs.trusted_ref }}
+      benchmark_id: SkillTrustBench
+      ids: https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/main/data/evaluation_subset_10pct.jsonl
+      profile: clawhub
+      config_path: ${{ inputs.config_path }}
+      output_path: ./artifacts/skilltrustbench-candidate.json
+      artifact_name: skilltrustbench-candidate
+      sandbox: docker
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      DEFAULT_MODEL: ${{ secrets.DEFAULT_MODEL }}
+      DEFAULT_BASE_URL: ${{ secrets.DEFAULT_BASE_URL }}
+      DEFAULT_MODEL_CONTEXT_WINDOW: ${{ secrets.DEFAULT_MODEL_CONTEXT_WINDOW }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_CLI_API_TOKEN }}
+      VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+
+  publish-baseline-artifact:
+    name: Build accepted baseline summary
+    needs:
+      - verify-trusted-commit
+      - run-benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      BASELINE_DATE: ${{ needs.verify-trusted-commit.outputs.baseline_date }}
+      BASELINE_PATH: ${{ needs.verify-trusted-commit.outputs.baseline_path }}
+    steps:
+      - name: Checkout trusted commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download benchmark artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: skilltrustbench-candidate
+          path: ./downloaded-artifact
+
+      - name: Build baseline summary
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          artifact="$(
+            find ./downloaded-artifact -type f \( -name 'skilltrustbench-candidate.json' -o -name 'clawscan-benchmark.json' \) |
+              head -n 1
+          )"
+          if [ -z "$artifact" ]; then
+            echo "Downloaded artifact did not include a benchmark JSON file." >&2
+            find ./downloaded-artifact -type f >&2 || true
+            exit 1
+          fi
+          mkdir -p "$(dirname "$BASELINE_PATH")"
+          go run ./scripts/update-skilltrustbench-baseline \
+            --artifact "$artifact" \
+            --output "$BASELINE_PATH" \
+            --profile clawhub \
+            --profile-source "$CONFIG_PATH" \
+            --subset-case-ids-sha256 903a036e4b7b16ee28e22d5d9db57a00b3764cfe41e43144acad67921e5196c2 \
+            --workflow-url "$WORKFLOW_URL"
+          {
+            echo "## ClawHub SkillTrustBench baseline candidate"
+            echo
+            echo "- Benchmarked commit: \`${{ inputs.commit_sha }}\`"
+            echo "- Baseline: \`$BASELINE_PATH\`"
+            echo "- Artifact: \`skilltrustbench-baseline\`"
+            echo "- Workflow: $WORKFLOW_URL"
+            echo
+            echo "Commit this file from a reviewed branch. This workflow does not"
+            echo "push commits."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline summary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: skilltrustbench-baseline
+          path: ${{ needs.verify-trusted-commit.outputs.baseline_path }}
+          if-no-files-found: error
