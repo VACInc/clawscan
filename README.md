@@ -26,6 +26,84 @@ Run NVIDIA SkillSpector and Cisco Skill Scanner against a local `skills/` folder
 clawscan --scanner skillspector --scanner cisco
 ```
 
+## Observatory: behavior evidence, not verdicts
+
+Static scanners report what code appears capable of doing. Observatory runs the
+same synthetic OpenClaw task twice, once without the target and once with it,
+subtracts baseline runtime activity, and publishes the observed difference.
+
+```text
+target ──▶ stage ──▶ static/free scanners ──▶ gate
+                                              │
+                        baseline lane ◀───────┴───────▶ exercise lane
+                        (no target)                     (target loaded)
+                              └──────── paired capture ────────┘
+                                              │
+                            observatory.behavior.v2 evidence
+                                              │
+                        observatory.grade.v2 (separate projection)
+```
+
+The evidence schema has no verdict, score, or recommendation. The grade is a
+separate derived file. Both are reproducible offline from the retained capture.
+
+Quick start on a Linux control host:
+
+```bash
+go build -o ./bin/clawscan ./cmd/clawscan
+go build -o ./bin/observatory ./cmd/observatory
+
+./bin/clawscan scanners behavior
+./bin/observatory --help
+
+# Stage an owned fixture, which never executes it.
+./bin/observatory stage \
+  --output /tmp/observatory-demo-stage \
+  --metadata /tmp/observatory-demo-stage.json \
+  ./testdata/fixtures/pipeline-safe-plugin
+
+# Validate a live runner configuration before anything is provisioned.
+./bin/observatory validate-config --live /secure/path/observatory.yml
+```
+
+Offline replay of a completed run, from the retained private capture:
+
+```bash
+./bin/observatory analyze --config ./observatory.yml \
+  --bundle /secure/run/raw.tar.gz --json \
+  --grade-output /secure/run/grade.json \
+  /secure/run/target > /secure/run/evidence.json
+
+./bin/observatory grade  --input /secure/run/evidence.json --output /tmp/grade.json
+./bin/observatory render --input /secure/run/evidence.json --output /tmp/site
+```
+
+### Isolation prerequisites
+
+The behavior lane executes the target, so it never runs on the ClawScan host and
+it refuses ClawScan Docker sandbox mode. It requires a separately isolated
+remote runner: a fresh full clone on a dedicated quarantine bridge, default-deny
+networking, dedicated accounts, pinned TLS, bounded cgroups, and synthetic
+identity material. The target never receives VirusTotal, Codex, model, Proxmox,
+or Crabbox credentials. The runner contract is in
+[`infra/proxmox/README.md`](infra/proxmox/README.md), and the full flow is
+[`infra/proxmox/run-gated-observatory.sh`](infra/proxmox/run-gated-observatory.sh).
+
+### What Observatory does not prove
+
+- A clean grade is not a safety proof. One task exercises one path.
+- Dormant branches, delayed triggers, and version-specific behavior can be
+  missed.
+- GUI and channel-plugin coverage is shallow, and tool-argument metadata can be
+  incomplete. Both are reported in the evidence coverage fields.
+- Deep or repeated redirect trials are rejected by configuration on purpose.
+- Observatory does not host a public scanning service, scan the ClawHub catalog,
+  or execute third-party targets on your behalf.
+
+See [`docs/observatory.md`](docs/observatory.md) for the full contract and
+[`docs/release-gate-ledger.md`](docs/release-gate-ledger.md) for the current
+release gates.
+
 ## Scan a known malicious skill
 
 This example scans Trail of Bits' [`csv-summarizer`](https://github.com/trailofbits/overtly-malicious-skills/tree/4ffbf9461ef0505f9ce76a0d3694a18ec33ea531/skills/csv-summarizer) skill, which claims to summarize a CSV file but also prints every environment variable when run.

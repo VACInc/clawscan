@@ -38,6 +38,8 @@ optional external judge command supplied by the operator.
 
 Current safety boundaries:
 
+- Command-backed scanners and judge commands run in the ClawScan Docker runtime
+  by default. `--sandbox off` opts out and runs them directly on the host.
 - ClawScan validates scanner and judge environment requirements up front when
   it knows them.
 - ClawScan records only secret-safe environment presence in artifacts.
@@ -48,7 +50,9 @@ Current safety boundaries:
 
 Current non-goals:
 
-- ClawScan does not sandbox scanners or judge commands by default.
+- The default Docker runtime is a convenience boundary, not a containment
+  boundary. It does not make an untrusted scanner, judge harness, or target
+  safe, and it is not the isolation the Observatory behavior lane requires.
 - ClawScan does not make untrusted scanners, judge harnesses, shells, package
   managers, or local workspaces safe to execute.
 - ClawScan does not validate that third-party scanner output is complete or
@@ -57,6 +61,29 @@ Current non-goals:
 
 Treat every scanner command and `--judge` command as local code execution. Run
 only tools and profiles you trust, and review artifacts before sharing them.
+
+## Observatory behavior lane
+
+The `behavior` adapter executes a target, so it does not run on the ClawScan
+host at all. It refuses ClawScan Docker sandbox mode and requires an
+independently isolated remote runner: a fresh full clone on a dedicated
+quarantine bridge, default-deny networking, dedicated accounts, pinned TLS,
+bounded cgroups, and synthetic identity material. The target never receives
+VirusTotal, Codex, model, Proxmox, or Crabbox credentials.
+
+Observatory publishes observed behavior, not a safety verdict. Evidence
+(`observatory.behavior.v2`) carries no verdict, score, or recommendation; the
+grade (`observatory.grade.v2`) is a separate derived projection. A clean grade
+means one synthetic task in one environment produced no observed delta of
+interest. It is not proof that a target is safe.
+
+## Profile proposal trust boundary
+
+A ClawHub profile can name the judge command, so an unreviewed profile proposal
+is untrusted code. Proposal validation runs with read-only permissions and no
+secrets and treats a proposal strictly as data. Running a proposal in a
+credentialed benchmark requires a maintainer dispatch against a commit that is
+already an ancestor of the trusted branch.
 
 ## Reporting Malicious Skills
 
