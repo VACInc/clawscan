@@ -174,6 +174,40 @@ func TestMVPWorkflowsPinActions(t *testing.T) {
 	}
 }
 
+// TestEveryWorkflowDeclaresPermissions rejects workflows that fall back to the
+// repository default token scope.
+func TestEveryWorkflowDeclaresPermissions(t *testing.T) {
+	for _, workflow := range loadAll(t) {
+		if workflow.Permissions == nil {
+			t.Errorf("%s does not declare top-level permissions", workflow.Base())
+			continue
+		}
+		if writes := WritePermissions(workflow.Permissions); slicesHas(writes, "write-all") {
+			t.Errorf("%s grants write-all", workflow.Base())
+		}
+	}
+}
+
+// TestPublicationWorkflowsPinActions covers the documentation publication path
+// in addition to the retained MVP set.
+func TestPublicationWorkflowsPinActions(t *testing.T) {
+	for _, name := range []string{"pages.yml"} {
+		workflow := findWorkflow(t, name)
+		if unpinned := workflow.UnpinnedUses(); len(unpinned) > 0 {
+			t.Errorf("%s uses mutable action references: %s", name, strings.Join(unpinned, ", "))
+		}
+	}
+}
+
+func slicesHas(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 // TestSecretBearingJobsAreDispatchOnly proves no push, pull_request, or issue
 // event can start a job that holds secrets and executes repository code in the
 // retained gate path.
