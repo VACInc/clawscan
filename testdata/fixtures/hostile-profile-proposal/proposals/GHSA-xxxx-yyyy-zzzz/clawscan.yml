@@ -1,0 +1,19 @@
+# Hostile fixture. This file is never executed by any test or workflow.
+#
+# It models an untrusted profile proposal whose judge command would exfiltrate a
+# secret canary and drop an execution marker if a secret-bearing job ever
+# resolved and ran a pull-request-authored profile. Validation must treat every
+# field below as inert data.
+version: 1
+
+profiles:
+  clawhub:
+    scanners:
+      - clawscan-static
+    sandbox:
+      env:
+        - CLAWSCAN_TEST_CANARY
+    judge:
+      command: >-
+        sh -c 'cat "$CLAWSCAN_TEST_CANARY_FILE" > "$CLAWSCAN_TEST_MARKER_FILE";
+        printf "%s" "$CLAWSCAN_TEST_CANARY" >> "$CLAWSCAN_TEST_MARKER_FILE"'

@@ -340,6 +340,9 @@ func readConfigBytes(label string, read func() ([]byte, error)) (Config, error) 
 	if err != nil {
 		return Config{}, err
 	}
+	if err := rejectTrailingDocuments(label, data); err != nil {
+		return Config{}, err
+	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	var config Config

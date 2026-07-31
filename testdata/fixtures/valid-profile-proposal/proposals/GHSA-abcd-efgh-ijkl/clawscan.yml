@@ -1,0 +1,26 @@
+version: 1
+
+profiles:
+  clawhub:
+    scanners:
+      - virustotal
+      - skillspector
+      - clawscan-static
+    sandbox:
+      env:
+        - VIRUSTOTAL_API_KEY
+    judge:
+      execution: host
+      waitForScanners:
+        - virustotal
+      waitTimeout: 10m
+      waitInterval: 30s
+      command: >-
+        codex exec --cd {{ workspace }}
+        --model gpt-5.5
+        --sandbox read-only
+        --output-schema {{ output_schema:output.schema.json }}
+        --output-last-message {{ output }}
+        --ephemeral
+        --json
+        - < {{ prompt:prompt.md }}
