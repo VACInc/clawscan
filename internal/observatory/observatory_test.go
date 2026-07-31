@@ -2405,8 +2405,22 @@ func TestGeneratedConfigSupportsPinnedOpenClawSchema(t *testing.T) {
 	if strings.Contains(writeConfigScript, "securityAcknowledgedAt") {
 		t.Fatal("generated config uses a wizard field unavailable in pinned OpenClaw 2026.6.11")
 	}
-	if !strings.Contains(writeConfigScript, `bundledDiscovery: "allowlist"`) {
-		t.Fatal("generated plugin config does not explicitly select allowlist discovery")
+	if !strings.Contains(writeConfigScript, `bundledDiscovery = "allowlist"`) {
+		t.Fatal("generated plugin config does not explicitly select allowlist discovery on builds that support it")
+	}
+	// The generated guest config must fit the OpenClaw build that is actually
+	// installed in the runner image. The script probes the guest config schema
+	// and keeps the legacy spelling when the probe is unavailable, so one runner
+	// template revision is not pinned to one OpenClaw revision.
+	for _, required := range []string{
+		`["config", "schema"]`,
+		`guestSchemaSupports(["tools", "exec", "timeoutSeconds"])`,
+		`"timeoutSeconds" : "timeoutSec"`,
+		`observatoryReservedPluginID`,
+	} {
+		if !strings.Contains(writeConfigScript, required) {
+			t.Fatalf("generated config is not schema adaptive: missing %q", required)
+		}
 	}
 	for _, required := range []string{
 		`timeoutSeconds: runtime.timeoutSeconds`,

@@ -2,6 +2,7 @@ package observatory
 
 const writeConfigScript = `import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 const runtime = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const workspace = process.env.OBSERVATORY_WORKSPACE;
@@ -10,6 +11,31 @@ const home = process.env.OBSERVATORY_HOME;
 const state = process.env.OPENCLAW_STATE_DIR;
 const lane = process.env.OBSERVATORY_LANE;
 const targetRoot = process.env.OBSERVATORY_TARGET_ROOT;
+// Reserved identifier that no staged target may use, so the baseline lane can
+// express "an allowlist that matches nothing" on OpenClaw builds that no longer
+// accept plugins.bundledDiscovery.
+const observatoryReservedPluginID = "observatory-no-plugin";
+// The guest OpenClaw build decides which configuration spelling is valid, and a
+// rejected key aborts the lane. The schema is read from the guest CLI itself so
+// one runner template revision is not silently pinned to one OpenClaw revision.
+// When the probe is unavailable the legacy spelling is kept, which is the schema
+// the currently pinned template ships.
+let guestConfigSchema = null;
+try {
+  const probe = execFileSync(typeof runtime.openclawCommand === "string" && runtime.openclawCommand.length > 0 ? runtime.openclawCommand : "openclaw", ["config", "schema"], { encoding: "utf8", timeout: 60000, maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
+  guestConfigSchema = JSON.parse(probe);
+} catch { guestConfigSchema = null; }
+function guestSchemaSupports(segments) {
+  if (!guestConfigSchema) return false;
+  let node = guestConfigSchema;
+  for (const segment of segments) {
+    node = node && node.properties ? node.properties[segment] : null;
+    if (!node) return false;
+  }
+  return true;
+}
+const execTimeoutKey = guestSchemaSupports(["tools", "exec", "timeoutSeconds"]) ? "timeoutSeconds" : "timeoutSec";
+const supportsBundledDiscovery = !guestSchemaSupports(["tools", "exec", "timeoutSeconds"]) || guestSchemaSupports(["plugins", "bundledDiscovery"]);
 if (!workspace || !configPath || !home || !state || !lane || !targetRoot) throw new Error("missing Observatory lane paths");
 const model = runtime.model;
 const markers = runtime.canaries;
@@ -65,14 +91,19 @@ const config = {
       "image", "image_generate", "music_generate", "video_generate",
     ],
     elevated: { enabled: false },
-    exec: { security: "full", ask: "off", timeoutSec: runtime.timeoutSeconds },
+    exec: { security: "full", ask: "off", [execTimeoutKey]: runtime.timeoutSeconds },
   },
 };
 if (runtime.targetKind === "plugin") {
+  if (runtime.targetId === observatoryReservedPluginID) throw new Error("staged plugin uses the reserved Observatory identifier");
   if (lane === "exercise" && typeof runtime.targetTool === "string" && runtime.targetTool.length > 0) config.tools.alsoAllow = [runtime.targetTool];
-  config.plugins = lane === "exercise" ? {
+  // plugins.allow is the loader allowlist: when it is set, only the listed IDs
+  // are eligible to load. Builds that still accept bundledDiscovery keep the
+  // explicit allowlist discovery mode. Builds that dropped it get a reserved ID
+  // in the baseline lane, so the allowlist stays non-empty and the eligible set
+  // stays empty instead of relying on an empty array being read as deny-all.
+  const exercisePlugins = {
     enabled: true,
-    bundledDiscovery: "allowlist",
     allow: [runtime.targetId],
     deny: [],
     load: { paths: [targetRoot] },
@@ -82,7 +113,19 @@ if (runtime.targetKind === "plugin") {
         hooks: { allowPromptInjection: false, allowConversationAccess: false },
       },
     },
-  } : { enabled: true, bundledDiscovery: "allowlist", allow: [], deny: [], load: { paths: [] }, entries: {} };
+  };
+  const baselinePlugins = {
+    enabled: true,
+    allow: supportsBundledDiscovery ? [] : [observatoryReservedPluginID],
+    deny: [],
+    load: { paths: [] },
+    entries: {},
+  };
+  if (supportsBundledDiscovery) {
+    exercisePlugins.bundledDiscovery = "allowlist";
+    baselinePlugins.bundledDiscovery = "allowlist";
+  }
+  config.plugins = lane === "exercise" ? exercisePlugins : baselinePlugins;
 } else {
   config.plugins = { enabled: false };
 }

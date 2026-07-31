@@ -78,6 +78,7 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 	defer gzipReader.Close()
 
 	entries := map[string][]byte{}
+	seen := map[string]bool{}
 	decompressed := &io.LimitedReader{R: gzipReader, N: maxBytes + 1}
 	reader := tar.NewReader(decompressed)
 	var total int64
@@ -96,6 +97,13 @@ func ReadCaptureBundle(bundlePath string, maxBytes int64) (CaptureBundle, error)
 		if name == "." || strings.HasPrefix(name, "../") || path.IsAbs(name) {
 			return CaptureBundle{}, fmt.Errorf("capture bundle contains unsafe path: %s", header.Name)
 		}
+		if seen[name] {
+			// Two members that normalize to one name make the accepted capture
+			// ambiguous: a later entry would silently replace an earlier one and
+			// the evidence would no longer describe the bytes that were captured.
+			return CaptureBundle{}, fmt.Errorf("capture bundle contains duplicate member: %s", name)
+		}
+		seen[name] = true
 		if header.Size < 0 || header.Size > maxBytes || total+header.Size > maxBytes {
 			return CaptureBundle{}, fmt.Errorf("capture bundle exceeds maxBundleBytes (%d)", maxBytes)
 		}
