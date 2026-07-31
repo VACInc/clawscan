@@ -82,6 +82,18 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Require the upstream repository for publish
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Fork safety: only the repository that owns @openclaw/clawscan may
+          # publish it. A fork can run preflight validation and build archives.
+          if [[ "${REPOSITORY}" != "openclaw/clawscan" ]]; then
+            echo "Publishing @openclaw/clawscan is restricted to openclaw/clawscan; this is ${REPOSITORY}." >&2
+            exit 1
+          fi
+
       - name: Require main workflow ref for publish
         env:
           WORKFLOW_REF: ${{ github.ref }}
@@ -104,7 +116,7 @@ jobs:
 
   publish_clawscan_npm:
     needs: [validate_publish_request]
-    if: ${{ !inputs.preflight_only }}
+    if: ${{ !inputs.preflight_only && github.repository == 'openclaw/clawscan' }}
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:

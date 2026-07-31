@@ -25,6 +25,11 @@ concurrency:
 
 env:
   NODE_VERSION: 24
+  # Fork safety: building always runs, but publishing is confined to the
+  # repository that owns the official @openclaw/clawscan package and the
+  # openclaw/homebrew-tap formula. A fork can produce archives; it can never
+  # mutate an official namespace.
+  UPSTREAM_REPOSITORY: openclaw/clawscan
 
 jobs:
   build:
@@ -81,7 +86,7 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' || inputs.publish
+    if: ${{ (github.event_name == 'push' || inputs.publish) && startsWith(needs.build.outputs.version, 'v') }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -103,7 +108,7 @@ jobs:
     name: Publish @openclaw/clawscan
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' || inputs.publish
+    if: ${{ (github.event_name == 'push' || inputs.publish) && startsWith(needs.build.outputs.version, 'v') && github.repository == 'openclaw/clawscan' }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -221,7 +226,7 @@ jobs:
       - build
       - publish
       - publish-npm
-    if: always() && needs.publish.result == 'success' && needs.publish-npm.result == 'success' && startsWith(needs.build.outputs.version, 'v')
+    if: ${{ always() && needs.publish.result == 'success' && needs.publish-npm.result == 'success' && startsWith(needs.build.outputs.version, 'v') && github.repository == 'openclaw/clawscan' }}
     env:
       TAP_REPO: openclaw/homebrew-tap
       FORMULA: clawscan
