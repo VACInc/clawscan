@@ -25,8 +25,8 @@ concurrency:
 
 env:
   NODE_VERSION: 24
-  # The narrative in docs/release-gate-ledger.md is ADVISORY. Publication jobs
-  # enforce only its machine-readable release-publication-status line.
+  # The release-publication-status line is a self-attestation read from and
+  # checked against the tagged tree, not an independent approval control.
   # Fork safety: building always runs, but publishing is confined to the
   # repository that owns the official @openclaw/clawscan package and the
   # openclaw/homebrew-tap formula. A fork can produce archives; it can never

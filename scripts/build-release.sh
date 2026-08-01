@@ -76,42 +76,8 @@ for platform in "${platforms[@]}"; do
     mkdir -p "${workdir}/docs"
     cp docs/observatory.md "${workdir}/docs/observatory.md"
     cp examples/observatory.yml "${workdir}/observatory.example.yml"
-    cat >"${workdir}/LIMITATIONS.md" <<'LIMITS'
-# Observatory limitations
-
-Observatory publishes observed behavior for one synthetic task in one isolated
-environment. It does not prove that a target is safe.
-
-- Evidence is observational. A grade is a separate derived projection and is
-  never part of the evidence schema.
-- One task exercises one path. Dormant branches, delayed triggers, and
-  version-specific behavior can be missed.
-- GUI and channel-plugin coverage is shallow, and tool-argument metadata can be
-  incomplete. Those gaps are reported in the evidence coverage fields.
-- The behavior lane requires an independently isolated remote runner. It refuses
-  ClawScan Docker sandbox mode.
-- Deep or repeated redirect trials are rejected by configuration on purpose.
-- Live runs require an operator-approved disposable VM lifecycle. Nothing in
-  this archive provisions infrastructure by itself.
-LIMITS
-    cat >"${workdir}/PROOF-PACKET.md" <<'PROOF'
-# Proof packet
-
-This archive does not embed a live proof packet. A published Observatory proof
-packet is produced by an approved owned-fixture run and contains, at minimum:
-
-- source and runner-template commit SHAs
-- sanitized commands and configuration shape
-- runner-release and runtime-image receipts
-- public skill and plugin evidence, with separate grades
-- pipeline summaries
-- teardown and protected-resource proofs
-- generated static evidence pages
-- checksums and a proof index
-
-Raw capture bundles, raw traces, raw subprocess output, credential-wrapper logs,
-private endpoints, and private hostnames stay outside the packet.
-PROOF
+    cp LIMITATIONS.md "${workdir}/LIMITATIONS.md"
+    cp PROOF-PACKET.md "${workdir}/PROOF-PACKET.md"
   fi
 
   if [[ "$os" == "windows" ]]; then

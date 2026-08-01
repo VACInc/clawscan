@@ -9,6 +9,9 @@ if [[ -n "$SPLIT" ]]; then
 fi
 if [[ -n "$IDS" ]]; then
   args+=(--ids "$IDS")
+  if [[ -n "${IDS_SHA256:-}" ]]; then
+    args+=(--ids-sha256 "$IDS_SHA256")
+  fi
 else
   args+=(--limit "$LIMIT" --offset "$OFFSET")
 fi

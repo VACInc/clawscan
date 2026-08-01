@@ -11,25 +11,104 @@ import (
 	"testing"
 )
 
-func TestFetchSkillTrustBenchRowsPinsDatasetRevision(t *testing.T) {
-	var revision string
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		revision = request.URL.Query().Get("revision")
-		writer.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(writer, `{"rows":[{"row":{"id":"case_00001","judgment":"normal","skill_path":"benchmark_full_v1.0/case_00001"}}]}`)
-	}))
-	defer server.Close()
-
-	client := &HuggingFaceBenchmarkClient{Endpoint: server.URL}
-	rows, err := client.FetchSkillTrustBenchRows(skillTrustBenchID, defaultSkillTrustBenchSplit, 0, 1)
+func TestSkillTrustBenchJSONLRowsAreAuthoritative(t *testing.T) {
+	dir := t.TempDir()
+	idsPath := filepath.Join(dir, "subset.jsonl")
+	if err := os.WriteFile(idsPath, []byte(`{"id":"case_00001","judgment":"normal","risk_labels":[],"source":"pinned-subset","base_category":"safe","skill_path":"benchmark_full_v1.0/case_00001"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	benchmark, err := NewBenchmarkOptions("SkillTrustBench", "", 0, 0, "", idsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(rows))
+	artifact, err := RunBenchmark(Options{
+		Benchmark:          benchmark,
+		Scanners:           []string{"clawscan-static"},
+		ScannerResultPaths: map[string]string{},
+	}, RunContext{
+		Env: map[string]string{},
+		BenchmarkClient: staticBenchmarkClient{
+			skillTrustBenchRows: []SkillTrustBenchRow{{
+				ID: "case_00001", Judgment: "malicious", SkillPath: "benchmark_full_v1.0/case_00001",
+			}},
+			materializedSkillTrustBench: map[string]map[string]string{
+				"case_00001": {"SKILL.md": "# Safe fixture\n"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if revision != skillTrustBenchRevision {
-		t.Fatalf("revision = %q, want %q", revision, skillTrustBenchRevision)
+	if got := artifact.Cases[0].Expected.Verdict; got != "clean" {
+		t.Fatalf("expected verdict = %q, want pinned JSONL verdict clean", got)
+	}
+	if got := string(artifact.Cases[0].Expected.Context); !strings.Contains(got, `"source":"pinned-subset"`) {
+		t.Fatalf("expected context = %s, want pinned JSONL metadata", got)
+	}
+}
+
+func TestSkillTrustBenchJSONLRowsFailBeforeScannerOnInvalidLabel(t *testing.T) {
+	dir := t.TempDir()
+	idsPath := filepath.Join(dir, "subset.jsonl")
+	if err := os.WriteFile(idsPath, []byte(`{"id":"case_00001","judgment":"changed-upstream","skill_path":"benchmark_full_v1.0/case_00001"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	benchmark, err := NewBenchmarkOptions("SkillTrustBench", "", 0, 0, "", idsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingScannerRunner{}
+	_, err = RunBenchmark(Options{
+		Benchmark:          benchmark,
+		Scanners:           []string{"clawscan-static"},
+		ScannerResultPaths: map[string]string{},
+	}, RunContext{
+		Env:             map[string]string{},
+		ScannerRunner:   recorder,
+		BenchmarkClient: staticBenchmarkClient{},
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsupported judgment "changed-upstream"`) {
+		t.Fatalf("error = %v, want unsupported judgment", err)
+	}
+	if len(recorder.targets) != 0 {
+		t.Fatalf("scanner executed for invalid label source: %v", recorder.targets)
+	}
+}
+
+func TestFetchSkillTrustBenchRowsVerifiesPinnedJSONL(t *testing.T) {
+	rowsJSONL := strings.Join([]string{
+		`{"id":"case_00001","judgment":"normal","skill_path":"benchmark_full_v1.0/case_00001"}`,
+		`{"id":"case_00002","judgment":"malicious","skill_path":"benchmark_full_v1.0/case_00002"}`,
+	}, "\n") + "\n"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(writer, rowsJSONL)
+	}))
+	defer server.Close()
+	client := &HuggingFaceBenchmarkClient{
+		SkillTrustBenchRowsURL:    server.URL,
+		SkillTrustBenchRowsSHA256: sha256String(rowsJSONL),
+	}
+	rows, err := client.FetchSkillTrustBenchRows(skillTrustBenchID, defaultSkillTrustBenchSplit, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != "case_00002" || rows[0].Judgment != "malicious" {
+		t.Fatalf("rows = %#v", rows)
+	}
+}
+
+func TestFetchSkillTrustBenchRowsRejectsDigestMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(writer, `{"id":"case_00001","judgment":"malicious"}`)
+	}))
+	defer server.Close()
+	client := &HuggingFaceBenchmarkClient{
+		SkillTrustBenchRowsURL:    server.URL,
+		SkillTrustBenchRowsSHA256: sha256String("different pinned rows"),
+	}
+	_, err := client.FetchSkillTrustBenchRows(skillTrustBenchID, defaultSkillTrustBenchSplit, 0, 0)
+	if err == nil || !strings.Contains(err.Error(), "SkillTrustBench rows SHA-256 mismatch") {
+		t.Fatalf("error = %v, want rows digest mismatch", err)
 	}
 }
 
@@ -50,6 +129,7 @@ func TestSkillTrustBenchArchiveRejectsDigestMismatch(t *testing.T) {
 
 func TestSkillTrustBenchArchiveReplacesInvalidCacheOnlyAfterVerifiedDownload(t *testing.T) {
 	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
 	t.Setenv("XDG_CACHE_HOME", cacheRoot)
 	cachePath := filepath.Join(cacheRoot, "clawscan", "benchmarks", "skilltrustbench", skillTrustBenchArchiveName)
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
@@ -86,6 +166,7 @@ func TestSkillTrustBenchArchiveReplacesInvalidCacheOnlyAfterVerifiedDownload(t *
 
 func TestSkillTrustBenchArchiveDoesNotCacheBadDownload(t *testing.T) {
 	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
 	t.Setenv("XDG_CACHE_HOME", cacheRoot)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(writer, "wrong archive")

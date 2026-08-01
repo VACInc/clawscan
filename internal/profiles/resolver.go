@@ -97,6 +97,8 @@ type cliIntent struct {
 	predictionsOutputSet bool
 	idsSource            string
 	idsSourceSet         bool
+	idsSHA256            string
+	idsSHA256Set         bool
 }
 
 var judgePathPlaceholderPattern = regexp.MustCompile(`\{\{\s*(prompt|output_schema):([^}]+)\}\}`)
@@ -187,6 +189,7 @@ func resolveRunSetIntent(intent cliIntent, cwd string) (ResolvedRunSet, error) {
 		if err != nil {
 			return ResolvedRunSet{}, err
 		}
+		opts.Benchmark.IDsExpectedSHA256 = intent.idsSHA256
 	}
 	return ResolvedRunSet{
 		Options:    []runner.Options{opts},
@@ -586,6 +589,14 @@ func parseCLIIntent(args []string) (cliIntent, error) {
 			intent.idsSource = value
 			intent.idsSourceSet = true
 			i = next
+		case "--ids-sha256":
+			value, next, err := readValue(args, i, arg)
+			if err != nil {
+				return cliIntent{}, err
+			}
+			intent.idsSHA256 = value
+			intent.idsSHA256Set = true
+			i = next
 		default:
 			return cliIntent{}, fmt.Errorf("Unknown argument: %s", arg)
 		}
@@ -610,6 +621,12 @@ func buildRunnerArgs(intent cliIntent, selected resolvedProfile, profileName str
 		if intent.idsSourceSet {
 			return nil, nil, errors.New("--ids requires clawscan benchmark <benchmark-id>")
 		}
+		if intent.idsSHA256Set {
+			return nil, nil, errors.New("--ids-sha256 requires clawscan benchmark <benchmark-id>")
+		}
+	}
+	if intent.idsSHA256Set && !intent.idsSourceSet {
+		return nil, nil, errors.New("--ids-sha256 requires --ids")
 	}
 	if intent.idsSourceSet && (intent.limitSet || intent.offsetSet) {
 		return nil, nil, errors.New("--ids is mutually exclusive with --limit and --offset")

@@ -216,6 +216,7 @@ func TestResolveBenchmarkRunSetForwardsIDsSource(t *testing.T) {
 	resolved, err := ResolveBenchmarkRunSet("SkillTrustBench", []string{
 		"--scanner", "clawscan-static",
 		"--ids", "./subset.jsonl",
+		"--ids-sha256", strings.Repeat("a", 64),
 	}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +227,19 @@ func TestResolveBenchmarkRunSetForwardsIDsSource(t *testing.T) {
 	}
 	if opts.Benchmark.IDsSource != "./subset.jsonl" {
 		t.Fatalf("ids source = %q", opts.Benchmark.IDsSource)
+	}
+	if opts.Benchmark.IDsExpectedSHA256 != strings.Repeat("a", 64) {
+		t.Fatalf("ids expected sha256 = %q", opts.Benchmark.IDsExpectedSHA256)
+	}
+}
+
+func TestResolveBenchmarkRunSetRejectsIDsSHA256WithoutIDs(t *testing.T) {
+	_, err := ResolveBenchmarkRunSet("SkillTrustBench", []string{
+		"--scanner", "clawscan-static",
+		"--ids-sha256", strings.Repeat("a", 64),
+	}, t.TempDir())
+	if err == nil || err.Error() != "--ids-sha256 requires --ids" {
+		t.Fatalf("err = %v", err)
 	}
 }
 

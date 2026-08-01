@@ -207,37 +207,27 @@ jobs:
         env:
           IDS_SOURCE: ${{ inputs.ids }}
           IDS_SHA256: ${{ inputs.ids_sha256 }}
+        run: bash scripts/verify-benchmark-id-source.sh
+
+      - name: Classify benchmark credential lane
+        id: benchmark_lane
+        env:
+          BENCHMARK_ID: ${{ inputs.benchmark_id }}
         run: |
           set -euo pipefail
-          if [ -z "$IDS_SOURCE" ]; then
-            echo "BENCHMARK_IDS=" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          verified_source="$IDS_SOURCE"
-          case "$IDS_SOURCE" in
-            http://*)
-              echo "remote benchmark IDs must use HTTPS" >&2
-              exit 1
+          normalized="$(
+            printf '%s' "$BENCHMARK_ID" |
+              sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+              tr '[:upper:]' '[:lower:]'
+          )"
+          case "$normalized" in
+            skilltrustbench | cuhk-zhuque/skilltrustbench)
+              echo "lane=skilltrust" >>"$GITHUB_OUTPUT"
               ;;
-            https://*)
-              if ! printf '%s' "$IDS_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
-                echo "ids_sha256 is required for remote benchmark IDs" >&2
-                exit 1
-              fi
-              verified_source="$RUNNER_TEMP/benchmark-ids.jsonl"
-              curl --fail --location --proto '=https' --tlsv1.2 \
-                --output "$verified_source" "$IDS_SOURCE"
+            *)
+              echo "lane=generic" >>"$GITHUB_OUTPUT"
               ;;
           esac
-          if [ -n "$IDS_SHA256" ]; then
-            actual_sha256="$(sha256sum "$verified_source" | awk '{ print $1 }')"
-            if [ "$actual_sha256" != "$IDS_SHA256" ]; then
-              echo "benchmark IDs SHA-256 mismatch: expected $IDS_SHA256, got $actual_sha256" >&2
-              exit 1
-            fi
-          fi
-          echo "BENCHMARK_IDS=$verified_source" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -261,7 +251,7 @@ jobs:
           docker pull "$CLAWSCAN_SANDBOX_IMAGE"
 
       - name: Run SkillTrustBench benchmark
-        if: ${{ contains(fromJSON('["SkillTrustBench", "cuhk-zhuque/SkillTrustBench"]'), inputs.benchmark_id) }}
+        if: ${{ steps.benchmark_lane.outputs.lane == 'skilltrust' }}
         env:
           BENCHMARK_ID: ${{ inputs.benchmark_id }}
           PROFILE: ${{ inputs.profile }}
@@ -269,6 +259,7 @@ jobs:
           SCANNERS: ${{ inputs.scanners }}
           SPLIT: ${{ inputs.split }}
           IDS: ${{ env.BENCHMARK_IDS }}
+          IDS_SHA256: ${{ inputs.ids_sha256 }}
           LIMIT: ${{ inputs.limit }}
           OFFSET: ${{ inputs.offset }}
           PREDICTIONS_OUTPUT: ${{ inputs.predictions_output }}
@@ -281,7 +272,7 @@ jobs:
         run: bash scripts/run-ci-benchmark.sh
 
       - name: Run benchmark
-        if: ${{ !contains(fromJSON('["SkillTrustBench", "cuhk-zhuque/SkillTrustBench"]'), inputs.benchmark_id) }}
+        if: ${{ steps.benchmark_lane.outputs.lane == 'generic' }}
         env:
           BENCHMARK_ID: ${{ inputs.benchmark_id }}
           PROFILE: ${{ inputs.profile }}
@@ -289,6 +280,7 @@ jobs:
           SCANNERS: ${{ inputs.scanners }}
           SPLIT: ${{ inputs.split }}
           IDS: ${{ env.BENCHMARK_IDS }}
+          IDS_SHA256: ${{ inputs.ids_sha256 }}
           LIMIT: ${{ inputs.limit }}
           OFFSET: ${{ inputs.offset }}
           PREDICTIONS_OUTPUT: ${{ inputs.predictions_output }}

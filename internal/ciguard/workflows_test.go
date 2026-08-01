@@ -211,8 +211,13 @@ func TestSkillTrustBenchCallerPassesOnlyRequiredSecrets(t *testing.T) {
 	if got := strings.Join(names, ","); got != "CODEX_API_KEY,OPENAI_API_KEY,VIRUSTOTAL_API_KEY" {
 		t.Fatalf("SkillTrustBench command secret env = %q", got)
 	}
-	if !strings.Contains(skillTrustStep.If, "contains(") || !strings.Contains(genericStep.If, "!contains(") {
-		t.Fatal("SkillTrustBench and generic benchmark command steps are not mutually exclusive")
+	if skillTrustStep.If != "${{ steps.benchmark_lane.outputs.lane == 'skilltrust' }}" ||
+		genericStep.If != "${{ steps.benchmark_lane.outputs.lane == 'generic' }}" {
+		t.Fatal("SkillTrustBench and generic benchmark command steps must use the normalized credential lane")
+	}
+	if !strings.Contains(reusable.Raw, "Classify benchmark credential lane") ||
+		!strings.Contains(reusable.Raw, "sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'") {
+		t.Fatal("benchmark credential lane must trim benchmark_id before classifying it")
 	}
 }
 

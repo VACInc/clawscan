@@ -646,7 +646,7 @@ func TestLoadBenchmarkIDSelectionAcceptsTextAndHTTPJSONL(t *testing.T) {
 	if err := os.WriteFile(textPath, []byte("case_00003\ncase_00001\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	textSelection, err := LoadBenchmarkIDSelection(textPath)
+	textSelection, err := LoadBenchmarkIDSelection(textPath, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,12 +663,24 @@ func TestLoadBenchmarkIDSelectionAcceptsTextAndHTTPJSONL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	httpSelection, err := LoadBenchmarkIDSelection(server.URL + "/subset.jsonl")
+	_, err = LoadBenchmarkIDSelection(server.URL+"/subset.jsonl", "")
+	if err == nil || err.Error() != "--ids-sha256 is required for remote --ids sources" {
+		t.Fatalf("missing remote digest error = %v", err)
+	}
+	httpRows := strings.Join([]string{
+		`{"id":"case_00002","judgment":"suspicious"}`,
+		`{"id":"case_00001","judgment":"malicious"}`,
+	}, "\n") + "\n"
+	httpSelection, err := LoadBenchmarkIDSelection(server.URL+"/subset.jsonl", sha256String(httpRows))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(httpSelection.IDs, ","); got != "case_00002,case_00001" {
 		t.Fatalf("http ids = %q", got)
+	}
+	_, err = LoadBenchmarkIDSelection(server.URL+"/subset.jsonl", strings.Repeat("0", 64))
+	if err == nil || !strings.Contains(err.Error(), "--ids source SHA-256 mismatch") {
+		t.Fatalf("remote digest mismatch error = %v", err)
 	}
 }
 
@@ -711,7 +723,7 @@ func TestLoadBenchmarkIDSelectionRejectsBadSources(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tt.content), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			_, err := LoadBenchmarkIDSelection(path)
+			_, err := LoadBenchmarkIDSelection(path, "")
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("err = %v, want %q", err, tt.wantErr)
 			}

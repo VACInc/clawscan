@@ -1,7 +1,7 @@
 name: NPM Release
 
-# The release ledger narrative is ADVISORY. The publish job enforces only the
-# exact machine-readable release-publication-status line from the tagged tree.
+# The release-publication-status line is a self-attestation read from and
+# checked against the tagged tree, not an independent approval control.
 
 on:
   workflow_dispatch:

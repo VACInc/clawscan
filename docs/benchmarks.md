@@ -12,7 +12,10 @@ clawscan benchmark SkillTrustBench \
 ```
 
 Use `--ids <path-or-url>` with SkillTrustBench to run a fixed subset from a
-plain text ID list or JSONL rows with an `id` field.
+plain text ID list or JSONL rows with an `id` field. JSONL rows that include
+`judgment` are authoritative for labels and metadata, so verify the source
+digest with `--ids-sha256 <sha256>` before using them for a published score.
+The digest is required for remote sources.
 
 ## Available benchmarks
 

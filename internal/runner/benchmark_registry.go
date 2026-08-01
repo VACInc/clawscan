@@ -289,19 +289,27 @@ func (skillTrustBenchBenchmarkAdapter) SupportsPredictionsOutput() bool {
 func (adapter skillTrustBenchBenchmarkAdapter) RunCases(opts Options, ctx RunContext, env map[string]string, now func() time.Time, client BenchmarkClient) ([]BenchmarkCase, error) {
 	offset := opts.Benchmark.Offset
 	limit := opts.Benchmark.Limit
-	if len(opts.Benchmark.IDs) > 0 {
+	rows := opts.Benchmark.SkillTrustBenchRows
+	if len(opts.Benchmark.IDs) > 0 && len(rows) == 0 {
 		offset = 0
 		limit = 0
 	}
-	rows, err := client.FetchSkillTrustBenchRows(opts.Benchmark.ID, opts.Benchmark.Split, offset, limit)
-	if err != nil {
-		return nil, err
+	if len(rows) == 0 {
+		var err error
+		rows, err = client.FetchSkillTrustBenchRows(opts.Benchmark.ID, opts.Benchmark.Split, offset, limit)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(opts.Benchmark.IDs) > 0 {
+		var err error
 		rows, err = selectSkillTrustBenchRows(rows, opts.Benchmark.IDs, opts.Benchmark.Split)
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := validateSkillTrustBenchRows(rows); err != nil {
+		return nil, err
 	}
 	cases := make([]BenchmarkCase, 0, len(rows))
 	for _, row := range rows {
@@ -312,6 +320,18 @@ func (adapter skillTrustBenchBenchmarkAdapter) RunCases(opts Options, ctx RunCon
 		cases = append(cases, benchmarkCase)
 	}
 	return cases, nil
+}
+
+func validateSkillTrustBenchRows(rows []SkillTrustBenchRow) error {
+	for _, row := range rows {
+		if _, ok := canonicalVerdict(row.Judgment); !ok {
+			return fmt.Errorf("SkillTrustBench row %s has unsupported judgment %q", row.ID, row.Judgment)
+		}
+		if _, err := skillTrustBenchArchiveSkillPath(row); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func selectSkillTrustBenchRows(rows []SkillTrustBenchRow, ids []string, split string) ([]SkillTrustBenchRow, error) {

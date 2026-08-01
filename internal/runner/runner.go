@@ -43,8 +43,10 @@ type BenchmarkOptions struct {
 	Offset                int
 	PredictionsOutputPath string
 	IDsSource             string
+	IDsExpectedSHA256     string
 	IDs                   []string
 	IDsSHA256             string
+	SkillTrustBenchRows   []SkillTrustBenchRow
 }
 
 type JudgeOptions struct {

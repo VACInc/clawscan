@@ -35,8 +35,10 @@ const (
 	skillTrustBenchArchiveRoot    = "benchmark_full_v1.0"
 	skillTrustBenchArchiveName    = "benchmark_full_v1.0.zip"
 	skillTrustBenchRevision       = "f90517b7058fdcfea89af114c069fbf973f42bc7"
-	skillTrustBenchArchiveURL     = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench/resolve/f90517b7058fdcfea89af114c069fbf973f42bc7/benchmark_full_v1.0.zip"
+	skillTrustBenchArchiveURL     = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench/resolve/" + skillTrustBenchRevision + "/benchmark_full_v1.0.zip"
 	skillTrustBenchArchiveSHA256  = "e1d8950ef01c3b24fa80e32101844abc8c5ab3a0a38525427e8b16f00a414ae4"
+	skillTrustBenchRowsURL        = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench/resolve/" + skillTrustBenchRevision + "/data/test_cases.jsonl"
+	skillTrustBenchRowsSHA256     = "e37f2c1c0539a8e8f8269cb2b015bcc3d3fb4f8d4299273ab6b53be546ed7bec"
 	huggingFaceRowsEndpoint       = "https://datasets-server.huggingface.co/rows"
 	huggingFaceRowsPageSize       = 100
 	huggingFaceRowsMaxAttempts    = 6
@@ -136,6 +138,7 @@ type BenchmarkIDSelection struct {
 	Source string
 	IDs    []string
 	SHA256 string
+	Rows   []SkillTrustBenchRow
 }
 
 type OpenClawBenchmarkRow struct {
@@ -178,6 +181,8 @@ type SkillTrustBenchRow struct {
 type HuggingFaceBenchmarkClient struct {
 	HTTPClient                   *http.Client
 	Endpoint                     string
+	SkillTrustBenchRowsURL       string
+	SkillTrustBenchRowsSHA256    string
 	SkillTrustBenchArchiveURL    string
 	SkillTrustBenchArchivePath   string
 	SkillTrustBenchArchiveSHA256 string
@@ -193,15 +198,6 @@ type huggingFaceRowsResponse struct {
 
 type huggingFaceRow struct {
 	Row OpenClawBenchmarkRow `json:"row"`
-}
-
-type skillTrustBenchRowsResponse struct {
-	Rows  []skillTrustBenchHuggingFaceRow `json:"rows"`
-	Error string                          `json:"error"`
-}
-
-type skillTrustBenchHuggingFaceRow struct {
-	Row SkillTrustBenchRow `json:"row"`
 }
 
 func RunBenchmark(opts Options, ctx RunContext) (BenchmarkArtifact, error) {
@@ -227,13 +223,14 @@ func RunBenchmark(opts Options, ctx RunContext) (BenchmarkArtifact, error) {
 		return BenchmarkArtifact{}, err
 	}
 	if opts.Benchmark.IDsSource != "" {
-		selection, err := LoadBenchmarkIDSelection(opts.Benchmark.IDsSource)
+		selection, err := LoadBenchmarkIDSelection(opts.Benchmark.IDsSource, opts.Benchmark.IDsExpectedSHA256)
 		if err != nil {
 			return BenchmarkArtifact{}, err
 		}
 		benchmarkOpts.IDsSource = selection.Source
 		benchmarkOpts.IDs = selection.IDs
 		benchmarkOpts.IDsSHA256 = selection.SHA256
+		benchmarkOpts.SkillTrustBenchRows = selection.Rows
 		opts.Benchmark = &benchmarkOpts
 	}
 	now := ctx.Now
@@ -299,16 +296,34 @@ func RunBenchmark(opts Options, ctx RunContext) (BenchmarkArtifact, error) {
 	return artifact, nil
 }
 
-func LoadBenchmarkIDSelection(source string) (BenchmarkIDSelection, error) {
+func LoadBenchmarkIDSelection(source string, expectedSHA256 string) (BenchmarkIDSelection, error) {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return BenchmarkIDSelection{}, errors.New("--ids source is required")
+	}
+	parsedSource, _ := url.Parse(source)
+	isRemote := parsedSource != nil && (parsedSource.Scheme == "http" || parsedSource.Scheme == "https")
+	expectedSHA256 = strings.TrimSpace(expectedSHA256)
+	if isRemote && expectedSHA256 == "" {
+		return BenchmarkIDSelection{}, errors.New("--ids-sha256 is required for remote --ids sources")
+	}
+	if expectedSHA256 != "" {
+		decoded, err := hex.DecodeString(expectedSHA256)
+		if err != nil || len(decoded) != sha256.Size || strings.ToLower(expectedSHA256) != expectedSHA256 {
+			return BenchmarkIDSelection{}, errors.New("--ids-sha256 must be exactly 64 lowercase hexadecimal characters")
+		}
 	}
 	data, err := readBenchmarkIDSource(source)
 	if err != nil {
 		return BenchmarkIDSelection{}, err
 	}
-	ids, err := parseBenchmarkIDs(source, data)
+	if expectedSHA256 != "" {
+		actualSHA256 := fmt.Sprintf("%x", sha256.Sum256(data))
+		if actualSHA256 != expectedSHA256 {
+			return BenchmarkIDSelection{}, fmt.Errorf("--ids source SHA-256 mismatch: expected %s, got %s", expectedSHA256, actualSHA256)
+		}
+	}
+	ids, rows, err := parseBenchmarkIDSelection(source, data)
 	if err != nil {
 		return BenchmarkIDSelection{}, err
 	}
@@ -318,6 +333,7 @@ func LoadBenchmarkIDSelection(source string) (BenchmarkIDSelection, error) {
 		Source: source,
 		IDs:    ids,
 		SHA256: fmt.Sprintf("%x", sum[:]),
+		Rows:   rows,
 	}, nil
 }
 
@@ -341,56 +357,73 @@ func readBenchmarkIDSource(source string) ([]byte, error) {
 	return data, nil
 }
 
-func parseBenchmarkIDs(source string, data []byte) ([]string, error) {
+func parseBenchmarkIDSelection(source string, data []byte) ([]string, []SkillTrustBenchRow, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	var ids []string
+	var rows []SkillTrustBenchRow
+	allJSONRows := true
+	allJSONRowsHaveJudgments := true
 	seen := map[string]bool{}
 	lineNumber := 0
 	for scanner.Scan() {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
-			return nil, fmt.Errorf("--ids source %s line %d is blank", source, lineNumber)
+			return nil, nil, fmt.Errorf("--ids source %s line %d is blank", source, lineNumber)
 		}
-		id, err := parseBenchmarkIDLine(line)
+		id, row, err := parseBenchmarkIDLine(line)
 		if err != nil {
-			return nil, fmt.Errorf("--ids source %s line %d: %w", source, lineNumber, err)
+			return nil, nil, fmt.Errorf("--ids source %s line %d: %w", source, lineNumber, err)
 		}
 		if seen[id] {
-			return nil, fmt.Errorf("--ids source %s line %d duplicates benchmark id %s", source, lineNumber, id)
+			return nil, nil, fmt.Errorf("--ids source %s line %d duplicates benchmark id %s", source, lineNumber, id)
 		}
 		seen[id] = true
 		ids = append(ids, id)
+		if row == nil {
+			allJSONRows = false
+		} else {
+			rows = append(rows, *row)
+			if strings.TrimSpace(row.Judgment) == "" {
+				allJSONRowsHaveJudgments = false
+			}
+		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read --ids source %s: %w", source, err)
+		return nil, nil, fmt.Errorf("read --ids source %s: %w", source, err)
 	}
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("--ids source %s contains no benchmark ids", source)
+		return nil, nil, fmt.Errorf("--ids source %s contains no benchmark ids", source)
 	}
-	return ids, nil
+	if !allJSONRows || !allJSONRowsHaveJudgments {
+		rows = nil
+	}
+	return ids, rows, nil
 }
 
-func parseBenchmarkIDLine(line string) (string, error) {
+func parseBenchmarkIDLine(line string) (string, *SkillTrustBenchRow, error) {
 	id := line
+	var skillTrustBenchRow *SkillTrustBenchRow
 	if strings.HasPrefix(line, "{") {
-		var row struct {
-			ID string `json:"id"`
-		}
+		var row SkillTrustBenchRow
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
-			return "", fmt.Errorf("malformed JSONL row: %w", err)
+			return "", nil, fmt.Errorf("malformed JSONL row: %w", err)
 		}
 		id = row.ID
+		skillTrustBenchRow = &row
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return "", errors.New("benchmark id is blank")
+		return "", nil, errors.New("benchmark id is blank")
 	}
 	if strings.ContainsAny(id, " \t\r\n") {
-		return "", fmt.Errorf("benchmark id %q is malformed", id)
+		return "", nil, fmt.Errorf("benchmark id %q is malformed", id)
 	}
-	return id, nil
+	if skillTrustBenchRow != nil {
+		skillTrustBenchRow.ID = id
+	}
+	return id, skillTrustBenchRow, nil
 }
 
 func BenchmarkPredictionsOutputPath(opts Options) string {
@@ -771,35 +804,74 @@ func (client *HuggingFaceBenchmarkClient) FetchSkillTrustBenchRows(dataset strin
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
-	endpoint := client.Endpoint
-	if endpoint == "" {
-		endpoint = huggingFaceRowsEndpoint
+	rowsURL := client.SkillTrustBenchRowsURL
+	if rowsURL == "" {
+		rowsURL = skillTrustBenchRowsURL
 	}
-	var rows []SkillTrustBenchRow
-	nextOffset := offset
-	for {
-		length := huggingFaceRowsPageSize
-		if limit > 0 {
-			remaining := limit - len(rows)
-			if remaining <= 0 {
-				break
-			}
-			if remaining < length {
-				length = remaining
-			}
+	response, err := httpClient.Get(rowsURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch pinned SkillTrustBench rows: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("fetch pinned SkillTrustBench rows: HTTP %d", response.StatusCode)
+	}
+	raw, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned SkillTrustBench rows: %w", err)
+	}
+	expectedSHA256 := client.SkillTrustBenchRowsSHA256
+	if expectedSHA256 == "" {
+		expectedSHA256 = skillTrustBenchRowsSHA256
+	}
+	actualSHA256 := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if actualSHA256 != expectedSHA256 {
+		return nil, fmt.Errorf("SkillTrustBench rows SHA-256 mismatch: expected %s, got %s", expectedSHA256, actualSHA256)
+	}
+	rows, err := parseSkillTrustBenchRows(rowsURL, raw)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= len(rows) {
+		return []SkillTrustBenchRow{}, nil
+	}
+	rows = rows[offset:]
+	if limit > 0 && limit < len(rows) {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+func parseSkillTrustBenchRows(source string, data []byte) ([]SkillTrustBenchRow, error) {
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	rows := make([]SkillTrustBenchRow, 0)
+	seen := map[string]bool{}
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			return nil, fmt.Errorf("pinned SkillTrustBench rows %s line %d is blank", source, lineNumber)
 		}
-		page, err := client.fetchSkillTrustBenchRowsPage(httpClient, endpoint, dataset, split, nextOffset, length)
-		if err != nil {
-			return nil, err
+		var row SkillTrustBenchRow
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return nil, fmt.Errorf("pinned SkillTrustBench rows %s line %d: %w", source, lineNumber, err)
 		}
-		if len(page) == 0 {
-			break
+		if strings.TrimSpace(row.ID) == "" {
+			return nil, fmt.Errorf("pinned SkillTrustBench rows %s line %d has blank id", source, lineNumber)
 		}
-		rows = append(rows, page...)
-		nextOffset += len(page)
-		if len(page) < length {
-			break
+		if seen[row.ID] {
+			return nil, fmt.Errorf("pinned SkillTrustBench rows %s line %d duplicates id %s", source, lineNumber, row.ID)
 		}
+		seen[row.ID] = true
+		rows = append(rows, row)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read pinned SkillTrustBench rows %s: %w", source, err)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("pinned SkillTrustBench rows %s contains no rows", source)
 	}
 	return rows, nil
 }
@@ -828,37 +900,6 @@ func (client *HuggingFaceBenchmarkClient) fetchOpenClawRowsPage(httpClient *http
 		return nil, err
 	}
 	rows := make([]OpenClawBenchmarkRow, 0, len(parsed.Rows))
-	for _, row := range parsed.Rows {
-		rows = append(rows, row.Row)
-	}
-	return rows, nil
-}
-
-func (client *HuggingFaceBenchmarkClient) fetchSkillTrustBenchRowsPage(httpClient *http.Client, endpoint string, dataset string, split string, offset int, length int) ([]SkillTrustBenchRow, error) {
-	values := url.Values{}
-	values.Set("dataset", dataset)
-	values.Set("config", skillTrustBenchConfig)
-	values.Set("split", split)
-	values.Set("revision", skillTrustBenchRevision)
-	values.Set("offset", fmt.Sprintf("%d", offset))
-	values.Set("length", fmt.Sprintf("%d", length))
-	requestURL := endpoint + "?" + values.Encode()
-	raw, statusCode, err := fetchHuggingFaceRowsPage(httpClient, requestURL)
-	if err != nil {
-		return nil, err
-	}
-	var parsed skillTrustBenchRowsResponse
-	if statusCode < 200 || statusCode >= 300 {
-		_ = json.Unmarshal(raw, &parsed)
-		if parsed.Error != "" {
-			return nil, fmt.Errorf("fetch benchmark rows: %s", parsed.Error)
-		}
-		return nil, fmt.Errorf("fetch benchmark rows: HTTP %d", statusCode)
-	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, err
-	}
-	rows := make([]SkillTrustBenchRow, 0, len(parsed.Rows))
 	for _, row := range parsed.Rows {
 		rows = append(rows, row.Row)
 	}
