@@ -39,7 +39,7 @@ func run(args []string, stdout io.Writer) error {
 		return fmt.Errorf("validate-security-signals-submission requires <submission-dir>")
 	}
 
-	result, err := runner.ValidateSecuritySignalsSubmission(submissionDir, runner.HuggingFaceBenchmarkClient{
+	result, err := runner.ValidateSecuritySignalsSubmission(submissionDir, &runner.HuggingFaceBenchmarkClient{
 		Endpoint: os.Getenv("CLAWSCAN_HUGGINGFACE_ROWS_ENDPOINT"),
 	})
 	if err != nil {

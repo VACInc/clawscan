@@ -1,5 +1,8 @@
 name: NPM Release
 
+# The release ledger narrative is ADVISORY. The publish job enforces only the
+# exact machine-readable release-publication-status line from the tagged tree.
+
 on:
   workflow_dispatch:
     inputs:
@@ -40,19 +43,19 @@ jobs:
           exit 1
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
@@ -66,7 +69,7 @@ jobs:
         run: node scripts/build-npm-package.mjs --version "${{ inputs.tag }}" --pack --smoke
 
       - name: Upload prepared npm publish bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: clawscan-npm-preflight-${{ inputs.tag }}
           path: |
@@ -125,13 +128,22 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
 
+      - name: Enforce release publication status
+        run: |
+          set -euo pipefail
+          mapfile -t statuses < <(sed -n 's/^release-publication-status: //p' docs/release-gate-ledger.md)
+          if [ "${#statuses[@]}" -ne 1 ] || [ "${statuses[0]}" != "go" ]; then
+            echo "npm publication is blocked by release-publication-status=${statuses[0]:-missing}" >&2
+            exit 1
+          fi
+
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
@@ -153,7 +165,7 @@ jobs:
           printf '%s' "$RUN_JSON" | node --input-type=module -e 'const chunks=[]; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => { const run = JSON.parse(Buffer.concat(chunks).toString("utf8")); const checks = [["workflowName", "NPM Release"], ["headBranch", "main"], ["event", "workflow_dispatch"], ["conclusion", "success"]]; for (const [key, expected] of checks) { if (run[key] !== expected) { console.error(`Referenced npm preflight run ${process.env.PREFLIGHT_RUN_ID} must have ${key}=${expected}, got ${run[key] ?? "<missing>"}.`); process.exit(1); } } console.log(`Using npm preflight run ${process.env.PREFLIGHT_RUN_ID}: ${run.url}`); });'
 
       - name: Download prepared npm tarball
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: clawscan-npm-preflight-${{ inputs.tag }}
           path: dist/npm

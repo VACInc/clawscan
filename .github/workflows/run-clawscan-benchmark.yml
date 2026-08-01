@@ -20,7 +20,11 @@ on:
         required: false
         default: ""
       ids:
-        description: Optional benchmark ID source. Accepts a local text/JSONL path or HTTP(S) JSONL URL.
+        description: Optional benchmark ID source. Accepts a local text/JSONL path or HTTPS JSONL URL.
+        required: false
+        default: ""
+      ids_sha256:
+        description: Required SHA-256 when ids is an HTTP(S) URL.
         required: false
         default: ""
       limit:
@@ -40,9 +44,8 @@ on:
           - docker
           - off
       commit_sha:
-        description: Optional exact 40-character commit SHA to benchmark. Must be an ancestor of trusted_ref.
-        required: false
-        default: ""
+        description: Exact 40-character commit SHA to benchmark. Must be an ancestor of trusted_ref.
+        required: true
       trusted_ref:
         description: Trusted branch that commit_sha must descend from.
         required: false
@@ -69,6 +72,10 @@ on:
         required: false
         default: ""
       ids:
+        type: string
+        required: false
+        default: ""
+      ids_sha256:
         type: string
         required: false
         default: ""
@@ -99,11 +106,10 @@ on:
       sandbox_image:
         type: string
         required: false
-        default: ghcr.io/openclaw/clawscan-runtime:latest
+        default: ghcr.io/openclaw/clawscan-runtime@sha256:8795ee4802f8d3cb58bd724594e3794d2950b6a684df516064cf2761d9e63b09
       commit_sha:
         type: string
-        required: false
-        default: ""
+        required: true
       trusted_ref:
         type: string
         required: false
@@ -140,41 +146,101 @@ jobs:
     name: Run ${{ inputs.benchmark_id }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout trusted ref
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: ${{ inputs.trusted_ref }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check out verified trusted commit
-        if: ${{ inputs.commit_sha != '' }}
+      - name: Resolve trust root, verify ancestry, and check out detached commit
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           TRUSTED_REF: ${{ inputs.trusted_ref }}
+          REMOTE_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           set -euo pipefail
           # This job holds credentials, so it only ever executes code that is
           # already part of the trusted branch history.
           case "$TRUSTED_REF" in
-            main | trusted/*) ;;
+            main | refs/heads/main)
+              TRUSTED_BRANCH=main
+              ;;
+            trusted/*)
+              TRUSTED_BRANCH="$TRUSTED_REF"
+              ;;
+            refs/heads/trusted/*)
+              TRUSTED_BRANCH="${TRUSTED_REF#refs/heads/}"
+              ;;
             *)
               echo "trusted_ref must be main or trusted/*, got $TRUSTED_REF" >&2
               exit 1
               ;;
           esac
+          git check-ref-format --branch "$TRUSTED_BRANCH" >/dev/null
           if ! printf '%s' "$COMMIT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "commit_sha must be a full 40-character lowercase hex SHA" >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/${TRUSTED_REF#refs/heads/}"; then
+          TRUSTED_SHA="$(
+            git ls-remote --exit-code --refs "$REMOTE_URL" "refs/heads/$TRUSTED_BRANCH" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if ! printf '%s' "$TRUSTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "trusted_ref did not resolve to exactly one commit SHA: $TRUSTED_REF" >&2
+            exit 1
+          fi
+
+          git init .
+          git remote add origin "$REMOTE_URL"
+          git fetch --no-tags origin "refs/heads/$TRUSTED_BRANCH"
+          FETCHED_TRUSTED_SHA="$(git rev-parse FETCH_HEAD)"
+          if [ "$FETCHED_TRUSTED_SHA" != "$TRUSTED_SHA" ]; then
+            echo "trusted_ref changed while it was being validated; retry the workflow" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${COMMIT_SHA}^{commit}" 2>/dev/null; then
+            echo "commit_sha is not present in the trusted branch history" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "$TRUSTED_SHA"; then
             echo "commit_sha is not an ancestor of $TRUSTED_REF; refusing to run untrusted code with secrets" >&2
             exit 1
           fi
           git checkout --detach "$COMMIT_SHA"
+          test "$(git rev-parse HEAD)" = "$COMMIT_SHA"
+
+      - name: Verify benchmark ID source
+        env:
+          IDS_SOURCE: ${{ inputs.ids }}
+          IDS_SHA256: ${{ inputs.ids_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IDS_SOURCE" ]; then
+            echo "BENCHMARK_IDS=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          verified_source="$IDS_SOURCE"
+          case "$IDS_SOURCE" in
+            http://*)
+              echo "remote benchmark IDs must use HTTPS" >&2
+              exit 1
+              ;;
+            https://*)
+              if ! printf '%s' "$IDS_SHA256" | grep -Eq '^[0-9a-f]{64}$'; then
+                echo "ids_sha256 is required for remote benchmark IDs" >&2
+                exit 1
+              fi
+              verified_source="$RUNNER_TEMP/benchmark-ids.jsonl"
+              curl --fail --location --proto '=https' --tlsv1.2 \
+                --output "$verified_source" "$IDS_SOURCE"
+              ;;
+          esac
+          if [ -n "$IDS_SHA256" ]; then
+            actual_sha256="$(sha256sum "$verified_source" | awk '{ print $1 }')"
+            if [ "$actual_sha256" != "$IDS_SHA256" ]; then
+              echo "benchmark IDs SHA-256 mismatch: expected $IDS_SHA256, got $actual_sha256" >&2
+              exit 1
+            fi
+          fi
+          echo "BENCHMARK_IDS=$verified_source" >> "$GITHUB_ENV"
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
@@ -185,23 +251,50 @@ jobs:
       - name: Pull ClawScan runtime image
         if: ${{ inputs.sandbox == 'docker' }}
         env:
-          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime:latest' }}
-        run: docker pull "$CLAWSCAN_SANDBOX_IMAGE"
+          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime@sha256:8795ee4802f8d3cb58bd724594e3794d2950b6a684df516064cf2761d9e63b09' }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$CLAWSCAN_SANDBOX_IMAGE" | grep -Eq '^.+@sha256:[0-9a-f]{64}$'; then
+            echo "sandbox_image must be pinned by sha256 digest" >&2
+            exit 1
+          fi
+          docker pull "$CLAWSCAN_SANDBOX_IMAGE"
 
-      - name: Run benchmark
+      - name: Run SkillTrustBench benchmark
+        if: ${{ contains(fromJSON('["SkillTrustBench", "cuhk-zhuque/SkillTrustBench"]'), inputs.benchmark_id) }}
         env:
           BENCHMARK_ID: ${{ inputs.benchmark_id }}
           PROFILE: ${{ inputs.profile }}
           CONFIG_PATH: ${{ inputs.config_path }}
           SCANNERS: ${{ inputs.scanners }}
           SPLIT: ${{ inputs.split }}
-          IDS: ${{ inputs.ids }}
+          IDS: ${{ env.BENCHMARK_IDS }}
           LIMIT: ${{ inputs.limit }}
           OFFSET: ${{ inputs.offset }}
           PREDICTIONS_OUTPUT: ${{ inputs.predictions_output }}
           OUTPUT_PATH: ${{ inputs.output_path || './artifacts/clawscan-benchmark.json' }}
           CLAWSCAN_SANDBOX: ${{ inputs.sandbox }}
-          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime:latest' }}
+          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime@sha256:8795ee4802f8d3cb58bd724594e3794d2950b6a684df516064cf2761d9e63b09' }}
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: bash scripts/run-ci-benchmark.sh
+
+      - name: Run benchmark
+        if: ${{ !contains(fromJSON('["SkillTrustBench", "cuhk-zhuque/SkillTrustBench"]'), inputs.benchmark_id) }}
+        env:
+          BENCHMARK_ID: ${{ inputs.benchmark_id }}
+          PROFILE: ${{ inputs.profile }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          SCANNERS: ${{ inputs.scanners }}
+          SPLIT: ${{ inputs.split }}
+          IDS: ${{ env.BENCHMARK_IDS }}
+          LIMIT: ${{ inputs.limit }}
+          OFFSET: ${{ inputs.offset }}
+          PREDICTIONS_OUTPUT: ${{ inputs.predictions_output }}
+          OUTPUT_PATH: ${{ inputs.output_path || './artifacts/clawscan-benchmark.json' }}
+          CLAWSCAN_SANDBOX: ${{ inputs.sandbox }}
+          CLAWSCAN_SANDBOX_IMAGE: ${{ inputs.sandbox_image || 'ghcr.io/openclaw/clawscan-runtime@sha256:8795ee4802f8d3cb58bd724594e3794d2950b6a684df516064cf2761d9e63b09' }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           DEFAULT_MODEL: ${{ secrets.DEFAULT_MODEL }}
           DEFAULT_BASE_URL: ${{ secrets.DEFAULT_BASE_URL }}
@@ -213,40 +306,7 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_CLI_API_TOKEN }}
           VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$(dirname "$OUTPUT_PATH")"
-
-          args=(benchmark "$BENCHMARK_ID" --output "$OUTPUT_PATH")
-          if [ -n "$SPLIT" ]; then
-            args+=(--split "$SPLIT")
-          fi
-          if [ -n "$IDS" ]; then
-            args+=(--ids "$IDS")
-          else
-            args+=(--limit "$LIMIT" --offset "$OFFSET")
-          fi
-          if [ -n "$PREDICTIONS_OUTPUT" ]; then
-            mkdir -p "$(dirname "$PREDICTIONS_OUTPUT")"
-            args+=(--predictions-output "$PREDICTIONS_OUTPUT")
-          fi
-          if [ -n "$CONFIG_PATH" ]; then
-            args+=(--config "$CONFIG_PATH")
-          fi
-          if [ -n "$PROFILE" ]; then
-            args+=(--profile "$PROFILE")
-          else
-            read -r -a scanners <<<"$(printf '%s' "$SCANNERS" | tr ',' ' ')"
-            if [ "${#scanners[@]}" -eq 0 ]; then
-              echo "Either profile or scanners must be set." >&2
-              exit 1
-            fi
-            for scanner in "${scanners[@]}"; do
-              args+=(--scanner "$scanner")
-            done
-          fi
-
-          ./dist/clawscan "${args[@]}"
+        run: bash scripts/run-ci-benchmark.sh
 
       - name: Summarize benchmark
         if: always()
@@ -276,7 +336,7 @@ jobs:
 
       - name: Upload benchmark artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact_name || 'clawscan-benchmark' }}
           path: |

@@ -1,9 +1,16 @@
-# Observatory MVP release-gate ledger
+# Observatory MVP advisory release ledger
 
-Status: living document for the tagless MVP release candidate.
+release-publication-status: no-go
+
+Status: **ADVISORY** living evidence for the tagless MVP release candidate.
 Owner: repository maintainer of this fork.
 Scope: the exact code path that is exercised by the owned-fixture behavior lane
 plus the CI and release paths that can publish or execute it.
+
+The narrative, proof checklist, and historical hold below are advisory. Release
+and npm publication workflows enforce only the single machine-readable status
+line above; `no-go` blocks publication and `go` permits the publication jobs to
+continue.
 
 ## 1. Exact revisions
 
@@ -47,7 +54,7 @@ scan target controls.
 | T2 | PR-authored `proposals/<GHSA-ID>/clawscan.yml` (`config_path`) | Passed straight into `clawscan --config` in the secret-bearing job, where profile fields can name executable commands | Validated as data by `cmd/validate-profile-proposal` (parse, shape, scope, executable-field rejection). Execution requires a trusted commit. |
 | T3 | PR-authored workflow definitions | Reusable workflow was resolved from the PR checkout context | Benchmark lane is dispatched against the trusted default branch definition and refuses non-ancestor SHAs. |
 | T4 | Automated commits pushed back into the PR branch | `update-baseline` held `contents: write` and ran `git push` onto the PR branch | Baseline update is produced as an artifact plus a step summary. Publication is a separate maintainer action. |
-| T5 | Mutable third-party action tags | `actions/checkout@v4`, `actions/setup-go@v5`, `actions/upload-artifact@v4`, `actions/download-artifact@v4` in the benchmark and gate paths | All actions in the retained MVP workflow set are pinned to full commit SHAs and enforced by a test. |
+| T5 | Mutable third-party action tags | `actions/checkout@v4`, `actions/setup-go@v5`, `actions/upload-artifact@v4`, `actions/download-artifact@v4` in the benchmark and gate paths | Every external action in every workflow file is pinned to a full release-tag commit SHA and enforced by a directory-wide test. |
 | T6 | Scan target contents (owned fixture, and any future third-party target) | Capture reader accepted duplicate tar member names, last writer winning | Duplicate normalized member names fail closed. |
 
 ## 4. Findings triage against current source
@@ -67,7 +74,7 @@ MVP gate.
 | S-03 | Default Docker sandbox lacks strong containment | No, documented limitation | Documentation correction only. The behavior lane refuses ClawScan Docker mode. |
 | S-04, S-05, S-10, R-02, C-01..C-08 | Remaining review items | Not on the owned-fixture behavior path | Deferred with rationale; not release blockers for a tagless RC. |
 
-## 5. Environment-blocked gates
+## 5. Advisory environment-blocked gates
 
 These are the plan gates that cannot be closed from a repository-only session
 and must not be reported as passed:
@@ -77,9 +84,11 @@ and must not be reported as passed:
   bounded model relay. Not attempted.
 - Hour 17: demo bundle sourced from a real run. Depends on hours 6-13. A demo
   built from synthetic evidence would misrepresent the proof and is excluded.
-- Hour 20: go/no-go. Remains **no-go** while the live proof packet is absent.
+- Hour 20: the advisory go/no-go assessment remains **no-go** while the live
+  proof packet is absent. The machine-readable status at the top independently
+  enforces that decision for version-tag publication.
 
-### Publication of this branch
+### Advisory publication guidance
 
 The CI repair in this branch describes, and fixes, a defect that is still
 present in the public upstream repository. Publishing the branch to a public
@@ -87,10 +96,10 @@ fork would disclose an unpatched vulnerability in someone else's repository
 before its maintainers have had a chance to fix it, which is exactly what the
 project's own security policy asks contributors not to do.
 
-The branch therefore stays unpublished until either the upstream maintainers
-have been notified privately through GitHub private vulnerability reporting and
-have had a chance to respond, or the branch is pushed somewhere private. That
-decision belongs to the repository owner, not to the build.
+That historical hold was advisory and is now stale because the fork publication
+recorded in section 1 already occurred. It is retained as review context, not as
+an enforced gate. The only build-enforced release decision in this document is
+`release-publication-status` above.
 
 ## 6. Baseline verification, candidate base
 

@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultSubsetSource        = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/main/data/evaluation_subset_10pct.jsonl"
+	defaultSubsetSource        = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/326ec286d082199cb270b25b8b4fc93c8762281e/data/evaluation_subset_10pct.jsonl"
 	defaultSubsetCaseIDsSHA256 = "903a036e4b7b16ee28e22d5d9db57a00b3764cfe41e43144acad67921e5196c2"
 )
 

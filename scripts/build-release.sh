@@ -75,7 +75,6 @@ for platform in "${platforms[@]}"; do
     GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o "${workdir}/observatory" "$observatory_package"
     mkdir -p "${workdir}/docs"
     cp docs/observatory.md "${workdir}/docs/observatory.md"
-    cp docs/release-gate-ledger.md "${workdir}/docs/release-gate-ledger.md"
     cp examples/observatory.yml "${workdir}/observatory.example.yml"
     cat >"${workdir}/LIMITATIONS.md" <<'LIMITS'
 # Observatory limitations

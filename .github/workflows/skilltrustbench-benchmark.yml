@@ -43,7 +43,7 @@ jobs:
       baseline_path: ${{ steps.baseline.outputs.path }}
     steps:
       - name: Checkout trusted ref
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.trusted_ref }}
           fetch-depth: 0
@@ -100,22 +100,16 @@ jobs:
       commit_sha: ${{ inputs.commit_sha }}
       trusted_ref: ${{ inputs.trusted_ref }}
       benchmark_id: SkillTrustBench
-      ids: https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/main/data/evaluation_subset_10pct.jsonl
+      ids: https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/326ec286d082199cb270b25b8b4fc93c8762281e/data/evaluation_subset_10pct.jsonl
+      ids_sha256: dff7621ffcc7a42f1a8ff64c8e47d2fafc1cd332431fd533be88bb684aaa6843
       profile: clawhub
       config_path: ${{ inputs.config_path }}
       output_path: ./artifacts/skilltrustbench-candidate.json
       artifact_name: skilltrustbench-candidate
       sandbox: docker
     secrets:
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      DEFAULT_MODEL: ${{ secrets.DEFAULT_MODEL }}
-      DEFAULT_BASE_URL: ${{ secrets.DEFAULT_BASE_URL }}
-      DEFAULT_MODEL_CONTEXT_WINDOW: ${{ secrets.DEFAULT_MODEL_CONTEXT_WINDOW }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_CLI_API_TOKEN }}
       VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
 
   publish-baseline-artifact:
@@ -132,20 +126,20 @@ jobs:
       BASELINE_PATH: ${{ needs.verify-trusted-commit.outputs.baseline_path }}
     steps:
       - name: Checkout trusted commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Download benchmark artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: skilltrustbench-candidate
           path: ./downloaded-artifact
@@ -186,7 +180,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload baseline summary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: skilltrustbench-baseline
           path: ${{ needs.verify-trusted-commit.outputs.baseline_path }}

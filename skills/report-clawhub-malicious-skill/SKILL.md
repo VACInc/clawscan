@@ -110,7 +110,7 @@ Separate private evidence from public contribution material:
 
    ```bash
    clawscan benchmark SkillTrustBench \
-     --ids https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/main/data/evaluation_subset_10pct.jsonl \
+     --ids https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench-results/resolve/326ec286d082199cb270b25b8b4fc93c8762281e/data/evaluation_subset_10pct.jsonl \
      --config proposals/<GHSA-ID>/clawscan.yml \
      --profile clawhub \
      --output ./artifacts/skilltrustbench-candidate.json

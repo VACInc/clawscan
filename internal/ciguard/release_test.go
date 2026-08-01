@@ -7,6 +7,7 @@ import (
 )
 
 const releaseScriptPath = "../../scripts/build-release.sh"
+const releaseLedgerPath = "../../docs/release-gate-ledger.md"
 
 // TestReleasePackagingIsObservatoryComplete asserts the archive contents the
 // MVP promises: both CLIs, documentation, a configuration example, the license,
@@ -33,6 +34,9 @@ func TestReleasePackagingIsObservatoryComplete(t *testing.T) {
 		if !strings.Contains(script, needle) {
 			t.Errorf("release packaging is missing %q", needle)
 		}
+	}
+	if strings.Contains(script, "release-gate-ledger.md") {
+		t.Error("release packaging must not include the living advisory ledger")
 	}
 }
 
@@ -91,6 +95,42 @@ func TestTaglessReleaseBuildCannotPublish(t *testing.T) {
 	condition := jobCondition(t, release.Raw, "publish")
 	if !strings.Contains(condition, "startsWith(needs.build.outputs.version, 'v')") {
 		t.Fatalf("a tagless release build can still publish a GitHub Release: %q", condition)
+	}
+}
+
+// TestReleasePublicationStatusIsEnforced keeps the advisory ledger honest:
+// its narrative is not a build gate, but the one machine-readable status line
+// must block every release publication path while it says no-go.
+func TestReleasePublicationStatusIsEnforced(t *testing.T) {
+	ledgerData, err := os.ReadFile(releaseLedgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := string(ledgerData)
+	if strings.Count(ledger, "release-publication-status: no-go") != 1 {
+		t.Fatal("release ledger must contain exactly one no-go publication status")
+	}
+	if !strings.Contains(ledger, "**ADVISORY**") {
+		t.Error("release ledger narrative is not explicitly advisory")
+	}
+
+	release := findWorkflow(t, "release.yml")
+	for _, needle := range []string{
+		"sed -n 's/^release-publication-status: //p'",
+		"Block publication while status is no-go",
+		"needs: [build, publication-gate]",
+	} {
+		if !strings.Contains(release.Raw, needle) {
+			t.Errorf("release.yml is missing publication status enforcement %q", needle)
+		}
+	}
+	npmRelease := findWorkflow(t, "npm-release.yml")
+	if !strings.Contains(npmRelease.Raw, "npm publication is blocked by release-publication-status") {
+		t.Error("npm-release.yml does not enforce the tagged ledger status before publication")
+	}
+	runtimeImage := findWorkflow(t, "runtime-image.yml")
+	if !strings.Contains(runtimeImage.Raw, "runtime image publication is blocked by release-publication-status") {
+		t.Error("runtime-image.yml does not enforce the ledger status for version tags")
 	}
 }
 

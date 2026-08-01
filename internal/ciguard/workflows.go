@@ -47,6 +47,7 @@ type Job struct {
 // Step is the subset of a workflow step this package reasons about.
 type Step struct {
 	Name string         `yaml:"name"`
+	If   string         `yaml:"if"`
 	Uses string         `yaml:"uses"`
 	Run  string         `yaml:"run"`
 	With map[string]any `yaml:"with"`
@@ -272,4 +273,28 @@ func (w Workflow) DeclaresInput(name string) bool {
 		}
 	}
 	return false
+}
+
+// RequiresInput reports whether a specific trigger declares an input with
+// required: true. It deliberately distinguishes required inputs from inputs
+// that merely exist with an empty or optional default.
+func (w Workflow) RequiresInput(triggerName string, inputName string) bool {
+	on, ok := w.On.(map[string]any)
+	if !ok {
+		return false
+	}
+	trigger, ok := on[triggerName].(map[string]any)
+	if !ok {
+		return false
+	}
+	inputs, ok := trigger["inputs"].(map[string]any)
+	if !ok {
+		return false
+	}
+	input, ok := inputs[inputName].(map[string]any)
+	if !ok {
+		return false
+	}
+	required, ok := input["required"].(bool)
+	return ok && required
 }

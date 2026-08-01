@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,7 +34,9 @@ const (
 	defaultSkillTrustBenchSplit   = "benchmark"
 	skillTrustBenchArchiveRoot    = "benchmark_full_v1.0"
 	skillTrustBenchArchiveName    = "benchmark_full_v1.0.zip"
-	skillTrustBenchArchiveURL     = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench/resolve/main/benchmark_full_v1.0.zip"
+	skillTrustBenchRevision       = "f90517b7058fdcfea89af114c069fbf973f42bc7"
+	skillTrustBenchArchiveURL     = "https://huggingface.co/datasets/cuhk-zhuque/SkillTrustBench/resolve/f90517b7058fdcfea89af114c069fbf973f42bc7/benchmark_full_v1.0.zip"
+	skillTrustBenchArchiveSHA256  = "e1d8950ef01c3b24fa80e32101844abc8c5ab3a0a38525427e8b16f00a414ae4"
 	huggingFaceRowsEndpoint       = "https://datasets-server.huggingface.co/rows"
 	huggingFaceRowsPageSize       = 100
 	huggingFaceRowsMaxAttempts    = 6
@@ -172,10 +176,14 @@ type SkillTrustBenchRow struct {
 }
 
 type HuggingFaceBenchmarkClient struct {
-	HTTPClient                 *http.Client
-	Endpoint                   string
-	SkillTrustBenchArchiveURL  string
-	SkillTrustBenchArchivePath string
+	HTTPClient                   *http.Client
+	Endpoint                     string
+	SkillTrustBenchArchiveURL    string
+	SkillTrustBenchArchivePath   string
+	SkillTrustBenchArchiveSHA256 string
+
+	skillTrustBenchArchiveMu       sync.Mutex
+	verifiedSkillTrustBenchArchive string
 }
 
 type huggingFaceRowsResponse struct {
@@ -235,7 +243,7 @@ func RunBenchmark(opts Options, ctx RunContext) (BenchmarkArtifact, error) {
 	startedAt := now().UTC().Format(time.RFC3339Nano)
 	client := ctx.BenchmarkClient
 	if client == nil {
-		client = HuggingFaceBenchmarkClient{}
+		client = &HuggingFaceBenchmarkClient{}
 	}
 	artifact := BenchmarkArtifact{
 		SchemaVersion: "clawscan-benchmark-v1",
@@ -720,7 +728,7 @@ func normalizedRawMessage(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func (client HuggingFaceBenchmarkClient) FetchOpenClawRows(dataset string, split string, offset int, limit int) ([]OpenClawBenchmarkRow, error) {
+func (client *HuggingFaceBenchmarkClient) FetchOpenClawRows(dataset string, split string, offset int, limit int) ([]OpenClawBenchmarkRow, error) {
 	httpClient := client.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
@@ -758,7 +766,7 @@ func (client HuggingFaceBenchmarkClient) FetchOpenClawRows(dataset string, split
 	return rows, nil
 }
 
-func (client HuggingFaceBenchmarkClient) FetchSkillTrustBenchRows(dataset string, split string, offset int, limit int) ([]SkillTrustBenchRow, error) {
+func (client *HuggingFaceBenchmarkClient) FetchSkillTrustBenchRows(dataset string, split string, offset int, limit int) ([]SkillTrustBenchRow, error) {
 	httpClient := client.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
@@ -796,7 +804,7 @@ func (client HuggingFaceBenchmarkClient) FetchSkillTrustBenchRows(dataset string
 	return rows, nil
 }
 
-func (client HuggingFaceBenchmarkClient) fetchOpenClawRowsPage(httpClient *http.Client, endpoint string, dataset string, split string, offset int, length int) ([]OpenClawBenchmarkRow, error) {
+func (client *HuggingFaceBenchmarkClient) fetchOpenClawRowsPage(httpClient *http.Client, endpoint string, dataset string, split string, offset int, length int) ([]OpenClawBenchmarkRow, error) {
 	values := url.Values{}
 	values.Set("dataset", dataset)
 	values.Set("config", openClawBenchmarkConfig)
@@ -826,11 +834,12 @@ func (client HuggingFaceBenchmarkClient) fetchOpenClawRowsPage(httpClient *http.
 	return rows, nil
 }
 
-func (client HuggingFaceBenchmarkClient) fetchSkillTrustBenchRowsPage(httpClient *http.Client, endpoint string, dataset string, split string, offset int, length int) ([]SkillTrustBenchRow, error) {
+func (client *HuggingFaceBenchmarkClient) fetchSkillTrustBenchRowsPage(httpClient *http.Client, endpoint string, dataset string, split string, offset int, length int) ([]SkillTrustBenchRow, error) {
 	values := url.Values{}
 	values.Set("dataset", dataset)
 	values.Set("config", skillTrustBenchConfig)
 	values.Set("split", split)
+	values.Set("revision", skillTrustBenchRevision)
 	values.Set("offset", fmt.Sprintf("%d", offset))
 	values.Set("length", fmt.Sprintf("%d", length))
 	requestURL := endpoint + "?" + values.Encode()
@@ -916,7 +925,7 @@ func huggingFaceRowsBackoff(attempt int, headers http.Header) time.Duration {
 	return delay
 }
 
-func (client HuggingFaceBenchmarkClient) MaterializeSkillTrustBenchRow(root string, row SkillTrustBenchRow) (string, error) {
+func (client *HuggingFaceBenchmarkClient) MaterializeSkillTrustBenchRow(root string, row SkillTrustBenchRow) (string, error) {
 	archivePath, err := client.skillTrustBenchArchivePath()
 	if err != nil {
 		return "", err
@@ -924,9 +933,22 @@ func (client HuggingFaceBenchmarkClient) MaterializeSkillTrustBenchRow(root stri
 	return materializeSkillTrustBenchArchiveRow(root, row, archivePath)
 }
 
-func (client HuggingFaceBenchmarkClient) skillTrustBenchArchivePath() (string, error) {
+func (client *HuggingFaceBenchmarkClient) skillTrustBenchArchivePath() (string, error) {
+	client.skillTrustBenchArchiveMu.Lock()
+	defer client.skillTrustBenchArchiveMu.Unlock()
+	if client.verifiedSkillTrustBenchArchive != "" {
+		return client.verifiedSkillTrustBenchArchive, nil
+	}
+	expectedSHA256 := client.SkillTrustBenchArchiveSHA256
+	if expectedSHA256 == "" {
+		expectedSHA256 = skillTrustBenchArchiveSHA256
+	}
 	if client.SkillTrustBenchArchivePath != "" {
-		return client.SkillTrustBenchArchivePath, nil
+		if err := verifyFileSHA256(client.SkillTrustBenchArchivePath, expectedSHA256); err != nil {
+			return "", fmt.Errorf("verify SkillTrustBench archive: %w", err)
+		}
+		client.verifiedSkillTrustBenchArchive = client.SkillTrustBenchArchivePath
+		return client.verifiedSkillTrustBenchArchive, nil
 	}
 	cacheRoot, err := os.UserCacheDir()
 	if err != nil || cacheRoot == "" {
@@ -934,8 +956,16 @@ func (client HuggingFaceBenchmarkClient) skillTrustBenchArchivePath() (string, e
 	}
 	cacheDir := filepath.Join(cacheRoot, "clawscan", "benchmarks", "skilltrustbench")
 	archivePath := filepath.Join(cacheDir, skillTrustBenchArchiveName)
-	if info, err := os.Stat(archivePath); err == nil && info.Size() > 0 {
-		return archivePath, nil
+	if _, err := os.Stat(archivePath); err == nil {
+		if err := verifyFileSHA256(archivePath, expectedSHA256); err == nil {
+			client.verifiedSkillTrustBenchArchive = archivePath
+			return archivePath, nil
+		}
+		if err := os.Remove(archivePath); err != nil {
+			return "", fmt.Errorf("remove invalid cached SkillTrustBench archive: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", err
@@ -956,23 +986,52 @@ func (client HuggingFaceBenchmarkClient) skillTrustBenchArchivePath() (string, e
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", fmt.Errorf("download SkillTrustBench archive: HTTP %d", response.StatusCode)
 	}
-	tmpPath := fmt.Sprintf("%s.%d.tmp", archivePath, os.Getpid())
-	defer os.Remove(tmpPath)
-	file, err := os.Create(tmpPath)
+	file, err := os.CreateTemp(cacheDir, skillTrustBenchArchiveName+".*.tmp")
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(file, response.Body); err != nil {
+	tmpPath := file.Name()
+	defer os.Remove(tmpPath)
+	digest := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(file, digest), response.Body); err != nil {
 		file.Close()
 		return "", err
 	}
 	if err := file.Close(); err != nil {
 		return "", err
 	}
+	actualSHA256 := fmt.Sprintf("%x", digest.Sum(nil))
+	if actualSHA256 != expectedSHA256 {
+		return "", fmt.Errorf("SkillTrustBench archive SHA-256 mismatch: expected %s, got %s", expectedSHA256, actualSHA256)
+	}
 	if err := os.Rename(tmpPath, archivePath); err != nil {
 		return "", err
 	}
-	return archivePath, nil
+	client.verifiedSkillTrustBenchArchive = archivePath
+	return client.verifiedSkillTrustBenchArchive, nil
+}
+
+func verifyFileSHA256(path string, expected string) error {
+	if len(expected) != sha256.Size*2 {
+		return fmt.Errorf("invalid expected SHA-256 %q", expected)
+	}
+	if _, err := hex.DecodeString(expected); err != nil || strings.ToLower(expected) != expected {
+		return fmt.Errorf("invalid expected SHA-256 %q", expected)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return err
+	}
+	actual := fmt.Sprintf("%x", digest.Sum(nil))
+	if actual != expected {
+		return fmt.Errorf("SHA-256 mismatch: expected %s, got %s", expected, actual)
+	}
+	return nil
 }
 
 func materializeSkillTrustBenchArchiveRow(root string, row SkillTrustBenchRow, archivePath string) (string, error) {
